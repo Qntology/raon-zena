@@ -1,0 +1,27 @@
+KRAFTON Raon Zena
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains code derived from third-party projects:
+
+1. Qntology/logis-center — https://github.com/Qntology/logis-center
+   Apache License 2.0, Copyright 2026 Qntology.
+   - crates/raon-quant/src/kquant.rs: vendored from commerce/crates/ggml-kquant/src/lib.rs
+     (commit 1913209). Encoder bodies unchanged; English docs and Format::ggml_type added.
+   - crates/nlp-nms-router: algorithms ported from commerce/src-tauri/src (see
+     crates/nlp-nms-router/NOTICE for the file-by-file list and modifications).
+
+2. ggml / llama.cpp — https://github.com/ggml-org/ggml
+   MIT License, Copyright (c) Georgi Gerganov.
+   The Q8_0 / Q4_K / Q5_K / Q6_K block layouts and the scale packing in
+   crates/raon-quant/src/kquant.rs and crates/raon-quant/src/kernels.rs follow ggml's
+   reference quantize/dequantize routines so the output is bit-compatible with GGUF readers.
+
+3. KRAFTON Raon-VisionEncoder processor (OpenCLIP-derived), Apache License 2.0 / MIT.
+   crates/zena-sensor/src/naflex.rs re-implements the NaFlex resize search and patch layout of
+   modeling_raonve.py / raon_vision_encoder/transform.py.
+
+Model weights are NOT part of this repository. They are downloaded separately and remain under
+their own licenses:
+   - KRAFTON/Raon-1-nano: Apache-2.0
+   - KRAFTON/Raon-VisionEncoder: Apache-2.0
+   - KRAFTON/Raon-OpenTTS-0.3B: CC-BY-NC-4.0 (non-commercial)

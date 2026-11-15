@@ -1,0 +1,10 @@
+[package]
+name = "nlp-nms-router"
+description = "Raon Zena natural-language request router: Korean/English NLP preprocessing, embedding scoring, span / semantic / spatial-text NMS (ported from Qntology/logis-center)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zena-core = { path = "../zena-core" }
+serde.workspace = true

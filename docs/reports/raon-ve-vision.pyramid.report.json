@@ -1,0 +1,1860 @@
+{
+ "arch": "raon_ve_vision",
+ "file_bytes": 335742336,
+ "seconds": 25.73988,
+ "config": {
+  "edge_back": "2",
+  "edge_front": "2",
+  "imatrix": "false",
+  "recipe": "pyramid-4tier/1",
+  "tier2": "Q8_0",
+  "tier3": "Q6_K",
+  "tier4": "Q4_K"
+ },
+ "by_tier": {
+  "T1Spine": {
+   "tensors": 231,
+   "params": 1592770,
+   "bytes": 6375816,
+   "bpw": 32.02379
+  },
+  "T2Gate": {
+   "tensors": 21,
+   "params": 76124160,
+   "bytes": 81077760,
+   "bpw": 8.520581
+  },
+  "T3Attention": {
+   "tensors": 46,
+   "params": 122093568,
+   "bytes": 111283200,
+   "bpw": 7.2916665
+  },
+  "T4Bulk": {
+   "tensors": 46,
+   "params": 228077568,
+   "bytes": 136931328,
+   "bpw": 4.8029737
+  }
+ },
+ "by_residency": {
+  "Device": {
+   "tensors": 344,
+   "params": 427888066,
+   "bytes": 335668104,
+   "bpw": 6.275811
+  }
+ },
+ "excluded_params": 707782896,
+ "excluded_count": 330,
+ "tensors": [
+  {
+   "name": "visual.trunk.attn_pool.kv.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    2304,
+    1152
+   ],
+   "stored": [
+    2304,
+    1152
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.005023854
+  },
+  {
+   "name": "visual.trunk.attn_pool.mlp.fc1.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4320,
+    1152
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.005016567
+  },
+  {
+   "name": "visual.trunk.attn_pool.mlp.fc2.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4320
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.005213648
+  },
+  {
+   "name": "visual.trunk.attn_pool.proj.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.005017607
+  },
+  {
+   "name": "visual.trunk.attn_pool.q.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.007707739
+  },
+  {
+   "name": "visual.trunk.blocks.0.attn.proj.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.005495067
+  },
+  {
+   "name": "visual.trunk.blocks.0.attn.qkv.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1152
+   ],
+   "bytes": 4230144,
+   "rel_err": 0.0064444435
+  },
+  {
+   "name": "visual.trunk.blocks.0.mlp.fc1.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4320,
+    1152
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.005190943
+  },
+  {
+   "name": "visual.trunk.blocks.0.mlp.fc2.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4320
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.0059841434
+  },
+  {
+   "name": "visual.trunk.blocks.1.attn.proj.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.005076795
+  },
+  {
+   "name": "visual.trunk.blocks.1.attn.qkv.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1152
+   ],
+   "bytes": 4230144,
+   "rel_err": 0.005075866
+  },
+  {
+   "name": "visual.trunk.blocks.1.mlp.fc1.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4320,
+    1152
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.0050243963
+  },
+  {
+   "name": "visual.trunk.blocks.1.mlp.fc2.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4320
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.0055384347
+  },
+  {
+   "name": "visual.trunk.blocks.2.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.01752093
+  },
+  {
+   "name": "visual.trunk.blocks.2.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017561756
+  },
+  {
+   "name": "visual.trunk.blocks.2.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07186719
+  },
+  {
+   "name": "visual.trunk.blocks.2.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07569482
+  },
+  {
+   "name": "visual.trunk.blocks.3.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.01753831
+  },
+  {
+   "name": "visual.trunk.blocks.3.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017533189
+  },
+  {
+   "name": "visual.trunk.blocks.3.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071805924
+  },
+  {
+   "name": "visual.trunk.blocks.3.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07489839
+  },
+  {
+   "name": "visual.trunk.blocks.4.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017500024
+  },
+  {
+   "name": "visual.trunk.blocks.4.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01750616
+  },
+  {
+   "name": "visual.trunk.blocks.4.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07183856
+  },
+  {
+   "name": "visual.trunk.blocks.4.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07392008
+  },
+  {
+   "name": "visual.trunk.blocks.5.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017529812
+  },
+  {
+   "name": "visual.trunk.blocks.5.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017502844
+  },
+  {
+   "name": "visual.trunk.blocks.5.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07180849
+  },
+  {
+   "name": "visual.trunk.blocks.5.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07369337
+  },
+  {
+   "name": "visual.trunk.blocks.6.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017536353
+  },
+  {
+   "name": "visual.trunk.blocks.6.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017497476
+  },
+  {
+   "name": "visual.trunk.blocks.6.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071778245
+  },
+  {
+   "name": "visual.trunk.blocks.6.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07358458
+  },
+  {
+   "name": "visual.trunk.blocks.7.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017552514
+  },
+  {
+   "name": "visual.trunk.blocks.7.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017521653
+  },
+  {
+   "name": "visual.trunk.blocks.7.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07181129
+  },
+  {
+   "name": "visual.trunk.blocks.7.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07348273
+  },
+  {
+   "name": "visual.trunk.blocks.8.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017505273
+  },
+  {
+   "name": "visual.trunk.blocks.8.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01749698
+  },
+  {
+   "name": "visual.trunk.blocks.8.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07181332
+  },
+  {
+   "name": "visual.trunk.blocks.8.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07341811
+  },
+  {
+   "name": "visual.trunk.blocks.9.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017507393
+  },
+  {
+   "name": "visual.trunk.blocks.9.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017505916
+  },
+  {
+   "name": "visual.trunk.blocks.9.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071840934
+  },
+  {
+   "name": "visual.trunk.blocks.9.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07307451
+  },
+  {
+   "name": "visual.trunk.blocks.10.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017516922
+  },
+  {
+   "name": "visual.trunk.blocks.10.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.0174882
+  },
+  {
+   "name": "visual.trunk.blocks.10.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07177867
+  },
+  {
+   "name": "visual.trunk.blocks.10.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07311674
+  },
+  {
+   "name": "visual.trunk.blocks.11.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017500129
+  },
+  {
+   "name": "visual.trunk.blocks.11.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01749408
+  },
+  {
+   "name": "visual.trunk.blocks.11.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07182264
+  },
+  {
+   "name": "visual.trunk.blocks.11.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07330616
+  },
+  {
+   "name": "visual.trunk.blocks.12.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017541392
+  },
+  {
+   "name": "visual.trunk.blocks.12.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017494828
+  },
+  {
+   "name": "visual.trunk.blocks.12.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07178134
+  },
+  {
+   "name": "visual.trunk.blocks.12.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07316236
+  },
+  {
+   "name": "visual.trunk.blocks.13.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017534135
+  },
+  {
+   "name": "visual.trunk.blocks.13.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017491251
+  },
+  {
+   "name": "visual.trunk.blocks.13.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07175822
+  },
+  {
+   "name": "visual.trunk.blocks.13.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07314376
+  },
+  {
+   "name": "visual.trunk.blocks.14.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017485604
+  },
+  {
+   "name": "visual.trunk.blocks.14.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017498983
+  },
+  {
+   "name": "visual.trunk.blocks.14.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07176199
+  },
+  {
+   "name": "visual.trunk.blocks.14.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.0733404
+  },
+  {
+   "name": "visual.trunk.blocks.15.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.01750497
+  },
+  {
+   "name": "visual.trunk.blocks.15.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01750551
+  },
+  {
+   "name": "visual.trunk.blocks.15.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071756534
+  },
+  {
+   "name": "visual.trunk.blocks.15.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07369491
+  },
+  {
+   "name": "visual.trunk.blocks.16.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017497012
+  },
+  {
+   "name": "visual.trunk.blocks.16.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017487757
+  },
+  {
+   "name": "visual.trunk.blocks.16.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07171756
+  },
+  {
+   "name": "visual.trunk.blocks.16.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07380716
+  },
+  {
+   "name": "visual.trunk.blocks.17.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.01748546
+  },
+  {
+   "name": "visual.trunk.blocks.17.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017512819
+  },
+  {
+   "name": "visual.trunk.blocks.17.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07181806
+  },
+  {
+   "name": "visual.trunk.blocks.17.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.073933326
+  },
+  {
+   "name": "visual.trunk.blocks.18.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017485492
+  },
+  {
+   "name": "visual.trunk.blocks.18.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017505497
+  },
+  {
+   "name": "visual.trunk.blocks.18.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07180686
+  },
+  {
+   "name": "visual.trunk.blocks.18.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.0743341
+  },
+  {
+   "name": "visual.trunk.blocks.19.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017491637
+  },
+  {
+   "name": "visual.trunk.blocks.19.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017493127
+  },
+  {
+   "name": "visual.trunk.blocks.19.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07175688
+  },
+  {
+   "name": "visual.trunk.blocks.19.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07421212
+  },
+  {
+   "name": "visual.trunk.blocks.20.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017498268
+  },
+  {
+   "name": "visual.trunk.blocks.20.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017505893
+  },
+  {
+   "name": "visual.trunk.blocks.20.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071811296
+  },
+  {
+   "name": "visual.trunk.blocks.20.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.073984444
+  },
+  {
+   "name": "visual.trunk.blocks.21.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017486176
+  },
+  {
+   "name": "visual.trunk.blocks.21.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01750008
+  },
+  {
+   "name": "visual.trunk.blocks.21.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071806796
+  },
+  {
+   "name": "visual.trunk.blocks.21.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07371588
+  },
+  {
+   "name": "visual.trunk.blocks.22.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017498726
+  },
+  {
+   "name": "visual.trunk.blocks.22.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017503519
+  },
+  {
+   "name": "visual.trunk.blocks.22.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.07179323
+  },
+  {
+   "name": "visual.trunk.blocks.22.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.073409796
+  },
+  {
+   "name": "visual.trunk.blocks.23.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.01750052
+  },
+  {
+   "name": "visual.trunk.blocks.23.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.01749917
+  },
+  {
+   "name": "visual.trunk.blocks.23.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071724184
+  },
+  {
+   "name": "visual.trunk.blocks.23.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.07359821
+  },
+  {
+   "name": "visual.trunk.blocks.24.attn.proj.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1280
+   ],
+   "bytes": 1209600,
+   "rel_err": 0.017489197
+  },
+  {
+   "name": "visual.trunk.blocks.24.attn.qkv.weight",
+   "tier": "T3Attention",
+   "ty": "Q6_K",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1280
+   ],
+   "bytes": 3628800,
+   "rel_err": 0.017509796
+  },
+  {
+   "name": "visual.trunk.blocks.24.mlp.fc1.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4352,
+    1280
+   ],
+   "bytes": 3133440,
+   "rel_err": 0.071781136
+  },
+  {
+   "name": "visual.trunk.blocks.24.mlp.fc2.weight",
+   "tier": "T4Bulk",
+   "ty": "Q4_K",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4352
+   ],
+   "bytes": 2820096,
+   "rel_err": 0.074118376
+  },
+  {
+   "name": "visual.trunk.blocks.25.attn.proj.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.0050151013
+  },
+  {
+   "name": "visual.trunk.blocks.25.attn.qkv.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1152
+   ],
+   "bytes": 4230144,
+   "rel_err": 0.0050166985
+  },
+  {
+   "name": "visual.trunk.blocks.25.mlp.fc1.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4320,
+    1152
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.0050154068
+  },
+  {
+   "name": "visual.trunk.blocks.25.mlp.fc2.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4320
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.005393997
+  },
+  {
+   "name": "visual.trunk.blocks.26.attn.proj.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    1152
+   ],
+   "stored": [
+    1152,
+    1152
+   ],
+   "bytes": 1410048,
+   "rel_err": 0.005012082
+  },
+  {
+   "name": "visual.trunk.blocks.26.attn.qkv.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    3456,
+    1152
+   ],
+   "stored": [
+    3456,
+    1152
+   ],
+   "bytes": 4230144,
+   "rel_err": 0.005010937
+  },
+  {
+   "name": "visual.trunk.blocks.26.mlp.fc1.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    4304,
+    1152
+   ],
+   "stored": [
+    4320,
+    1152
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.0050164945
+  },
+  {
+   "name": "visual.trunk.blocks.26.mlp.fc2.weight",
+   "tier": "T2Gate",
+   "ty": "Q8_0",
+   "residency": "Device",
+   "logical": [
+    1152,
+    4304
+   ],
+   "stored": [
+    1152,
+    4320
+   ],
+   "bytes": 5287680,
+   "rel_err": 0.005343703
+  }
+ ]
+}

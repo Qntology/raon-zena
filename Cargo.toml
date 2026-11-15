@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zena-core",
+    "crates/zena-sensor",
+    "crates/raon-quant",
+    "crates/nlp-nms-router",
+    "apps/raon-zena",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/sungu-che/raon-zena"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+half = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
