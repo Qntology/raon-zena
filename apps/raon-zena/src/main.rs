@@ -1,8 +1,11 @@
 //! KRAFTON Raon Zena — overlay client.
 //!
 //! ```text
-//! raon-zena [--synthetic] [--model out/raon-1-nano.pyramid.gguf] [--vision out/raon-ve-vision.pyramid.gguf]
+//! raon-zena [--synthetic] [--model out/raon-1-nano.zena.gguf] [--tokenizer tokenizer.json]
+//!           [--llm-device auto|cpu|cuda|rocm|vulkan|metal] [--head full|kept|guarded]
+//!           [--vision out/raon-ve-vision.pyramid.gguf]
 //! ```
+//! Build with `--features cuda` / `rocm` / `vulkan` / `metal` (+ `flash-attn`) to accelerate the LLM.
 //! Type a line on stdin to talk to Zena while it runs (voice input is not wired yet).
 
 mod capture;
@@ -25,6 +28,9 @@ struct Args {
     synthetic: bool,
     model: Option<PathBuf>,
     vision: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+    llm_device: raon_infer::device::Backend,
+    head: raon_infer::head::HeadMode,
 }
 
 fn args() -> Args {
@@ -32,6 +38,9 @@ fn args() -> Args {
         synthetic: !cfg!(windows),
         model: None,
         vision: None,
+        tokenizer: None,
+        llm_device: raon_infer::device::Backend::Auto,
+        head: raon_infer::head::HeadMode::Full,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -39,6 +48,9 @@ fn args() -> Args {
             "--synthetic" => a.synthetic = true,
             "--model" => a.model = it.next().map(PathBuf::from),
             "--vision" => a.vision = it.next().map(PathBuf::from),
+            "--tokenizer" => a.tokenizer = it.next().map(PathBuf::from),
+            "--llm-device" => a.llm_device = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::device::Backend::Auto),
+            "--head" => a.head = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::head::HeadMode::Full),
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -129,10 +141,27 @@ fn main() -> Result<()> {
         }
     });
     let (ctx, crx) = mpsc::channel::<pipeline::AvatarCmd>();
+    // Lv3 backend: Raon-1-nano when a GGUF is given (CPU / CUDA / ROCm / Vulkan / Metal through the
+    // candle-rocm-vulkan fork, chosen by --llm-device), otherwise the template stub.
+    let backend: Box<dyn llm::LlmBackend> = match &a.model {
+        Some(gguf) => {
+            let tok = a.tokenizer.clone().unwrap_or_else(|| gguf.with_file_name("tokenizer.json"));
+            Box::new(llm::RaonNanoBackend::load(gguf, &tok, a.llm_device, a.head)?)
+        }
+        None => Box::new(llm::TemplateBackend),
+    };
+    let worker = {
+        let ctx = ctx.clone();
+        llm::LlmWorker::spawn(backend, move |job, text| {
+            for cmd in pipeline::completion_to_cmds(&text, job.level) {
+                let _ = ctx.send(cmd);
+            }
+        })
+    };
     {
         let running = running.clone();
         std::thread::spawn(move || {
-            let r = pipeline::run(src, Box::new(llm::TemplateBackend), urx, ctx, pipeline::PipelineConfig::default());
+            let r = pipeline::run(src, worker, urx, ctx, pipeline::PipelineConfig::default());
             if running.load(Ordering::SeqCst) {
                 if let Err(e) = r {
                     eprintln!("pipeline stopped: {e:#}");

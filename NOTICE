@@ -20,6 +20,14 @@ This repository contains code derived from third-party projects:
    crates/zena-sensor/src/naflex.rs re-implements the NaFlex resize search and patch layout of
    modeling_raonve.py / raon_vision_encoder/transform.py.
 
+4. Qntology/candle-rocm-vulkan — https://github.com/Qntology/candle-rocm-vulkan
+   Apache License 2.0. Used as a Cargo dependency ([patch.crates-io] of candle-core / candle-nn
+   0.11.0, and candle-rocm) for the CUDA / ROCm / Vulkan / Metal LLM backends, wired the same way
+   as Qntology/logis-center. Not vendored.
+
+5. crates/raon-infer/src/model.rs re-implements the forward pass of KRAFTON's
+   modeling_raon1_nano.py (Apache-2.0) operation by operation.
+
 Model weights are NOT part of this repository. They are downloaded separately and remain under
 their own licenses:
    - KRAFTON/Raon-1-nano: Apache-2.0

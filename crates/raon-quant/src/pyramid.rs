@@ -88,6 +88,12 @@ pub struct PyramidConfig {
     pub tier2: Format,
     pub tier3: Format,
     pub tier4: Format,
+    /// Format of the per-layer-embedding table (disk-gathered, so it costs no VRAM).
+    /// `None` = `tier4`.
+    pub ple: Option<Format>,
+    /// Extra sensitive MLP layers right after the front edge that use `tier3` instead of
+    /// `tier4` (Raon-1-nano's early MLPs dominate the Q4_K error; see docs/INFERENCE.md).
+    pub mlp_sensitive_front: usize,
     pub guard_clusters: usize,
     pub guard_iters: usize,
 }
@@ -100,6 +106,8 @@ impl Default for PyramidConfig {
             tier2: Format::Q8_0,
             tier3: Format::Q6K,
             tier4: Format::Q4K,
+            ple: None,
+            mlp_sensitive_front: 0,
             guard_clusters: 512,
             guard_iters: 4,
         }
@@ -334,7 +342,7 @@ pub fn plan_raon1_nano(st: &SafeTensors, cfg: &PyramidConfig, vocab: &VocabSlice
                 "model.per_layer_inputs.table.kept",
                 RowSel::Ids(kept.clone()),
                 Tier::T4Bulk,
-                cfg.tier4,
+                cfg.ple.unwrap_or(cfg.tier4),
                 Residency::HostGather,
                 None,
                 None,
@@ -346,7 +354,7 @@ pub fn plan_raon1_nano(st: &SafeTensors, cfg: &PyramidConfig, vocab: &VocabSlice
                     "model.per_layer_inputs.table.cold",
                     RowSel::Ids(cold.clone()),
                     Tier::T4Bulk,
-                    cfg.tier4,
+                    cfg.ple.unwrap_or(cfg.tier4),
                     Residency::HostGather,
                     None,
                     None,
@@ -369,7 +377,12 @@ pub fn plan_raon1_nano(st: &SafeTensors, cfg: &PyramidConfig, vocab: &VocabSlice
         } else if nano_attention(name) || name.contains(".per_layer_input_gate.") {
             (Tier::T3Attention, cfg.tier3)
         } else if name.contains(".mlp.") {
-            (Tier::T4Bulk, cfg.tier4)
+            let sensitive = layer.is_some_and(|l| l < cfg.edge_front + cfg.mlp_sensitive_front);
+            if sensitive {
+                (Tier::T3Attention, cfg.tier3)
+            } else {
+                (Tier::T4Bulk, cfg.tier4)
+            }
         } else {
             (Tier::T2Gate, cfg.tier2)
         };
@@ -601,6 +614,8 @@ pub fn convert(
     config.insert("tier2".into(), fmt_name(cfg.tier2).into());
     config.insert("tier3".into(), fmt_name(cfg.tier3).into());
     config.insert("tier4".into(), fmt_name(cfg.tier4).into());
+    config.insert("ple".into(), fmt_name(cfg.ple.unwrap_or(cfg.tier4)).into());
+    config.insert("mlp_sensitive_front".into(), cfg.mlp_sensitive_front.to_string());
     config.insert("imatrix".into(), imatrix.is_some().to_string());
     let mut meta = serde_json::Map::new();
     for it in &plan.items {

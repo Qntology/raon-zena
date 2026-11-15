@@ -10,11 +10,21 @@ zena-core = { path = "../../crates/zena-core" }
 zena-sensor = { path = "../../crates/zena-sensor" }
 nlp-nms-router = { path = "../../crates/nlp-nms-router" }
 raon-quant = { path = "../../crates/raon-quant" }
+raon-infer = { path = "../../crates/raon-infer" }
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 wgpu = "30"
 winit = "0.30"
+
+[features]
+default = []
+# LLM acceleration backends (candle-rocm-vulkan fork), same switches as Qntology/logis-center.
+cuda = ["raon-infer/cuda"]
+rocm = ["raon-infer/rocm"]
+vulkan = ["raon-infer/vulkan"]
+metal = ["raon-infer/metal"]
+flash-attn = ["raon-infer/flash-attn"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

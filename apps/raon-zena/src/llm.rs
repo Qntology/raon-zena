@@ -1,18 +1,80 @@
 //! Lv3 generation backends.
 //!
-//! The production backend is Raon-1-nano running from the pyramid GGUF (RDA + MLA + Raon-mHC
-//! forward pass with the fused kernels of `raon-quant`). That forward pass is not implemented
-//! yet; [`TemplateBackend`] stands in for it and emits the *same wire format* the model's chat
-//! template produces (`<tool_call><function=…><parameter=…>`), so prompt building, parsing,
-//! routing and rendering are exercised end to end.
+//! * [`RaonNanoBackend`] — KRAFTON Raon-1-nano from the pyramid GGUF through `raon-infer`
+//!   (candle + the candle-rocm-vulkan fork: CPU / CUDA / ROCm / Vulkan / Metal). The constant
+//!   part of the prompt (persona + tool definitions) is prefilled once and its recurrent/KV
+//!   state is cloned for every request, so only the situation lines are prefilled per call.
+//! * [`TemplateBackend`] — a rule-based stand-in emitting the same `<tool_call>` wire format,
+//!   used when no model is configured.
+//!
+//! [`LlmWorker`] runs a backend on its own thread so generation never blocks the sensor loop.
 
-use zena_core::prompt::Situation;
+use raon_infer::device::{select_device, Backend};
+use raon_infer::generate::Generator;
+use raon_infer::head::HeadMode;
+use raon_infer::model::State;
+use std::path::Path;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use zena_core::prompt::{build_fast_path_prompt, Situation};
 
 pub trait LlmBackend: Send {
     fn name(&self) -> &'static str;
     /// Generate a completion for the fast-path prompt. `situation` is passed alongside the
     /// rendered prompt so non-neural backends can respond without parsing text.
     fn generate(&mut self, prompt: &str, situation: &Situation) -> String;
+}
+
+const USER_TURN: &str = "<|im_start|>user\n";
+
+pub struct RaonNanoBackend {
+    gen: Generator,
+    prefix: State,
+    pub max_new: usize,
+}
+
+impl RaonNanoBackend {
+    pub fn load(gguf: &Path, tokenizer: &Path, device: Backend, head: HeadMode) -> anyhow::Result<Self> {
+        let dev = select_device(device, 0)?;
+        let gen = Generator::load_gguf(gguf, tokenizer, dev.clone(), None, head)?;
+        let full = build_fast_path_prompt(&Situation::default());
+        let cut = full.find(USER_TURN).ok_or_else(|| anyhow::anyhow!("prompt has no user turn"))?;
+        let t = std::time::Instant::now();
+        let prefix_ids = gen.encode(&full[..cut])?;
+        let prefix = gen.prefix_state(&prefix_ids)?;
+        eprintln!(
+            "[llm] Raon-1-nano on {} (head {:?}); cached {}-token system/tools prefix in {:.1}s",
+            raon_infer::device::describe(&dev),
+            gen.head.mode,
+            prefix_ids.len(),
+            t.elapsed().as_secs_f32()
+        );
+        Ok(Self { gen, prefix, max_new: 96 })
+    }
+}
+
+impl LlmBackend for RaonNanoBackend {
+    fn name(&self) -> &'static str {
+        "raon-1-nano"
+    }
+
+    fn generate(&mut self, prompt: &str, _situation: &Situation) -> String {
+        // Special tokens are atomic, so splitting right before the user turn tokenizes exactly
+        // like the whole prompt.
+        let suffix = prompt.find(USER_TURN).map(|i| &prompt[i..]).unwrap_or(prompt);
+        let run = || -> anyhow::Result<String> {
+            let ids = self.gen.encode(suffix)?;
+            let (text, stats) = self.gen.generate_from(self.prefix.clone(), &ids, self.max_new, |_| {})?;
+            eprintln!(
+                "[llm] {} prompt tok, {} new tok, prefill {:.0} ms, {:.1} tok/s",
+                stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_tok_per_s
+            );
+            Ok(text)
+        };
+        run().unwrap_or_else(|e| {
+            eprintln!("[llm] generation failed: {e:#}");
+            String::new()
+        })
+    }
 }
 
 pub struct TemplateBackend;
@@ -60,6 +122,42 @@ impl LlmBackend for TemplateBackend {
     }
 }
 
+/// A request for the LLM thread.
+pub struct LlmJob {
+    pub prompt: String,
+    pub situation: Situation,
+    pub level: zena_core::reaction::ReactionLevel,
+}
+
+/// Runs a backend on its own thread; at most one job in flight (new Lv3 requests are dropped
+/// while busy — the reaction router has already rate-limited them).
+pub struct LlmWorker {
+    tx: SyncSender<LlmJob>,
+    pub name: &'static str,
+}
+
+impl LlmWorker {
+    pub fn spawn(mut backend: Box<dyn LlmBackend>, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
+        let name = backend.name();
+        let (tx, rx): (SyncSender<LlmJob>, Receiver<LlmJob>) = sync_channel(0);
+        std::thread::Builder::new()
+            .name("zena-llm".into())
+            .spawn(move || {
+                for job in rx {
+                    let out = backend.generate(&job.prompt, &job.situation);
+                    on_done(job, out);
+                }
+            })
+            .expect("spawn llm thread");
+        Self { tx, name }
+    }
+
+    /// `false` when the worker is busy (or gone).
+    pub fn try_submit(&self, job: LlmJob) -> bool {
+        !matches!(self.tx.try_send(job), Err(TrySendError::Full(_) | TrySendError::Disconnected(_)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +173,26 @@ mod tests {
         let out = TemplateBackend.generate("", &s);
         let p = parse_model_output(&out);
         assert!(matches!(p.calls.as_slice(), [ToolCall::ControlZenaAvatar(_)]), "{:?}", p.rejected);
+    }
+
+    #[test]
+    fn worker_runs_jobs_off_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let w = LlmWorker::spawn(Box::new(TemplateBackend), move |_, out| tx.send(out).unwrap());
+        // sync_channel(0): a send only succeeds when the worker is waiting; retry briefly.
+        let mut ok = false;
+        for _ in 0..100 {
+            if w.try_submit(LlmJob {
+                prompt: String::new(),
+                situation: Situation::default(),
+                level: zena_core::reaction::ReactionLevel::Lv3Coaching,
+            }) {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ok);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().contains("<tool_call>"));
     }
 }

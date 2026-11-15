@@ -1,0 +1,123 @@
+대한민국은 동아시아의 한반도 남부에 위치한 나라로, 수도는 서울이다. 한강을 중심으로 발달한 서울은 정치, 경제, 문화의 중심지이며 약 천만 명이 살고 있다. 부산은 남동쪽 해안에 자리한 제2의 도시로 큰 항구가 있고, 인천에는 국제공항이 있어 많은 여행객이 오간다.
+
+한글은 1443년 세종대왕이 창제한 문자로, 자음과 모음을 조합해 음절을 만든다. 초성, 중성, 종성의 구조 덕분에 배우기 쉽고 컴퓨터로 처리하기에도 효율적이다. 오늘날 한글날은 10월 9일로, 문자의 창제를 기념하는 국경일이다.
+
+인공지능 모델을 기기에서 직접 실행하려면 메모리와 연산량을 줄이는 기술이 필요하다. 가중치를 8비트나 4비트로 양자화하면 모델 크기가 크게 줄어들지만, 민감한 층에서는 정확도가 떨어질 수 있다. 그래서 층마다 다른 비트 폭을 쓰는 혼합 정밀도 방식이 널리 쓰인다.
+
+The quick brown fox jumps over the lazy dog. Machine learning models learn patterns from data, and inference engines run those models efficiently on CPUs and GPUs. Quantization reduces memory bandwidth, which is usually the bottleneck when generating one token at a time.
+
+In real-time strategy games, players gather resources, build bases, and command units. Good players scout the map early, keep producing workers, and avoid fighting when their army is weaker. Timing attacks are strong when the opponent is investing in their economy.
+
+롤플레잉 게임에서 보스전은 패턴을 익히는 것이 핵심이다. 보스가 팔을 높이 드는 예비 동작을 보이면 곧 강한 내려찍기가 온다는 신호다. 이때는 무작정 공격하기보다 거리를 벌리고, 공격이 끝난 직후의 빈틈을 노려 반격하는 것이 안전하다.
+
+체력이 30퍼센트 아래로 떨어지면 회복 물약을 먼저 쓰는 습관을 들이자. 물약은 보통 인벤토리의 소모품 칸에 있고, 단축키에 등록해 두면 전투 중에도 빠르게 사용할 수 있다. 쿨타임이 긴 회피기는 정말 위험한 공격을 위해 아껴 두는 것이 좋다.
+
+<|im_start|>system
+너는 게임 화면 옆에 떠 있는 버튜버 컴패니언이다. 대사는 짧고 다정하게 한다.<|im_end|>
+<|im_start|>user
+[화면 이벤트] 몬스터 접근 / 왼쪽 위 중거리 (angle_deg=135, distance_norm=0.40) / 접근 중
+[HP] 64%<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+<tool_call>
+<function=control_zena_avatar>
+<parameter=gaze_target>
+{"angle_deg": 135, "distance_norm": 0.4}
+</parameter>
+<parameter=emotion_state>
+FOCUSED
+</parameter>
+<parameter=body_motion>
+LEAN_FORWARD_POINT
+</parameter>
+<parameter=speech_text>
+왼쪽 위에서 몬스터가 오고 있어. 자리 잡고 기다려!
+</parameter>
+</function>
+</tool_call><|im_end|>
+
+<|im_start|>user
+제나야 잠깐 화면에서 숨어 있어 줄래?<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+<tool_call>
+<function=manage_zena_system>
+<parameter=command>
+HIDE_AVATAR
+</parameter>
+</function>
+</tool_call><|im_end|>
+
+<|im_start|>user
+What's the best way to farm gold quickly in the early game?<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+Focus on clearing the nearest camps in a loop, sell junk items right away, and upgrade your gathering tool first. Don't chase rare drops until your basic gear is done.<|im_end|>
+
+서울의 봄은 벚꽃과 함께 찾아온다. 여의도 윤중로와 석촌호수 주변은 4월 초가 되면 꽃구경을 나온 사람들로 붐빈다. 날씨가 따뜻해지면 한강 공원에서 자전거를 타거나 돗자리를 펴고 쉬는 사람도 많다.
+
+프로그래밍에서 함수는 입력을 받아 출력을 돌려주는 코드 묶음이다. 좋은 함수는 한 가지 일만 하고, 이름만 보고도 무엇을 하는지 알 수 있어야 한다. 테스트를 함께 작성하면 나중에 코드를 고칠 때도 안심할 수 있다.
+
+fn main() {
+    let numbers = vec![3, 1, 4, 1, 5, 9, 2, 6];
+    let total: i32 = numbers.iter().sum();
+    println!("sum = {total}");
+}
+
+def fibonacci(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+{"tool_calls": [{"name": "control_zena_avatar", "arguments": {"gaze_target": {"angle_deg": 270, "distance_norm": 0.15}, "emotion_state": "SURPRISED_URGENT", "body_motion": "FLINCH", "speech_text": "바로 아래야, 피해!"}}]}
+
+The weather today is sunny with a high of 24 degrees Celsius. Tomorrow, clouds will move in from the west and there is a sixty percent chance of rain in the afternoon. Remember to bring an umbrella if you are going out.
+
+축구 경기에서 수비수는 상대 공격수의 움직임을 미리 읽고 공간을 막아야 한다. 미드필더는 공을 지키면서 전방으로 패스를 연결하고, 공격수는 수비 뒷공간을 파고들어 슈팅 기회를 만든다. 체력 관리가 승패를 가르는 경우도 많다.
+
+FPS 게임에서는 조준보다 위치 선정이 더 중요할 때가 많다. 엄폐물 근처에서 싸우고, 총소리가 난 방향을 미니맵으로 확인하자. 재장전은 교전이 끝난 뒤 안전한 곳에서 하는 것이 기본이다.
+
+<|im_start|>user
+제나야 오늘 그만할게, 이제 꺼 줘.<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+<tool_call>
+<function=manage_zena_system>
+<parameter=command>
+EXIT_APP
+</parameter>
+</function>
+</tool_call><|im_end|>
+
+수학에서 소수는 1과 자기 자신만으로 나누어떨어지는 1보다 큰 자연수다. 2, 3, 5, 7, 11, 13은 모두 소수이며, 소수는 무한히 많다는 것이 유클리드에 의해 증명되었다. 소수는 현대 암호 기술의 기초가 된다.
+
+Large language models predict the next token given the previous ones. During decoding, the key and value tensors of earlier tokens are cached so that each new step only processes one position. Linear attention layers instead keep a fixed-size recurrent state, which makes long contexts cheap.
+
+라면을 맛있게 끓이려면 물의 양을 정확히 맞추는 것이 중요하다. 물이 끓으면 면과 스프를 함께 넣고 4분 정도 끓인 뒤, 마지막에 달걀이나 파를 넣으면 좋다. 너무 오래 끓이면 면이 불어 식감이 떨어진다.
+
+<|im_start|>user
+보스 체력이 절반 남았는데 패턴이 바뀌었어. 어떻게 해?<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+2페이즈로 넘어가면 공격 범위가 넓어지니까 한 번 더 거리를 벌리고 새 패턴을 먼저 관찰해. 예비 동작이 보이면 옆으로 구르고, 공격이 끝난 뒤 짧게 두세 번만 때리고 빠지는 게 안전해.<|im_end|>
+
+History teaches us that great empires rise and fall for many reasons: economic strain, overextension, internal conflict, and changes in technology. Studying these patterns helps us understand the present, even though history never repeats itself exactly.
+
+여행을 떠나기 전에는 여권의 유효기간과 숙소 예약을 꼭 확인하자. 현지 교통 카드와 간단한 회화를 미리 알아 두면 훨씬 편하다. 짐은 가볍게 싸고, 귀중품은 몸에 지니는 것이 안전하다.
+
+<|im_start|>user
+인벤토리에서 물약 어디 있는지 알려줘.<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+I 키로 인벤토리를 열고 소모품 탭을 보면 빨간 물약이 있어. 자주 쓰면 1번 단축키에 등록해 둬!<|im_end|>
+
+Photosynthesis is the process by which plants convert light energy into chemical energy. Chlorophyll in the leaves absorbs sunlight, and the plant combines carbon dioxide and water to make glucose, releasing oxygen as a by-product.
+
+경제 뉴스에 따르면 이번 분기 반도체 수출이 전년 대비 크게 늘었다. 인공지능 서버 수요가 늘면서 고대역폭 메모리 판매가 증가했고, 관련 기업들의 실적도 개선되었다. 다만 환율 변동성은 여전히 위험 요인으로 꼽힌다.

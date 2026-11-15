@@ -1,0 +1,64 @@
+# Build / type-check matrix for the LLM acceleration backends, modelled on Qntology/logis-center's
+# cross-verify workflow. GitHub-hosted runners have no GPU, so:
+#   cpu    : the whole workspace test suite runs
+#   vulkan : builds (the loader is opened at run time; no SDK needed)
+#   rocm   : type check with CANDLE_ROCM_SKIP_KERNEL_BUILD=1 (no hipcc on the runner)
+#   cuda   : type check with the apt CUDA toolkit (nvcc for the kernel build; never executed)
+# Real GPU execution needs a self-hosted runner with that GPU.
+# Runs on pull requests and on demand (Actions → cross-verify → Run workflow).
+name: cross-verify
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: cross-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CANDLE_ROCM_SKIP_KERNEL_BUILD: "1"
+  CUDA_COMPUTE_CAP: "80"
+
+jobs:
+  cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-cpu, os: ubuntu-latest, kind: test, features: "" }
+          - { name: linux-vulkan, os: ubuntu-latest, kind: check, features: "vulkan" }
+          - { name: linux-rocm, os: ubuntu-latest, kind: check, features: "rocm" }
+          - { name: linux-cuda, os: ubuntu-latest, kind: cuda-check, features: "cuda,flash-attn" }
+          - { name: windows-cpu, os: windows-latest, kind: check, features: "" }
+          - { name: windows-vulkan, os: windows-latest, kind: check, features: "vulkan" }
+          - { name: windows-rocm, os: windows-latest, kind: check, features: "rocm" }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: CUDA toolkit (apt nvcc for the candle kernel build; no GPU)
+        if: matrix.kind == 'cuda-check'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nvidia-cuda-toolkit
+          nvcc --version
+      - name: test (cpu)
+        if: matrix.kind == 'test'
+        run: cargo test --workspace --release
+      - name: check raon-infer + raon-zena (${{ matrix.features || 'cpu' }})
+        if: matrix.kind != 'test'
+        run: |
+          F="${{ matrix.features }}"
+          cargo check -p raon-infer --bins ${F:+--features "$F"}
+          cargo check -p raon-zena ${F:+--features "$F"}

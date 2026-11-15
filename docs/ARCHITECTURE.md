@@ -27,12 +27,14 @@ winit 350×450 창 ◄── overlay.rs ◄── AvatarCmd (EventLoopProxy로 �
 | §2.2 NaFlex 패치 | `zena-sensor/naflex.rs` (공식 프로세서와 같은 이진 탐색과 패치 순서) | 테스트 완료 |
 | §2.2 1152-d 특징을 `mm_projector`로 투영 | — | **불가**. 공개된 병합기가 없음(아래 참조) |
 | §2.3 NLP + 임베딩 NMS | `nlp-nms-router` | 테스트 완료. 해시 임베더 사용 |
-| §2.4 Lv1–Lv3, non-thinking fast path | `zena-core/reaction.rs`, `prompt.rs` (`<think></think>` 프리필) | 테스트 완료. LLM은 스텁 |
+| §2.4 Lv1–Lv3, non-thinking fast path | `zena-core/reaction.rs`, `prompt.rs` (`<think></think>` 프리필) | 테스트 완료 |
+| §2.4 Raon-1-nano 추론과 툴콜 | `raon-infer` (candle). 앱의 `RaonNanoBackend`가 전용 스레드에서 실행하고 프리픽스 상태를 캐시합니다 | 공식 구현과 로짓 일치. 실제 툴콜 생성 확인. GPU 실측은 남음 |
 | §2.4 55M MTP 추측 디코딩 | MTP 가중치를 T2로 양자화해 GGUF에 포함 | 디코딩 루프는 미구현 |
+| (LLM 가속) | `Qntology/candle-rocm-vulkan` 포크, 기능 플래그 `cuda`/`rocm`/`vulkan`/`metal`/`flash-attn` (logis-center와 동일) | Vulkan·ROCm·Windows는 `cargo check` 통과. CUDA는 CI(apt 툴킷)에서 검사 |
 | §3 피라미드 양자화 | `raon-quant` | 실가중치로 완료([QUANTIZATION.md](QUANTIZATION.md)) |
-| §3.5 Fused dequant-matmul, F32 누산, verify | `raon-quant/kernels.rs` (CPU) | CPU 구현 완료. GPU 커널은 미구현 |
+| §3.5 Fused dequant-matmul, F32 누산, verify | `raon-quant/kernels.rs` (CPU); GPU에서는 포크의 `QMatMul::forward_exact` (CUDA/ROCm, 활성값 비양자화) | CPU 검증 완료. GPU 실측은 남음 |
 | §4 툴콜 스키마, 2D/3D 매핑 | `zena-core/tools.rs`, `avatar.rs` | 테스트 완료. Live2D/VRM 렌더러는 미연결 |
-| §5.1 마이크로 뷰포트, 단일 wgpu, 동적 FPS | `apps/raon-zena/overlay.rs` | Windows 타깃 `cargo check` 통과. 실기 미검증 |
+| §5.1 마이크로 뷰포트, 단일 wgpu, 동적 FPS | `apps/raon-zena/overlay.rs` | Windows 타깃 `cargo check` 통과. 실기 미검증. LLM은 candle 백엔드(CUDA/ROCm/Vulkan)의 별도 GPU 컨텍스트에서 돌므로, 단일 wgpu 디바이스 공유는 센서·렌더에만 해당합니다 |
 | §5.1 egui 말풍선, tray-icon | — | 미구현 (말풍선 대신 stderr 로그) |
 | §5.2 Topmost, 클릭 투과, 호버 30% | `zena-core/window.rs`, `apps/raon-zena/win32.rs` | 플래그 계산은 테스트 완료. 적용은 실기 미검증 |
 | §5.2 `Alt+드래그` | — | 클릭 투과 창은 마우스 입력을 받지 않으므로 저수준 마우스 훅(WH_MOUSE_LL)이 필요. 현재는 `Ctrl+Shift+L`만 지원 |
@@ -95,12 +97,13 @@ winit 350×450 창 ◄── overlay.rs ◄── AvatarCmd (EventLoopProxy로 �
 
 ## 다음 단계 (우선순위)
 
-1. Raon-1-nano 순전파(RDA 재귀, MLA, mHC, PLE gather)를 `raon-quant` 커널 위에 구현합니다. HF 참조 구현과 로짓 KLD를 비교해 검증하고, imatrix를 생성합니다.
-2. 실제 hidden state로 lm_head 가드 효율을 측정하고 클러스터링을 개선합니다.
-3. GPU 경로를 연결합니다. 순서는 다음과 같습니다.
+1. GPU 실기(CUDA / ROCm / Vulkan)에서 tok/s와 VRAM을 측정합니다. CI(`cross-verify`)로 CUDA 빌드를 확인합니다.
+2. 포크에 RDA용 fused 커널(키 채널별 감쇠, 쓰기 게이트)을 추가하고, MLA에 flash-attn을 연결하고, MTP 추측 디코딩을 구현합니다.
+3. 보정 코퍼스를 게임 대화 로그로 확대하고 imatrix를 다시 만듭니다.
+4. 센서·렌더 GPU 경로를 연결합니다. 순서는 다음과 같습니다.
    - `event_diff.wgsl` 디스패치
    - DXGI 텍스처를 DX12와 공유
    - 비전 타워 WGSL 융합 커널
-4. 한국어 TTS를 선정하고(라이선스와 지연 시간 기준) ASR을 선정합니다.
-5. Live2D Cubism Native SDK 또는 VRM(glTF) 렌더러 어댑터를 구현합니다(`zena-core::avatar` 매핑은 준비됨).
-6. egui 말풍선과 tray-icon, WH_MOUSE_LL 기반 Alt+드래그를 구현합니다.
+5. 한국어 TTS를 선정하고(라이선스와 지연 시간 기준) ASR을 선정합니다.
+6. Live2D Cubism Native SDK 또는 VRM(glTF) 렌더러 어댑터를 구현합니다(`zena-core::avatar` 매핑은 준비됨).
+7. egui 말풍선과 tray-icon, WH_MOUSE_LL 기반 Alt+드래그를 구현합니다.

@@ -81,12 +81,9 @@ Raon-1-nano 토크나이저(byte-level BPE, 259,840행)를 GPT-2 바이트 역�
 3. **정확성 가드 (`lmhead.rs`).** 절삭된 cold 행 234,993개를 Q8_0으로 인코딩·디코딩한 값으로 1024개 클러스터(k-means)로 묶고, 클러스터마다 중심 `c`와 반경 `ρ`를 저장합니다. 런타임에는 `w·h ≤ c·h + ρ‖h‖`(Cauchy–Schwarz)를 넘는 클러스터만 디스크에서 다시 계산합니다. 결과는 전체 `[V, D]` argmax와 **항상 동일**합니다.
    - logis-center는 바로 이 정확성 보장 문제 때문에 head 절삭을 기각했습니다(`SyntheticData/eval/README.md`).
    - 실측(`raon-quant check`, 임베딩 행 3개를 프로브로 사용): 3개 모두 전체 argmax와 일치했습니다. 재계산한 클러스터는 128–586개, 행은 158k–229k(cold의 67–97%)입니다.
-   - **해석.** 1536차원에서는 반경 상한이 느슨해 가지치기 효율이 낮습니다.
-   - **후속 과제.** 다음으로 가지치기 효율을 높여야 합니다.
-     - 실제 최종 hidden state로 측정하기
-     - 방향/노름 분리 클러스터링(spherical k-means + 노름 상한)
-     - 클러스터 수 늘리기
-     - K 키우기
+   - **실제 hidden state로 측정한 결과(`raon-infer`).** 매 토큰 cold 행 234,993개 중 234,828개(99.9%)를 다시 계산했습니다. 결과는 정확하지만 전체 어휘를 병렬로 스캔하는 것(약 140 ms)보다 느립니다(380–590 ms).
+   - **해석.** 1536차원에서 Cauchy–Schwarz 클러스터 상한은 사실상 가지치기를 하지 못합니다.
+   - **결론.** 추론 기본 head는 전체 어휘(`--head full`, 정확)입니다. 절삭 head는 VRAM이 부족할 때 쓰는 근사 옵션(`--head kept`)으로 남겼습니다. 자세한 내용은 [INFERENCE.md](INFERENCE.md)에 있습니다.
 
 ## 검증
 
@@ -134,9 +131,13 @@ pip install gguf numpy && python3 -I scripts/xcheck_gguf.py out/raon-ve-vision.p
 | `--keep-top N` | 24576 | `0`이면 문자 필터만 적용 |
 | `--no-slice` | — | 절삭 끔 |
 | `--guard-clusters` | 1024 | 정확성 가드의 클러스터 수 |
+| `--preset prd\|zena` | `prd` | `zena`는 MLP Q5_K, 초반 6층 MLP Q6_K, PLE Q8_0을 씁니다(imatrix와 함께 사용) |
+| `--ple-format` | (tier4) | PLE 테이블 형식. 디스크 gather 대상이라 VRAM 비용이 없습니다 |
+| `--mlp-sensitive-front N` | 0 | 앞쪽 경계층 다음 N개 MLP를 tier3 형식으로 둡니다 |
 
 ## 알려진 한계
 
-- **imatrix 생성기가 없습니다.** imatrix를 만들려면 모델 순전파가 필요합니다. 리더는 구현되어 있습니다.
+- **imatrix 보정 데이터가 작습니다.** `raon-infer`의 `raon-imatrix`로 생성할 수 있게 되었지만, 현재 보정 코퍼스는 1.4k 토큰입니다.
+- **PRD 원안의 품질 손실이 큽니다.** PRD 원안(MLP Q4_K)은 공식 구현 대비 KL 0.100, top-1 87.1%입니다. 측정 기반 레시피 `--preset zena`(MLP Q5_K, 초반 6층 MLP Q6_K, PLE Q8_0)에 imatrix를 더하면 KL 0.0235, top-1 91.4%로, 상주 메모리는 994 MiB입니다. 근거는 [INFERENCE.md](INFERENCE.md#검증-공식-pytorch-구현-대비)에 있습니다.
 - **logis-center의 측정 이력.** 같은 SigLIP2 so400m에 피라미드 플랜을 적용했을 때 문서 번호 크롭 45개 중 2개를 놓쳐 q8 플랜을 기본으로 삼았습니다(`quant.rs:22-31`). 게임 ROI 분류와 그라운딩에 피라미드가 충분한지는 실제 게임 화면으로 평가해야 합니다.
 - **NF4 / FP8(E4M3)는 구현하지 않았습니다.** PRD에서 대안 형식으로 언급된 형식입니다.

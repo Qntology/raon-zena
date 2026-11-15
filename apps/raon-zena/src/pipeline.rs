@@ -2,7 +2,7 @@
 //! (Lv3) generation → avatar commands for the UI thread.
 
 use crate::capture::FrameSource;
-use crate::llm::LlmBackend;
+use crate::llm::{LlmJob, LlmWorker};
 use nlp_nms_router::{NlpNmsRouter, RouterInput};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
@@ -11,7 +11,9 @@ use zena_core::cues::{cue, cue_for_reason, CuePlayer};
 use zena_core::geometry::{FlowDirection, ScreenGeometry};
 use zena_core::prompt::{build_fast_path_prompt, Situation};
 use zena_core::reaction::{Observation, ReactionLevel, ReactionRouter};
-use zena_core::tools::{parse_model_output, GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAvatarArgs};
+use zena_core::tools::{
+    parse_model_output, BodyMotion, EmotionState, GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAvatarArgs,
+};
 use zena_sensor::{extract_rois, LogLumSensor, RoiTracker};
 
 /// What the UI thread is asked to do.
@@ -50,7 +52,7 @@ fn speech_ms(text: &str) -> u32 {
 
 pub fn run(
     mut src: Box<dyn FrameSource>,
-    mut llm: Box<dyn LlmBackend>,
+    llm: LlmWorker,
     utterances: Receiver<String>,
     out: Sender<AvatarCmd>,
     cfg: PipelineConfig,
@@ -63,7 +65,7 @@ pub fn run(
     let mut reactions = ReactionRouter::default();
     let mut cues = CuePlayer::default();
     let t0 = Instant::now();
-    eprintln!("pipeline: {w}x{h} sensor, Lv3 backend = {}", llm.name());
+    eprintln!("pipeline: {w}x{h} sensor, Lv3 backend = {}", llm.name);
     loop {
         let Some(frame) = src.next_frame()? else {
             continue;
@@ -163,23 +165,97 @@ pub fn run(
                     context: vec![],
                 };
                 let prompt = build_fast_path_prompt(&sit);
-                let completion = llm.generate(&prompt, &sit);
-                for call in parse_model_output(&completion).calls {
-                    match call {
-                        ToolCall::ControlZenaAvatar(args) => {
-                            let text = args.speech_text.clone().unwrap_or_default();
-                            let ms = speech_ms(&text);
-                            out.send(AvatarCmd::Act {
-                                visemes: viseme_timeline(&text, ms),
-                                speech_ms: ms,
-                                args,
-                                level: d.level,
-                            })?;
-                        }
-                        ToolCall::ManageZenaSystem(s) => out.send(AvatarCmd::System(s.command, s.window_layer_mode))?,
-                    }
+                // Generation runs on the LLM thread; if it is still busy with the previous
+                // coaching line, fall back to an immediate cached cue so Zena still reacts.
+                if !llm.try_submit(LlmJob {
+                    prompt,
+                    situation: sit,
+                    level: d.level,
+                }) {
+                    let kind = cue_for_reason(d.reason);
+                    let c = cue(kind);
+                    let line = cues.next_line(kind).to_string();
+                    let ms = speech_ms(&line);
+                    let args = ZenaAvatarArgs {
+                        gaze_target: obs.polar.map(|p| GazeTarget {
+                            angle_deg: p.theta_deg,
+                            distance_norm: p.r,
+                        }),
+                        emotion_state: c.emotion,
+                        body_motion: c.motion,
+                        speech_text: Some(line.clone()),
+                    };
+                    out.send(AvatarCmd::Act {
+                        args,
+                        level: ReactionLevel::Lv2Cached,
+                        visemes: viseme_timeline(&line, ms),
+                        speech_ms: ms,
+                    })?;
                 }
             }
         }
+    }
+}
+
+/// Turn a model completion into avatar commands (runs on the LLM thread).
+pub fn completion_to_cmds(completion: &str, level: ReactionLevel) -> Vec<AvatarCmd> {
+    let mut cmds = Vec::new();
+    let parsed = parse_model_output(completion);
+    if parsed.calls.is_empty() && !parsed.preamble.is_empty() {
+        // A plain-text answer (no tool call): speak it with a neutral expression.
+        let args = ZenaAvatarArgs {
+            gaze_target: None,
+            emotion_state: EmotionState::Neutral,
+            body_motion: BodyMotion::Nod,
+            speech_text: None,
+        };
+        let args = ToolCall::ControlZenaAvatar(ZenaAvatarArgs {
+            speech_text: Some(parsed.preamble.clone()),
+            ..args
+        })
+        .sanitized();
+        if let ToolCall::ControlZenaAvatar(args) = args {
+            let text = args.speech_text.clone().unwrap_or_default();
+            let ms = speech_ms(&text);
+            cmds.push(AvatarCmd::Act {
+                visemes: viseme_timeline(&text, ms),
+                speech_ms: ms,
+                args,
+                level,
+            });
+        }
+        return cmds;
+    }
+    for call in parsed.calls {
+        match call {
+            ToolCall::ControlZenaAvatar(args) => {
+                let text = args.speech_text.clone().unwrap_or_default();
+                let ms = speech_ms(&text);
+                cmds.push(AvatarCmd::Act {
+                    visemes: viseme_timeline(&text, ms),
+                    speech_ms: ms,
+                    args,
+                    level,
+                });
+            }
+            ToolCall::ManageZenaSystem(s) => cmds.push(AvatarCmd::System(s.command, s.window_layer_mode)),
+        }
+    }
+    cmds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_completion_is_spoken_and_tool_calls_are_mapped() {
+        let c = completion_to_cmds("인벤토리 한번 같이 찾아볼까?", ReactionLevel::Lv3Coaching);
+        assert!(matches!(&c[..], [AvatarCmd::Act { args, .. }] if args.speech_text.as_deref() == Some("인벤토리 한번 같이 찾아볼까?")));
+        let c = completion_to_cmds(
+            "<tool_call>\n<function=manage_zena_system>\n<parameter=command>\nEXIT_APP\n</parameter>\n</function>\n</tool_call>",
+            ReactionLevel::Lv3Coaching,
+        );
+        assert!(matches!(&c[..], [AvatarCmd::System(SystemCommand::ExitApp, None)]));
     }
 }

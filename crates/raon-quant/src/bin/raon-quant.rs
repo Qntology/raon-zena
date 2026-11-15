@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use raon_quant::gguf::{GgmlType, GgufFile};
 use raon_quant::kernels::{dequant_row, dot_row, matvec, verify_kernels};
+use raon_quant::kquant::Format;
 use raon_quant::lmhead::{exact_argmax, ColdGuard};
 use raon_quant::pyramid::{self, parse_format, Plan, PyramidConfig};
 use raon_quant::safetensors::SafeTensors;
@@ -60,6 +61,12 @@ enum Cmd {
 
 #[derive(Args)]
 struct Common {
+    /// `prd`: the PRD v3.0 pyramid as written (T4 Q4_K for MLP and the PLE table).
+    /// `zena`: the measured quality recipe for Raon-1-nano — MLP Q5_K, the 6 MLPs after the front
+    /// edge Q6_K, PLE table Q8_0 (disk-gathered, no VRAM cost); use with `--imatrix`.
+    /// Explicit --tier4 / --ple-format / --mlp-sensitive-front override the preset.
+    #[arg(long, default_value = "prd")]
+    preset: String,
     #[arg(long)]
     model_dir: PathBuf,
     #[arg(long)]
@@ -77,6 +84,12 @@ struct Common {
     tier3: String,
     #[arg(long, default_value = "q4_k")]
     tier4: String,
+    /// Per-layer-embedding table format (default: same as --tier4). Disk-gathered: no VRAM cost.
+    #[arg(long)]
+    ple_format: Option<String>,
+    /// MLP layers right after the front edge kept at --tier3 (sensitivity override).
+    #[arg(long, default_value_t = 0)]
+    mlp_sensitive_front: usize,
     /// llama.cpp legacy imatrix.dat keyed by the original tensor names.
     #[arg(long)]
     imatrix: Option<PathBuf>,
@@ -87,12 +100,31 @@ struct Common {
 
 impl Common {
     fn config(&self) -> Result<PyramidConfig> {
+        let zena = match self.preset.as_str() {
+            "prd" => false,
+            "zena" => true,
+            p => bail!("unknown preset {p} (prd, zena)"),
+        };
+        let tier4 = match (zena, self.tier4.as_str()) {
+            (true, "q4_k") => Format::Q5K,
+            (_, t) => parse_format(t)?,
+        };
         Ok(PyramidConfig {
             edge_front: self.edge_front,
             edge_back: self.edge_back,
             tier2: parse_format(&self.tier2)?,
             tier3: parse_format(&self.tier3)?,
-            tier4: parse_format(&self.tier4)?,
+            tier4,
+            ple: match (&self.ple_format, zena) {
+                (Some(f), _) => Some(parse_format(f)?),
+                (None, true) => Some(Format::Q8_0),
+                (None, false) => None,
+            },
+            mlp_sensitive_front: if zena && self.mlp_sensitive_front == 0 {
+                6
+            } else {
+                self.mlp_sensitive_front
+            },
             ..Default::default()
         })
     }

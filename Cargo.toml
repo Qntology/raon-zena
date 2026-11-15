@@ -5,6 +5,7 @@ members = [
     "crates/zena-sensor",
     "crates/raon-quant",
     "crates/nlp-nms-router",
+    "crates/raon-infer",
     "apps/raon-zena",
 ]
 
@@ -19,6 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
 half = "2"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
 
 [profile.release]
 opt-level = 3
@@ -28,3 +31,21 @@ panic = "abort"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# LLM acceleration: the candle-rocm-vulkan fork (CUDA / ROCm-HIP / Vulkan / Metal backends, fused
+# attention, TurboQuant), wired exactly like Qntology/logis-center. The fork tracks candle 0.11.0 and
+# replaces the crates.io candle-core / candle-nn; Cargo.lock pins the commit (`cargo update -p candle-core`
+# to move it). To build against a local checkout, swap the git lines for
+# `path = "../candle-rocm-vulkan/candle-core"` etc.
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.raon-quant]
+opt-level = 3
