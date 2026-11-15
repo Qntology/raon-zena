@@ -1,7 +1,8 @@
 //! KRAFTON Raon Zena — overlay client.
 //!
 //! ```text
-//! raon-zena [--synthetic] [--model out/raon-1-nano.zena.gguf] [--tokenizer tokenizer.json]
+//! raon-zena [--synthetic] [--model out/raon-1-nano.zena.gguf | models/KRAFTON/Raon-1-nano]
+//!           [--quant-preset zena|prd|q8] [--imatrix out/raon-1-nano.imatrix.dat] [--tokenizer tokenizer.json]
 //!           [--llm-device auto|cpu|cuda|rocm|vulkan|metal] [--head full|kept|guarded]
 //!           [--vision out/raon-ve-vision.pyramid.gguf]
 //! ```
@@ -31,6 +32,8 @@ struct Args {
     tokenizer: Option<PathBuf>,
     llm_device: raon_infer::device::Backend,
     head: raon_infer::head::HeadMode,
+    quant_preset: String,
+    imatrix: Option<PathBuf>,
 }
 
 fn args() -> Args {
@@ -41,6 +44,8 @@ fn args() -> Args {
         tokenizer: None,
         llm_device: raon_infer::device::Backend::Auto,
         head: raon_infer::head::HeadMode::Full,
+        quant_preset: "zena".into(),
+        imatrix: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -51,6 +56,8 @@ fn args() -> Args {
             "--tokenizer" => a.tokenizer = it.next().map(PathBuf::from),
             "--llm-device" => a.llm_device = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::device::Backend::Auto),
             "--head" => a.head = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::head::HeadMode::Full),
+            "--quant-preset" => a.quant_preset = it.next().unwrap_or_else(|| "zena".into()),
+            "--imatrix" => a.imatrix = it.next().map(PathBuf::from),
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -104,9 +111,12 @@ fn main() -> Result<()> {
     if checks.iter().any(|c| !c.ok) {
         bail!("kernel self-test failed: {checks:?}");
     }
+    // Report residency of pre-quantized GGUFs; a safetensors directory is quantized while the
+    // LLM backend loads it.
     let _models: Vec<GgufFile> = [a.model.as_ref(), a.vision.as_ref()]
         .into_iter()
         .flatten()
+        .filter(|p| p.is_file())
         .map(|p| open_model(p))
         .collect::<Result<_>>()?;
 
@@ -145,8 +155,21 @@ fn main() -> Result<()> {
     // candle-rocm-vulkan fork, chosen by --llm-device), otherwise the template stub.
     let backend: Box<dyn llm::LlmBackend> = match &a.model {
         Some(gguf) => {
-            let tok = a.tokenizer.clone().unwrap_or_else(|| gguf.with_file_name("tokenizer.json"));
-            Box::new(llm::RaonNanoBackend::load(gguf, &tok, a.llm_device, a.head)?)
+            let tok = a.tokenizer.clone().unwrap_or_else(|| {
+                if gguf.is_dir() {
+                    gguf.join("tokenizer.json")
+                } else {
+                    gguf.with_file_name("tokenizer.json")
+                }
+            });
+            Box::new(llm::RaonNanoBackend::load(
+                gguf,
+                &tok,
+                a.llm_device,
+                a.head,
+                &a.quant_preset,
+                a.imatrix.as_deref(),
+            )?)
         }
         None => Box::new(llm::TemplateBackend),
     };

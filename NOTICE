@@ -6,7 +6,8 @@ This repository contains code derived from third-party projects:
 1. Qntology/logis-center — https://github.com/Qntology/logis-center
    Apache License 2.0, Copyright 2026 Qntology.
    - crates/raon-quant/src/kquant.rs: vendored from commerce/crates/ggml-kquant/src/lib.rs
-     (commit 1913209). Encoder bodies unchanged; English docs and Format::ggml_type added.
+     (commit 1913209). Modified: English docs and Format::ggml_type added; the per-candidate
+     weighted error in fit_symmetric / fit_asymmetric is evaluated in closed form (one pass).
    - crates/nlp-nms-router: algorithms ported from commerce/src-tauri/src (see
      crates/nlp-nms-router/NOTICE for the file-by-file list and modifications).
 

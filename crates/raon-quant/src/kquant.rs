@@ -5,8 +5,11 @@
 // ggml's `quantize_row_q*_K_ref` (MIT, Copyright Georgi Gerganov), so the output is
 // bit-compatible with ggml / llama.cpp block layouts.
 //
-// Changes for Raon Zena: English module docs prepended and `Format::ggml_type` appended; the
-// encoder bodies are unchanged. Decoding and the fused dot kernels live in `crate::kernels`.
+// Changes for Raon Zena: English module docs prepended, `Format::ggml_type` appended, and the
+// weighted error of each scale candidate in `fit_symmetric` / `fit_asymmetric` is evaluated in
+// closed form from the sums of the candidate's single pass (marked `[raon-zena]`) — same
+// candidates, same least-squares solutions, half the work (used for load-time quantization).
+// Decoding and the fused dot kernels live in `crate::kernels`.
 //
 // (original note) 🌟 [PYRAMID-QUANT] GGML 블록 인코더 (Q8_0 · Q6_K · Q5_K · Q4_K).
 //
@@ -160,6 +163,9 @@ pub fn fit_symmetric(x: &[f32], w: &[f32], nmax: i32, qmin: i32) -> f32 {
     }
     let (lo, hi) = (qmin as f32, nmax as f32);
     let (mut best_err, mut best_d) = (f32::INFINITY, 0f32);
+    // [raon-zena] Σw(dq − x)² = Σwx² − d·Σwxq at the LS optimum d = Σwxq / Σwq²: one pass per
+    // candidate instead of two (same candidates, same solution).
+    let sum_wx2: f32 = x.iter().zip(w).map(|(&xi, &wi)| wi * xi * xi).sum();
     for s in -9..=9 {
         let inv = (nmax as f32 + 0.1 * s as f32) / amax;
         let (mut num, mut den) = (0f32, 0f32);
@@ -169,12 +175,7 @@ pub fn fit_symmetric(x: &[f32], w: &[f32], nmax: i32, qmin: i32) -> f32 {
             den += wi * q * q;
         }
         let d = if den > 0.0 { num / den } else { 0.0 };
-        let mut err = 0f32;
-        for (&xi, &wi) in x.iter().zip(w) {
-            let q = (xi * inv).round_ties_even().clamp(lo, hi);
-            let e = d * q - xi;
-            err += wi * e * e;
-        }
+        let err = sum_wx2 - d * num;
         if err < best_err {
             best_err = err;
             best_d = d;
@@ -192,6 +193,7 @@ pub fn fit_asymmetric(x: &[f32], w: &[f32], nmax: i32) -> (f32, f32) {
     let safe = if range > 0.0 { range } else { 1.0 };
     let sum_w: f32 = w.iter().sum();
     let sum_x: f32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
+    let sum_x2: f32 = w.iter().zip(x).map(|(a, b)| a * b * b).sum();
     let top = nmax as f32;
     let (mut best_err, mut best_d, mut best_m) = (f32::INFINITY, 0f32, 0f32);
     for s in 0..=20 {
@@ -217,12 +219,8 @@ pub fn fit_asymmetric(x: &[f32], w: &[f32], nmax: i32) -> (f32, f32) {
             d = scale_only();
             off = 0.0;
         }
-        let mut err = 0f32;
-        for (&xi, &wi) in x.iter().zip(w) {
-            let q = ((xi - lo) * inv).round_ties_even().clamp(0.0, top);
-            let e = d * q + off - xi;
-            err += wi * e * e;
-        }
+        // [raon-zena] Σw(dq + off − x)² expanded over the sums of this pass (no second pass).
+        let err = d * d * sl2 + 2.0 * d * off * sl + off * off * sum_w - 2.0 * d * sxl - 2.0 * off * sum_x + sum_x2;
         if err < best_err {
             best_err = err;
             best_d = d;

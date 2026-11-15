@@ -33,9 +33,36 @@ pub struct RaonNanoBackend {
 }
 
 impl RaonNanoBackend {
-    pub fn load(gguf: &Path, tokenizer: &Path, device: Backend, head: HeadMode) -> anyhow::Result<Self> {
+    /// `model` is either a pyramid GGUF written by `raon-quant`, or the original Hugging Face
+    /// safetensors directory, quantized while loading with `preset` (`prd`, `zena`, `q8`) and an
+    /// optional imatrix — no GGUF file involved.
+    pub fn load(
+        model: &Path,
+        tokenizer: &Path,
+        device: Backend,
+        head: HeadMode,
+        preset: &str,
+        imatrix: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let dev = select_device(device, 0)?;
-        let gen = Generator::load_gguf(gguf, tokenizer, dev.clone(), None, head)?;
+        let t = std::time::Instant::now();
+        let gen = if model.is_dir() {
+            let cfg = raon_quant::pyramid::PyramidConfig::preset(preset)?;
+            let g = Generator::load_safetensors_quantized(model, tokenizer, dev.clone(), &cfg, imatrix, head)?;
+            if let Some(q) = &g.model.w.quant {
+                let s = q.stats.lock().unwrap();
+                eprintln!(
+                    "[llm] load-time pyramid '{preset}': {} tensors, {:.0} MiB of blocks, encode {:.1}s, total {:.1}s",
+                    s.tensors,
+                    s.bytes as f64 / 1048576.0,
+                    s.encode_seconds,
+                    t.elapsed().as_secs_f32()
+                );
+            }
+            g
+        } else {
+            Generator::load_gguf(model, tokenizer, dev.clone(), None, head)?
+        };
         let full = build_fast_path_prompt(&Situation::default());
         let cut = full.find(USER_TURN).ok_or_else(|| anyhow::anyhow!("prompt has no user turn"))?;
         let t = std::time::Instant::now();

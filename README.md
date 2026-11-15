@@ -19,7 +19,7 @@
 | `crates/zena-sensor` | §2.1 · §2.2 | 로그 휘도 차분 **WGSL 컴퓨트 셰이더**(naga로 검증)와 동일한 알고리즘의 CPU 참조 구현, 타일 ROI 클러스터링, 트래커, NaFlex 패치 추출 |
 | `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. |
 | `crates/raon-quant` | §3 | 원본 safetensors를 mmap으로 읽어 **단일 패스 4계층 피라미드 양자화**를 하고 GGUF v3로 씁니다. 그 밖에 imatrix 반영, `--preset zena`(측정 기반 품질 레시피), `kept_ids` 어휘 절삭, 융합 dequant-dot 커널, 자가 검증이 들어 있습니다. |
-| `crates/raon-infer` | §2.4 | **Raon-1-nano 순전파**(RDA 18층 + MLA 6층 + Raon-mHC + PLE)를 candle로 구현했습니다. `cuda`/`rocm`/`vulkan`/`metal`/`flash-attn` 기능 플래그와 `Qntology/candle-rocm-vulkan` 포크를 씁니다. 그 밖에 GGUF 블록 디바이스 상주(`QMatMul`), 프리픽스 상태 캐시, `raon-chat`, `raon-imatrix`가 들어 있습니다. [`docs/INFERENCE.md`](docs/INFERENCE.md) |
+| `crates/raon-infer` | §2.4 | **Raon-1-nano 순전파**(RDA 18층 + MLA 6층 + Raon-mHC + PLE)를 candle로 구현했습니다. `cuda`/`rocm`/`vulkan`/`metal`/`flash-attn` 기능 플래그와 `Qntology/candle-rocm-vulkan` 포크를 씁니다. 그 밖에 GGUF 블록 디바이스 상주(`QMatMul`), **safetensors 로드 시점 피라미드 양자화**(GGUF 불필요), 프리픽스 상태 캐시, `raon-chat`, `raon-imatrix`가 들어 있습니다. [`docs/INFERENCE.md`](docs/INFERENCE.md) |
 | `apps/raon-zena` | §5 | Windows 오버레이(350×450 마이크로 뷰포트). 구성 요소: winit, 단일 wgpu DX12 디바이스(DirectComposition), DXGI Desktop Duplication, Win32 레이어 플래그와 전역 단축키, 절차적 플레이스홀더 아바타 |
 | `scripts/` | §0 A안 | 원본 가중치 병렬 다운로드와 SHA-256 검증(`fetch_models.sh`), llama.cpp `gguf-py` 교차 검증(`xcheck_gguf.py`), 공식 PyTorch 참조 로짓과 비교(`reference_logits.py`, `compare_logits.py`), 보정·평가 텍스트(`calibration/`) |
 | `.github/workflows/cross-verify.yml` | — | CPU 테스트와 `vulkan`/`rocm`/`cuda`(apt CUDA 툴킷) 빌드 검사, Linux·Windows. PR 또는 수동 실행 시 동작합니다. |
@@ -52,6 +52,12 @@ cp models/KRAFTON/Raon-1-nano/tokenizer.json out/
 
 ```bash
 ./target/release/raon-chat --gguf out/raon-1-nano.zena.gguf --device auto --prompt "보스가 내려찍기 할 때 어떻게 피해?"
+```
+
+GGUF로 변환하지 않고, 원본 safetensors를 로드하면서 바로 피라미드 양자화할 수도 있습니다(4코어에서 약 30초, 품질 동일).
+
+```bash
+./target/release/raon-chat --safetensors models/KRAFTON/Raon-1-nano --quantize zena --imatrix out/raon-1-nano.imatrix.dat --device auto --prompt "보스가 내려찍기 할 때 어떻게 피해?"
 ```
 
 ```bash

@@ -44,6 +44,18 @@ impl Generator {
         Self::from_weights(w, tokenizer, head)
     }
 
+    /// Original safetensors with pyramid quantization applied while loading (no GGUF).
+    pub fn load_safetensors_quantized(
+        dir: &Path,
+        tokenizer: &Path,
+        device: Device,
+        cfg: &raon_quant::pyramid::PyramidConfig,
+        imatrix: Option<&Path>,
+        head: HeadMode,
+    ) -> Result<Self> {
+        Self::from_weights(Weights::open_safetensors_quantized(dir, device, cfg, imatrix)?, tokenizer, head)
+    }
+
     pub fn load_safetensors(dir: &Path, tokenizer: &Path, device: Device) -> Result<Self> {
         Self::from_weights(Weights::open_safetensors(dir, device)?, tokenizer, HeadMode::Full)
     }

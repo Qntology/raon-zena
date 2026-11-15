@@ -204,7 +204,12 @@ pub fn dot_row(ty: GgmlType, b: &[u8], x: &[f32]) -> f32 {
             }
             acc
         }
-        _ => {
+        // Dense rows (e.g. a BF16 embedding table read straight from safetensors): convert in
+        // registers, no allocation.
+        GgmlType::BF16 => dot32(b.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32()), x),
+        GgmlType::F16 => dot32(b.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32()), x),
+        GgmlType::F32 => dot32(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])), x),
+        GgmlType::I32 => {
             let mut row = vec![0f32; x.len()];
             dequant_row(ty, b, &mut row);
             dot32(row.into_iter(), x)

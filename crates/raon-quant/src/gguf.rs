@@ -281,6 +281,7 @@ impl GgufTensor {
 /// Memory-mapped GGUF file; tensor/row accessors borrow directly from the map.
 pub struct GgufFile {
     map: Mmap,
+    pub path: PathBuf,
     data_start: usize,
     pub kvs: BTreeMap<String, Kv>,
     pub tensors: BTreeMap<String, GgufTensor>,
@@ -387,6 +388,7 @@ impl GgufFile {
         let data_start = c.p.div_ceil(align) * align;
         let g = GgufFile {
             map,
+            path: path.to_path_buf(),
             data_start,
             kvs,
             tensors,

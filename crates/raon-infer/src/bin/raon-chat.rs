@@ -25,6 +25,8 @@ struct Args {
     dump: Option<PathBuf>,
     exact: Option<bool>,
     head: raon_infer::head::HeadMode,
+    quantize: Option<String>,
+    imatrix: Option<PathBuf>,
 }
 
 fn parse() -> Result<Args> {
@@ -40,6 +42,8 @@ fn parse() -> Result<Args> {
         dump: None,
         exact: None,
         head: raon_infer::head::HeadMode::Full,
+        quantize: None,
+        imatrix: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -55,16 +59,30 @@ fn parse() -> Result<Args> {
             "--max-new" => a.max_new = v()?.parse()?,
             "--dump" => a.dump = Some(v()?.into()),
             "--head" => a.head = v()?.parse()?,
+            "--quantize" => a.quantize = Some(v()?),
+            "--imatrix" => a.imatrix = Some(v()?.into()),
             "--exact-matmul" => a.exact = Some(true),
             "--kquant-matmul" => a.exact = Some(false),
             "-h" | "--help" => {
-                println!("raon-chat (--gguf F | --safetensors DIR) [--tokenizer F] [--device auto|cpu|cuda|rocm|vulkan|metal] (--prompt TEXT | --raw TEXT) [--system TEXT] [--max-new N] [--head full|kept|guarded] [--dump F.f32] [--exact-matmul|--kquant-matmul]\nbuilt with: {}", compiled_backends().join(", "));
+                println!("raon-chat (--gguf F | --safetensors DIR) [--tokenizer F] [--device auto|cpu|cuda|rocm|vulkan|metal] (--prompt TEXT | --raw TEXT) [--system TEXT] [--max-new N] [--head full|kept|guarded] [--quantize prd|zena|q8 [--imatrix F]] [--dump F.f32] [--exact-matmul|--kquant-matmul]\nbuilt with: {}", compiled_backends().join(", "));
                 std::process::exit(0);
             }
             _ => bail!("unknown argument {k}"),
         }
     }
     Ok(a)
+}
+
+/// Resident memory of this process (Linux), split into anonymous and file-backed pages.
+fn rss() -> String {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let get = |k: &str| {
+        s.lines()
+            .find(|l| l.starts_with(k))
+            .map(|l| l[k.len()..].trim().to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    format!("VmRSS {} (anon {}, file {})", get("VmRSS:"), get("RssAnon:"), get("RssFile:"))
 }
 
 fn main() -> Result<()> {
@@ -78,10 +96,25 @@ fn main() -> Result<()> {
         }
         (None, Some(d)) => {
             let tok = a.tokenizer.clone().unwrap_or_else(|| d.join("tokenizer.json"));
-            Generator::load_safetensors(d, &tok, device.clone())?
+            match &a.quantize {
+                // Pyramid quantization while loading the original safetensors (no GGUF).
+                Some(preset) => {
+                    let cfg = raon_quant::pyramid::PyramidConfig::preset(preset)?;
+                    let g = Generator::load_safetensors_quantized(d, &tok, device.clone(), &cfg, a.imatrix.as_deref(), a.head)?;
+                    if let Some(q) = &g.model.w.quant {
+                        eprintln!(
+                            "[raon-chat] load-time pyramid '{preset}': {}",
+                            serde_json::to_string(&*q.stats.lock().unwrap())?
+                        );
+                    }
+                    g
+                }
+                None => Generator::load_safetensors(d, &tok, device.clone())?,
+            }
         }
         _ => bail!("pass --gguf or --safetensors"),
     };
+    eprintln!("[raon-chat] {}", rss());
     eprintln!(
         "[raon-chat] device={} exact_matmul={} head={:?} loaded in {:.1}s",
         describe(&device),

@@ -11,7 +11,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use raon_quant::gguf::{GgmlType, GgufFile};
 use raon_quant::kernels::{dequant_row, dot_row, matvec, verify_kernels};
-use raon_quant::kquant::Format;
 use raon_quant::lmhead::{exact_argmax, ColdGuard};
 use raon_quant::pyramid::{self, parse_format, Plan, PyramidConfig};
 use raon_quant::safetensors::SafeTensors;
@@ -100,32 +99,36 @@ struct Common {
 
 impl Common {
     fn config(&self) -> Result<PyramidConfig> {
-        let zena = match self.preset.as_str() {
-            "prd" => false,
-            "zena" => true,
-            p => bail!("unknown preset {p} (prd, zena)"),
-        };
-        let tier4 = match (zena, self.tier4.as_str()) {
-            (true, "q4_k") => Format::Q5K,
-            (_, t) => parse_format(t)?,
-        };
+        // Explicit flags override the preset only when they differ from the CLI defaults.
+        let base = PyramidConfig::preset(&self.preset)?;
         Ok(PyramidConfig {
             edge_front: self.edge_front,
             edge_back: self.edge_back,
-            tier2: parse_format(&self.tier2)?,
-            tier3: parse_format(&self.tier3)?,
-            tier4,
-            ple: match (&self.ple_format, zena) {
-                (Some(f), _) => Some(parse_format(f)?),
-                (None, true) => Some(Format::Q8_0),
-                (None, false) => None,
+            tier2: if self.tier2 == "q8_0" {
+                base.tier2
+            } else {
+                parse_format(&self.tier2)?
             },
-            mlp_sensitive_front: if zena && self.mlp_sensitive_front == 0 {
-                6
+            tier3: if self.tier3 == "q6_k" {
+                base.tier3
+            } else {
+                parse_format(&self.tier3)?
+            },
+            tier4: if self.tier4 == "q4_k" {
+                base.tier4
+            } else {
+                parse_format(&self.tier4)?
+            },
+            ple: match &self.ple_format {
+                Some(f) => Some(parse_format(f)?),
+                None => base.ple,
+            },
+            mlp_sensitive_front: if self.mlp_sensitive_front == 0 {
+                base.mlp_sensitive_front
             } else {
                 self.mlp_sensitive_front
             },
-            ..Default::default()
+            ..base
         })
     }
 }

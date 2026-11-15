@@ -98,6 +98,50 @@ pub struct PyramidConfig {
     pub guard_iters: usize,
 }
 
+impl PyramidConfig {
+    /// Named recipes.
+    /// * `prd`  — the PRD v3.0 pyramid as written (T4 Q4_K for MLP and the PLE table).
+    /// * `zena` — the measured quality recipe for Raon-1-nano: MLP Q5_K, the 6 MLPs after the
+    ///   front edge Q6_K, PLE table Q8_0 (disk-gathered). Use with an imatrix.
+    /// * `q8`   — every quantized tensor Q8_0 (Vulkan runs only Q8_0 on the GPU).
+    pub fn preset(name: &str) -> Result<Self> {
+        let d = Self::default();
+        Ok(match name {
+            "prd" => d,
+            "zena" => Self {
+                tier4: Format::Q5K,
+                ple: Some(Format::Q8_0),
+                mlp_sensitive_front: 6,
+                ..d
+            },
+            "q8" => Self {
+                tier3: Format::Q8_0,
+                tier4: Format::Q8_0,
+                ple: Some(Format::Q8_0),
+                ..d
+            },
+            _ => bail!("unknown preset {name} (prd, zena, q8)"),
+        })
+    }
+}
+
+/// Load-time view of the Raon-1-nano plan: original tensor name → quantized format, for every
+/// matrix the pyramid quantizes in place (no vocabulary slicing; the gathered tables stay in
+/// their original dtype). Used by `raon-infer` to quantize straight from safetensors at load.
+pub fn nano_formats(st: &SafeTensors, cfg: &PyramidConfig, n_layers: usize) -> Result<HashMap<String, (Tier, Format, Residency)>> {
+    let vocab = VocabSlice::full(st.info("model.embed_tokens.weight")?.shape[0]);
+    let plan = plan_raon1_nano(st, cfg, &vocab, n_layers)?;
+    Ok(plan
+        .items
+        .into_iter()
+        .filter(|it| it.out == it.src)
+        .filter_map(|it| match it.store {
+            Store::Quant(f) => Some((it.src, (it.tier, f, it.residency))),
+            _ => None,
+        })
+        .collect())
+}
+
 impl Default for PyramidConfig {
     fn default() -> Self {
         Self {

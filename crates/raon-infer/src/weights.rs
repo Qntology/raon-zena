@@ -5,9 +5,14 @@ use anyhow::{bail, Context, Result};
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
 use candle_core::{Device, Tensor};
 use raon_quant::gguf::{GgmlType, GgufFile};
+use raon_quant::imatrix::read_imatrix;
 use raon_quant::kernels::dequant_row;
+use raon_quant::kquant::{encode, Format};
+use raon_quant::pyramid::{self, PyramidConfig, Residency, Tier};
 use raon_quant::safetensors::SafeTensors;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Mutex;
 
 pub enum Source {
     Gguf(GgufFile),
@@ -26,6 +31,8 @@ pub struct Weights {
     /// take the tensors whose name contains one of the patterns from a pyramid GGUF instead
     /// (dequantized) — attributes quantization error to tensor groups.
     mix: Option<(GgufFile, Vec<String>)>,
+    /// Load-time pyramid quantization of an original safetensors model (no GGUF file).
+    pub quant: Option<LoadQuant>,
 }
 
 /// Importance-matrix collection (PRD §3.3): Σx² per input column of every linear layer, over a
@@ -72,6 +79,29 @@ pub mod imatrix {
         std::fs::write(path, b)?;
         Ok(acc.len())
     }
+}
+
+/// Load-time pyramid ("tower") quantization: every matrix the 4-tier plan quantizes is encoded
+/// from the mmap'd original safetensors the first and only time it is loaded, and the blocks go
+/// straight to the device. Gathered tables (`embed_tokens`, the PLE table) are never quantized:
+/// their original BF16 rows are read from the mmap per token.
+pub struct LoadQuant {
+    formats: HashMap<String, (Tier, Format, Residency)>,
+    imatrix: Option<HashMap<String, Vec<f32>>>,
+    pub stats: Mutex<LoadStats>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LoadStats {
+    pub tensors: usize,
+    pub params: usize,
+    pub bytes: usize,
+    /// Wall time inside the encoder / reading+decoding the originals / uploading the blocks.
+    pub encode_seconds: f64,
+    pub read_seconds: f64,
+    pub upload_seconds: f64,
+    /// format → (tensors, params, bytes)
+    pub by_format: BTreeMap<&'static str, (usize, usize, usize)>,
 }
 
 /// A linear layer `y = x Wᵀ` whose weight stays in its stored (quantized) form on the device.
@@ -130,6 +160,7 @@ impl Weights {
             kept_ids,
             config_json,
             mix: None,
+            quant: None,
         })
     }
 
@@ -151,7 +182,72 @@ impl Weights {
             kept_ids: None,
             config_json,
             mix,
+            quant: None,
         })
+    }
+
+    /// Original safetensors + pyramid quantization at load time (see [`LoadQuant`]).
+    pub fn open_safetensors_quantized(dir: &Path, device: Device, cfg: &PyramidConfig, imatrix: Option<&Path>) -> Result<Self> {
+        let mut w = Self::open_safetensors(dir, device)?;
+        let Source::SafeTensors(st) = &w.src else { unreachable!() };
+        let n_layers = pyramid::n_layers_from_config(dir)?;
+        let formats = pyramid::nano_formats(st, cfg, n_layers)?;
+        let imatrix = imatrix.map(read_imatrix).transpose()?;
+        w.exact = crate::device::exact_matmul_native(&w.device);
+        w.quant = Some(LoadQuant {
+            formats,
+            imatrix,
+            stats: Mutex::new(LoadStats::default()),
+        });
+        Ok(w)
+    }
+
+    /// Drop the pages of the original weights that were touched while quantizing: re-map the
+    /// files, so only the rows gathered later (embeddings, PLE) count toward the RSS.
+    pub fn release_mapped_pages(&mut self) -> Result<()> {
+        match &self.src {
+            Source::SafeTensors(st) => {
+                let paths = st.paths.clone();
+                self.src = Source::SafeTensors(SafeTensors::open(&paths)?);
+            }
+            // The device copies of the blocks are made; drop the touched file pages as well.
+            Source::Gguf(g) => {
+                let path = g.path.clone();
+                self.src = Source::Gguf(GgufFile::open(&path)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn quantize_linear(&self, q: &LoadQuant, st: &SafeTensors, name: &str, f: Format, shape: &[usize]) -> Result<QMatMul> {
+        let t = std::time::Instant::now();
+        let cols = shape[1];
+        let data = st.all_f32(name)?;
+        let t_read = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let imat = q
+            .imatrix
+            .as_ref()
+            .and_then(|m| m.get(name))
+            .filter(|v| v.len() == cols)
+            .map(|v| v.as_slice());
+        let bytes = encode(&data, cols, f, imat).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+        let t_enc = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let ty = f.ggml_type();
+        let qt = qtensor_from_ggml(ggml_dtype(ty)?, &bytes, shape.to_vec(), &self.device)?;
+        let mut s = q.stats.lock().unwrap();
+        s.tensors += 1;
+        s.params += data.len();
+        s.bytes += bytes.len();
+        s.encode_seconds += t_enc;
+        s.read_seconds += t_read;
+        s.upload_seconds += t.elapsed().as_secs_f64();
+        let e = s.by_format.entry(ty.name()).or_default();
+        e.0 += 1;
+        e.1 += data.len();
+        e.2 += bytes.len();
+        Ok(QMatMul::from_qtensor(qt)?)
     }
 
     fn mixed(&self, name: &str) -> Option<&GgufFile> {
@@ -233,7 +329,10 @@ impl Weights {
                     }
                 }
             }
-            Source::SafeTensors(_) => QMatMul::Tensor(self.tensor(name, None)?),
+            Source::SafeTensors(st) => match self.quant.as_ref().and_then(|q| q.formats.get(name).map(|e| (q, e.1))) {
+                Some((q, f)) => self.quantize_linear(q, st, name, f, &shape)?,
+                None => QMatMul::Tensor(self.tensor(name, None)?),
+            },
         };
         // Dense weights run a plain f32 matmul; `exact` only matters for quantized ones.
         Ok(Linear {

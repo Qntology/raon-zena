@@ -83,6 +83,52 @@ cargo build --release -p raon-zena --features vulkan
 - **출력 head.** `full`(기본, 정확), `kept`(절삭 행만, 근사), `guarded`(cold 클러스터 상한) 중 고릅니다.
 - **상태 캐시.** `State`(RDA conv·재귀 상태, MLA KV)는 복제 비용이 낮습니다. 그래서 Zena의 고정 프롬프트(페르소나 + 툴 정의)를 한 번만 프리필하고 요청마다 복제합니다(`Generator::prefix_state`).
 
+## 로드 시점 피라미드 양자화 (GGUF 없이)
+
+미리 GGUF로 변환하지 않고, **원본 safetensors를 mmap으로 열면서 그 자리에서 4계층 피라미드 양자화**를 적용할 수도 있습니다. `logis-center`가 SigLIP2 타워를 원본에서 바로 양자화하는 방식과 같은 발상이고, PRD §3.1의 "원본을 mmap으로 직접 읽어 단 1회 양자화"를 그대로 따릅니다.
+
+```bash
+./target/release/raon-chat --safetensors models/KRAFTON/Raon-1-nano --quantize zena --imatrix out/raon-1-nano.imatrix.dat --device auto --prompt "..."
+```
+
+```bash
+cargo run --release -p raon-zena --features cuda -- --model models/KRAFTON/Raon-1-nano --quant-preset zena --imatrix out/raon-1-nano.imatrix.dat
+```
+
+동작 방식(`Weights::open_safetensors_quantized`):
+1. **계획을 세웁니다.** `raon_quant::pyramid::nano_formats`가 GGUF 변환과 똑같은 티어 정책으로 텐서마다 형식을 정합니다.
+   - T1: 원본 그대로
+   - T2: Q8_0
+   - T3: Q6_K
+   - T4: Q4_K 또는 Q5_K
+   - 프리셋은 `prd`, `zena`, `q8` 중에서 고릅니다.
+2. **텐서마다 한 번 양자화합니다.** `Linear`를 만들 때 원본 BF16 행을 f32로 디코드하고, 가중 최소제곱 인코더(imatrix 반영)로 블록을 만들어 `qtensor_from_ggml`로 바로 디바이스에 올립니다. 중간 파일은 없습니다.
+3. **gather 테이블은 양자화하지 않습니다.** `embed_tokens`와 PLE 테이블은 원본 BF16 행을 토큰마다 mmap에서 읽습니다. GGUF 경로(Q8_0)보다 정확하고, 상주 메모리는 0입니다. CPU의 `full` head도 BF16 테이블을 융합 커널로 직접 스캔합니다.
+4. **로드 중에 읽은 원본 페이지를 해제합니다.** 로드 후 파일을 다시 매핑해, 이후 gather한 행만 RSS에 남게 합니다.
+
+측정 결과(4코어 CPU, 페이지 캐시가 따뜻한 상태, 278개 위치 평가셋):
+
+| 방식 | 로드 (캐시 있음 / 없음) | RSS (로드 후) | KL(ref‖x) | top-1 / top-5 |
+|---|---|---|---|---|
+| zena GGUF (미리 변환) | 1.3 s / 29.9 s | 1.09 GiB | 0.0235 | 91.4% / 92.9% |
+| safetensors + 로드 시점 `zena` | **31.7 s** / 약 115 s | 1.14 GiB | **0.0232** | 90.3% / 92.6% |
+
+"캐시 없음"은 파일이 OS 페이지 캐시에 없어 이 컨테이너 디스크에서 처음 읽는 경우입니다(GGUF 3.0 GB, 원본 7.1 GB). 두 경로 모두 로드가 끝나면 원본 매핑을 다시 열어, 로드 중에 건드린 파일 페이지가 RSS에 남지 않게 했습니다. 이 처리 전에는 GGUF 경로의 RSS가 2.06 GB였습니다.
+
+- **블록 양.** 247개 텐서, 11.2억 파라미터를 913 MB 블록으로 올립니다.
+- **로드 시간 구성.** 인코딩 28.4 s, 원본 읽기 2.0 s, 업로드 0.4 s입니다.
+- **원본이 페이지 캐시에 없을 때.** 디스크 읽기 시간이 더해집니다.
+- **코어 수에 따른 변화.** 인코더는 rayon으로 병렬화되어 있어 코어 수에 거의 비례해 빨라집니다(16코어면 약 8 s로 추정).
+- **인코더 개선.** 각 후보 스케일의 가중 오차를 두 번째 패스 대신 첫 패스의 합으로 닫힌 형태로 계산하도록 바꿨습니다(`kquant.rs`의 `[raon-zena]` 표시). 결과는 다음과 같습니다.
+  - 속도: 20 → 33 Melem/s
+  - 상대오차: 실제 Raon 텐서에서 원래 알고리즘과 소수점 6자리까지 같습니다(Q4_K 0.072400, Q5_K 0.035935, Q6_K 0.017543).
+  - 블록 값: 95–99.8%가 비트 단위로 동일합니다.
+
+두 방식 중 어느 것을 쓸지는 다음과 같이 고르면 됩니다.
+- **로드 시점 양자화**: 레시피나 imatrix를 바꿔도 바로 반영되고, 배포물이 원본 하나뿐입니다.
+- **GGUF 변환**: 페이지 캐시에 있으면 시작이 즉시이고(1.3 s), 디스크가 작습니다(3.0 GB vs 원본 7.1 GB).
+- **GPU 사용 시 주의**: `full` head를 쓰면 `embed_tokens`도 로드 때 Q8_0으로 양자화해 VRAM에 올리므로, 인코딩 시간이 약 4억 파라미터만큼 늘어납니다.
+
 ## 검증 (공식 PyTorch 구현 대비)
 
 `scripts/reference_logits.py`는 HF 공식 구현을 `trust_remote_code`, float32로 실행합니다. 그 출력과 `raon-chat --dump`의 출력을 `scripts/compare_logits.py`로 비교했습니다. 평가 텍스트는 `scripts/calibration/raon_eval.txt`(278토큰, 한국어/영어/툴콜)이고, 보정 텍스트와 겹치지 않습니다.

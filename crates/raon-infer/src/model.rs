@@ -649,7 +649,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(w: Weights) -> Result<Self> {
+    pub fn load(mut w: Weights) -> Result<Self> {
         let cfg = Config::from_json(&w.config_json)?;
         let n = cfg.streams;
         let dev = w.device.clone();
@@ -672,6 +672,9 @@ impl Model {
             (None, None)
         };
         let norm = w.tensor("model.norm.weight", None)?;
+        // Weights are on the device now; re-map the sources so only rows gathered later
+        // (embeddings, PLE, head scan) stay resident.
+        w.release_mapped_pages()?;
         Ok(Self {
             cfg,
             w,
