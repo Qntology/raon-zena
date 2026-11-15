@@ -45,15 +45,22 @@ impl Generator {
     }
 
     /// Original safetensors with pyramid quantization applied while loading (no GGUF).
+    #[allow(clippy::too_many_arguments)]
     pub fn load_safetensors_quantized(
         dir: &Path,
         tokenizer: &Path,
         device: Device,
+        preset: &str,
         cfg: &raon_quant::pyramid::PyramidConfig,
         imatrix: Option<&Path>,
+        cache: &crate::weights::BlockCache,
         head: HeadMode,
     ) -> Result<Self> {
-        Self::from_weights(Weights::open_safetensors_quantized(dir, device, cfg, imatrix)?, tokenizer, head)
+        Self::from_weights(
+            Weights::open_safetensors_quantized(dir, device, preset, cfg, imatrix, cache)?,
+            tokenizer,
+            head,
+        )
     }
 
     pub fn load_safetensors(dir: &Path, tokenizer: &Path, device: Device) -> Result<Self> {

@@ -27,6 +27,7 @@ struct Args {
     head: raon_infer::head::HeadMode,
     quantize: Option<String>,
     imatrix: Option<PathBuf>,
+    cache: raon_infer::weights::BlockCache,
 }
 
 fn parse() -> Result<Args> {
@@ -44,6 +45,7 @@ fn parse() -> Result<Args> {
         head: raon_infer::head::HeadMode::Full,
         quantize: None,
         imatrix: None,
+        cache: raon_infer::weights::BlockCache::Default,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -61,10 +63,12 @@ fn parse() -> Result<Args> {
             "--head" => a.head = v()?.parse()?,
             "--quantize" => a.quantize = Some(v()?),
             "--imatrix" => a.imatrix = Some(v()?.into()),
+            "--quant-cache" => a.cache = raon_infer::weights::BlockCache::Dir(v()?.into()),
+            "--no-quant-cache" => a.cache = raon_infer::weights::BlockCache::Off,
             "--exact-matmul" => a.exact = Some(true),
             "--kquant-matmul" => a.exact = Some(false),
             "-h" | "--help" => {
-                println!("raon-chat (--gguf F | --safetensors DIR) [--tokenizer F] [--device auto|cpu|cuda|rocm|vulkan|metal] (--prompt TEXT | --raw TEXT) [--system TEXT] [--max-new N] [--head full|kept|guarded] [--quantize prd|zena|q8 [--imatrix F]] [--dump F.f32] [--exact-matmul|--kquant-matmul]\nbuilt with: {}", compiled_backends().join(", "));
+                println!("raon-chat (--gguf F | --safetensors DIR) [--tokenizer F] [--device auto|cpu|cuda|rocm|vulkan|metal] (--prompt TEXT | --raw TEXT) [--system TEXT] [--max-new N] [--head full|kept|guarded] [--quantize prd|zena|q8 [--imatrix F] [--quant-cache DIR | --no-quant-cache]] [--dump F.f32] [--exact-matmul|--kquant-matmul]\nbuilt with: {}", compiled_backends().join(", "));
                 std::process::exit(0);
             }
             _ => bail!("unknown argument {k}"),
@@ -100,7 +104,16 @@ fn main() -> Result<()> {
                 // Pyramid quantization while loading the original safetensors (no GGUF).
                 Some(preset) => {
                     let cfg = raon_quant::pyramid::PyramidConfig::preset(preset)?;
-                    let g = Generator::load_safetensors_quantized(d, &tok, device.clone(), &cfg, a.imatrix.as_deref(), a.head)?;
+                    let g = Generator::load_safetensors_quantized(
+                        d,
+                        &tok,
+                        device.clone(),
+                        preset,
+                        &cfg,
+                        a.imatrix.as_deref(),
+                        &a.cache,
+                        a.head,
+                    )?;
                     if let Some(q) = &g.model.w.quant {
                         eprintln!(
                             "[raon-chat] load-time pyramid '{preset}': {}",

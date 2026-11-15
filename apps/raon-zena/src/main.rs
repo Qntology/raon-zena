@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! raon-zena [--synthetic] [--model out/raon-1-nano.zena.gguf | models/KRAFTON/Raon-1-nano]
-//!           [--quant-preset zena|prd|q8] [--imatrix out/raon-1-nano.imatrix.dat] [--tokenizer tokenizer.json]
+//!           [--quant-preset zena|prd|q8] [--imatrix out/raon-1-nano.imatrix.dat] [--quant-cache DIR | --no-quant-cache]
+//!           [--tokenizer tokenizer.json]
 //!           [--llm-device auto|cpu|cuda|rocm|vulkan|metal] [--head full|kept|guarded]
 //!           [--vision out/raon-ve-vision.pyramid.gguf]
 //! ```
@@ -34,6 +35,7 @@ struct Args {
     head: raon_infer::head::HeadMode,
     quant_preset: String,
     imatrix: Option<PathBuf>,
+    quant_cache: raon_infer::weights::BlockCache,
 }
 
 fn args() -> Args {
@@ -46,6 +48,7 @@ fn args() -> Args {
         head: raon_infer::head::HeadMode::Full,
         quant_preset: "zena".into(),
         imatrix: None,
+        quant_cache: raon_infer::weights::BlockCache::Default,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -58,6 +61,13 @@ fn args() -> Args {
             "--head" => a.head = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::head::HeadMode::Full),
             "--quant-preset" => a.quant_preset = it.next().unwrap_or_else(|| "zena".into()),
             "--imatrix" => a.imatrix = it.next().map(PathBuf::from),
+            "--quant-cache" => {
+                a.quant_cache = it
+                    .next()
+                    .map(|d| raon_infer::weights::BlockCache::Dir(PathBuf::from(d)))
+                    .unwrap_or_default()
+            }
+            "--no-quant-cache" => a.quant_cache = raon_infer::weights::BlockCache::Off,
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -169,6 +179,7 @@ fn main() -> Result<()> {
                 a.head,
                 &a.quant_preset,
                 a.imatrix.as_deref(),
+                &a.quant_cache,
             )?)
         }
         None => Box::new(llm::TemplateBackend),

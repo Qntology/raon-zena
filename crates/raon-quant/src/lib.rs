@@ -11,6 +11,7 @@
 //! * [`lmhead`]      – exact arg-max over a sliced head (cold-row cluster bounds).
 //! * [`gguf`], [`safetensors`], [`imatrix`] – file formats.
 
+pub mod cache;
 pub mod gguf;
 pub mod imatrix;
 pub mod kernels;

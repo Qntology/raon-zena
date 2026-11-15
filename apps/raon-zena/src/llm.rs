@@ -35,7 +35,8 @@ pub struct RaonNanoBackend {
 impl RaonNanoBackend {
     /// `model` is either a pyramid GGUF written by `raon-quant`, or the original Hugging Face
     /// safetensors directory, quantized while loading with `preset` (`prd`, `zena`, `q8`) and an
-    /// optional imatrix — no GGUF file involved.
+    /// optional imatrix. With a block cache (default) the blocks are built from the originals on
+    /// the first run and mapped on later runs, like logis-center's runtime towers.
     pub fn load(
         model: &Path,
         tokenizer: &Path,
@@ -43,19 +44,21 @@ impl RaonNanoBackend {
         head: HeadMode,
         preset: &str,
         imatrix: Option<&Path>,
+        cache: &raon_infer::weights::BlockCache,
     ) -> anyhow::Result<Self> {
         let dev = select_device(device, 0)?;
         let t = std::time::Instant::now();
         let gen = if model.is_dir() {
             let cfg = raon_quant::pyramid::PyramidConfig::preset(preset)?;
-            let g = Generator::load_safetensors_quantized(model, tokenizer, dev.clone(), &cfg, imatrix, head)?;
+            let g = Generator::load_safetensors_quantized(model, tokenizer, dev.clone(), preset, &cfg, imatrix, cache, head)?;
             if let Some(q) = &g.model.w.quant {
                 let s = q.stats.lock().unwrap();
                 eprintln!(
-                    "[llm] load-time pyramid '{preset}': {} tensors, {:.0} MiB of blocks, encode {:.1}s, total {:.1}s",
+                    "[llm] load-time pyramid '{preset}': cache {} ({} of {} tensors from it), {:.0} MiB of blocks, total {:.1}s",
+                    s.cache,
+                    s.cached_tensors,
                     s.tensors,
                     s.bytes as f64 / 1048576.0,
-                    s.encode_seconds,
                     t.elapsed().as_secs_f32()
                 );
             }

@@ -54,7 +54,7 @@ cp models/KRAFTON/Raon-1-nano/tokenizer.json out/
 ./target/release/raon-chat --gguf out/raon-1-nano.zena.gguf --device auto --prompt "보스가 내려찍기 할 때 어떻게 피해?"
 ```
 
-GGUF로 변환하지 않고, 원본 safetensors를 로드하면서 바로 피라미드 양자화할 수도 있습니다(4코어에서 약 30초, 품질 동일).
+GGUF로 변환하지 않고, 원본 safetensors를 로드하면서 바로 피라미드 양자화할 수도 있습니다. 처음 한 번만 블록을 만들어 `runtime-<프리셋>-<해시>/`에 저장하고(4코어 약 33초), 다음부터는 1초대에 올라갑니다. `logis-center`와 같은 런타임 캐시 방식이며 품질은 같습니다.
 
 ```bash
 ./target/release/raon-chat --safetensors models/KRAFTON/Raon-1-nano --quantize zena --imatrix out/raon-1-nano.imatrix.dat --device auto --prompt "보스가 내려찍기 할 때 어떻게 피해?"

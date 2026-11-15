@@ -88,11 +88,33 @@ pub mod imatrix {
 pub struct LoadQuant {
     formats: HashMap<String, (Tier, Format, Residency)>,
     imatrix: Option<HashMap<String, Vec<f32>>>,
+    /// Runtime block cache (`raon_quant::cache`): blocks built once from the originals, mapped
+    /// on later runs. Tensors missing from it are quantized in memory.
+    cache: Option<GgufFile>,
     pub stats: Mutex<LoadStats>,
+}
+
+/// Where load-time quantization keeps its blocks between runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BlockCache {
+    /// Quantize in memory on every load.
+    Off,
+    /// `<model dir>/runtime-<preset>-<hash>/`, falling back to the user cache directory.
+    #[default]
+    Default,
+    /// An explicit cache root.
+    Dir(std::path::PathBuf),
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LoadStats {
+    /// `hit`, `built` or `off` (and the blocks path).
+    pub cache: String,
+    pub cache_path: Option<String>,
+    /// Seconds spent building the cache (0 on a hit).
+    pub cache_build_seconds: f64,
+    /// Matrices taken from the cache vs quantized in memory.
+    pub cached_tensors: usize,
     pub tensors: usize,
     pub params: usize,
     pub bytes: usize,
@@ -187,19 +209,93 @@ impl Weights {
     }
 
     /// Original safetensors + pyramid quantization at load time (see [`LoadQuant`]).
-    pub fn open_safetensors_quantized(dir: &Path, device: Device, cfg: &PyramidConfig, imatrix: Option<&Path>) -> Result<Self> {
+    pub fn open_safetensors_quantized(
+        dir: &Path,
+        device: Device,
+        preset: &str,
+        cfg: &PyramidConfig,
+        imatrix: Option<&Path>,
+        cache: &BlockCache,
+    ) -> Result<Self> {
         let mut w = Self::open_safetensors(dir, device)?;
         let Source::SafeTensors(st) = &w.src else { unreachable!() };
         let n_layers = pyramid::n_layers_from_config(dir)?;
         let formats = pyramid::nano_formats(st, cfg, n_layers)?;
-        let imatrix = imatrix.map(read_imatrix).transpose()?;
+        let mut stats = LoadStats {
+            cache: "off".into(),
+            ..Default::default()
+        };
+        // logis-center scheme: build the blocks once from the originals, map them afterwards.
+        let cache_file = match cache {
+            BlockCache::Off => None,
+            BlockCache::Default | BlockCache::Dir(_) => {
+                let root = match cache {
+                    BlockCache::Dir(d) => Some(d.as_path()),
+                    _ => None,
+                };
+                let spec = raon_quant::cache::CacheSpec {
+                    model_dir: dir,
+                    preset,
+                    cfg,
+                    imatrix,
+                    // A GPU full head needs the Q8_0 embedding table on the device.
+                    host_gather: !w.device.is_cpu(),
+                    root,
+                };
+                match raon_quant::cache::prepare(&spec) {
+                    Ok(p) => {
+                        match &p {
+                            raon_quant::cache::Prepared::Hit { .. } => stats.cache = "hit".into(),
+                            raon_quant::cache::Prepared::Built { seconds, .. } => {
+                                stats.cache = "built".into();
+                                stats.cache_build_seconds = *seconds as f64;
+                            }
+                        }
+                        stats.cache_path = Some(p.blocks().display().to_string());
+                        Some(GgufFile::open(p.blocks())?)
+                    }
+                    Err(e) => {
+                        eprintln!("[quant-cache] cannot use a block cache ({e:#}); quantizing in memory");
+                        None
+                    }
+                }
+            }
+        };
+        // The imatrix is only needed when something still has to be encoded here.
+        let imatrix = if cache_file.is_some() {
+            None
+        } else {
+            imatrix.map(read_imatrix).transpose()?
+        };
         w.exact = crate::device::exact_matmul_native(&w.device);
         w.quant = Some(LoadQuant {
             formats,
             imatrix,
-            stats: Mutex::new(LoadStats::default()),
+            cache: cache_file,
+            stats: Mutex::new(stats),
         });
         Ok(w)
+    }
+
+    fn cached_linear(&self, q: &LoadQuant, name: &str, shape: &[usize]) -> Result<Option<QMatMul>> {
+        let Some(c) = &q.cache else { return Ok(None) };
+        let Some(t) = c.tensors.get(name) else { return Ok(None) };
+        if t.shape != shape {
+            return Ok(None);
+        }
+        let tm = std::time::Instant::now();
+        let qt = qtensor_from_ggml(ggml_dtype(t.ty)?, c.tensor_bytes(name)?, shape.to_vec(), &self.device)?;
+        let mut s = q.stats.lock().unwrap();
+        s.cached_tensors += 1;
+        s.tensors += 1;
+        s.params += shape.iter().product::<usize>();
+        s.bytes += t.nbytes();
+        s.upload_seconds += tm.elapsed().as_secs_f64();
+        let e = s.by_format.entry(t.ty.name()).or_default();
+        e.0 += 1;
+        e.1 += shape.iter().product::<usize>();
+        e.2 += t.nbytes();
+        Ok(Some(QMatMul::from_qtensor(qt)?))
     }
 
     /// Drop the pages of the original weights that were touched while quantizing: re-map the
@@ -209,6 +305,10 @@ impl Weights {
             Source::SafeTensors(st) => {
                 let paths = st.paths.clone();
                 self.src = Source::SafeTensors(SafeTensors::open(&paths)?);
+                // The cached blocks were copied to the device as well.
+                if let Some(q) = &mut self.quant {
+                    q.cache = None;
+                }
             }
             // The device copies of the blocks are made; drop the touched file pages as well.
             Source::Gguf(g) => {
@@ -330,7 +430,10 @@ impl Weights {
                 }
             }
             Source::SafeTensors(st) => match self.quant.as_ref().and_then(|q| q.formats.get(name).map(|e| (q, e.1))) {
-                Some((q, f)) => self.quantize_linear(q, st, name, f, &shape)?,
+                Some((q, f)) => match self.cached_linear(q, name, &shape)? {
+                    Some(m) => m,
+                    None => self.quantize_linear(q, st, name, f, &shape)?,
+                },
                 None => QMatMul::Tensor(self.tensor(name, None)?),
             },
         };

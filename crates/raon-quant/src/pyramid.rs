@@ -125,6 +125,28 @@ impl PyramidConfig {
     }
 }
 
+/// The part of the Raon-1-nano plan that a load-time block cache stores: every matrix quantized
+/// in place (original names, no vocabulary slicing). `host_gather` also keeps the Q8_0
+/// `embed_tokens` (needed when the full head runs on a GPU). Norms, gates and the other T1
+/// tensors are not cached — they are read from the originals.
+pub fn nano_cache_plan(st: &SafeTensors, cfg: &PyramidConfig, n_layers: usize, host_gather: bool) -> Result<Plan> {
+    let vocab = VocabSlice::full(st.info("model.embed_tokens.weight")?.shape[0]);
+    let mut plan = plan_raon1_nano(st, cfg, &vocab, n_layers)?;
+    plan.items
+        .retain(|it| it.out == it.src && matches!(it.store, Store::Quant(_)) && (host_gather || it.residency == Residency::Device));
+    plan.aux.clear();
+    plan.excluded.clear();
+    plan.arch = "raon1_nano_blockcache";
+    plan.kvs = vec![
+        ("general.architecture".into(), Kv::Str("raon1_nano_blockcache".into())),
+        (
+            "general.name".into(),
+            Kv::Str("Raon-1-nano load-time block cache (Raon Zena)".into()),
+        ),
+    ];
+    Ok(plan)
+}
+
 /// Load-time view of the Raon-1-nano plan: original tensor name → quantized format, for every
 /// matrix the pyramid quantizes in place (no vocabulary slicing; the gathered tables stay in
 /// their original dtype). Used by `raon-infer` to quantize straight from safetensors at load.
@@ -650,6 +672,34 @@ pub fn convert(
     extra_kvs: Vec<(String, Kv)>,
     imatrix: Option<&HashMap<String, Vec<f32>>>,
 ) -> Result<Report> {
+    convert_with(st, plan, cfg, out, extra_kvs, imatrix, &|k, n, it, rep, secs| {
+        eprintln!(
+            "[{:>4}/{}] {:<62} {:?} {:>5} {:>12?} rel_err={:.5} {:.1}s",
+            k + 1,
+            n,
+            it.out,
+            it.tier,
+            it.ty.name(),
+            it.stored,
+            rep.rel_err,
+            secs
+        );
+    })
+}
+
+/// Progress callback of [`convert_with`]: (index, total, item, its report, seconds).
+pub type OnItem<'a> = &'a (dyn Fn(usize, usize, &PlanItem, &ItemReport, f32) + Sync);
+
+/// [`convert`] with a caller-supplied progress callback (the runtime block cache logs sparsely).
+pub fn convert_with(
+    st: &SafeTensors,
+    plan: &Plan,
+    cfg: &PyramidConfig,
+    out: &Path,
+    extra_kvs: Vec<(String, Kv)>,
+    imatrix: Option<&HashMap<String, Vec<f32>>>,
+    on_item: OnItem,
+) -> Result<Report> {
     let t0 = Instant::now();
     let mut config = BTreeMap::new();
     config.insert("recipe".into(), "pyramid-4tier/1".into());
@@ -698,17 +748,7 @@ pub fn convert(
     for (k, it) in plan.items.iter().enumerate() {
         let t = Instant::now();
         let rep = write_item(st, it, &mut w, imatrix)?;
-        eprintln!(
-            "[{:>4}/{}] {:<62} {:?} {:>5} {:>12?} rel_err={:.5} {:.1}s",
-            k + 1,
-            plan.items.len(),
-            it.out,
-            it.tier,
-            it.ty.name(),
-            it.stored,
-            rep.rel_err,
-            t.elapsed().as_secs_f32()
-        );
+        on_item(k, plan.items.len(), it, &rep, t.elapsed().as_secs_f32());
         reports.push(rep);
     }
     for a in &plan.aux {
