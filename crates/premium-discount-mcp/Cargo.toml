@@ -1,0 +1,23 @@
+[package]
+name = "premium-discount-mcp"
+description = "premium.discount for Raon Zena: a headless MCP server (JSON-RPC 2.0 over stdio) that wraps premium-discount-app's line protocol (local LanceDB outbox, votes, verdict cache, embeddinggemma-2, QR login), plus the coalesced sync client the app drives it with"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zena-avatar-mcp = { path = "../zena-avatar-mcp" }
+anyhow = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+# ethers-compatible hashId: keccak256 + secp256k1 public key (ethers.computeAddress(ethers.hashMessage(text)))
+tiny-keccak = { version = "2", features = ["keccak"] }
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+unicode-normalization = "0.1"
+# GET /graph* (premium-discount-app has no graph command); the same ureq 2 the onnxruntime build already uses
+ureq = "2"
+
+[[bin]]
+name = "premium-discount-mcp"
+path = "src/bin/premium-discount-mcp.rs"

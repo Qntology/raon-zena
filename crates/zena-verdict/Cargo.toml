@@ -1,0 +1,13 @@
+[package]
+name = "zena-verdict"
+description = "PD-Verdict (premium / discount, 추천 / 비추천) for Raon Zena's local recommendations: the rule premium-discount owns (contracts/verdict_v1.json), run on local observations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"

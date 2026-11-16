@@ -84,6 +84,7 @@ impl SessionTracker {
     pub fn snapshot(&mut self, now_ms: u64) -> SessionContext {
         self.decay(now_ms);
         SessionContext {
+            verdicts: Vec::new(),
             scene: self.scene.as_ref().map(|(_, s, _)| s.clone()),
             scene_secs: self.scene_ms(now_ms) / 1000,
             defeat_streak: self.defeat_streak,
