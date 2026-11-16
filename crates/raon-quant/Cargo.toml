@@ -1,0 +1,19 @@
+[package]
+name = "raon-quant"
+description = "Single-pass 4-tier pyramid quantizer: original safetensors (mmap) -> GGUF, with kept_ids vocab slicing, zero-copy row gather, fused dequant-dot kernels and self-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+half.workspace = true
+memmap2.workspace = true
+rayon = "1.10"
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "raon-quant"
+path = "src/bin/raon-quant.rs"

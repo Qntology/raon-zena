@@ -1,0 +1,40 @@
+[package]
+name = "raon-infer"
+description = "KRAFTON Raon-1-nano inference on candle (CPU / CUDA / ROCm / Vulkan / Metal via the candle-rocm-vulkan fork)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+raon-quant = { path = "../raon-quant" }
+anyhow = "1"
+candle-core.workspace = true
+candle-nn.workspace = true
+# Same optional ROCm helper crate logis-center pulls from the fork (device info, pool trimming).
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
+half.workspace = true
+rayon = "1.10"
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[features]
+default = []
+# GPU backends — same feature names and wiring as Qntology/logis-center (commerce/src-tauri/Cargo.toml).
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+# Fused FlashAttention tiers (v1/v2/v3 per GPU) of the fork; the MLA layers use them when enabled.
+flash-attn = ["candle-core/flash-attn", "candle-nn/flash-attn"]
+
+[[bin]]
+name = "raon-chat"
+path = "src/bin/raon-chat.rs"
+
+[[bin]]
+name = "raon-imatrix"
+path = "src/bin/raon-imatrix.rs"
+
+[dev-dependencies]
+zena-core = { path = "../zena-core" }
