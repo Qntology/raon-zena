@@ -5,13 +5,118 @@
 //! L2-normalised. It is lexical, not semantic — paraphrases that share no surface form score
 //! low — so the router keeps it behind [`TextEmbedder`] and a neural encoder (e.g. pooled
 //! Raon-1-nano hidden states) can replace it without touching the NMS code.
+//!
+//! NLP-NMS v2 plugs in [`GraniteEmbedder`] (feature `neural`): granite-embedding-97m-multilingual-r2 through
+//! `zena-nlp`, batched per utterance and cached per text. [`SharedEmbedder`] lets the router keep one embedder
+//! across dictionary reloads.
 
 use crate::korean::{is_hangul, jamo};
 use crate::normalize::normalize;
+use std::sync::Arc;
 
 pub trait TextEmbedder: Send + Sync {
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Vec<f32>;
+    /// Several texts at once (one forward pass for neural embedders).
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+    /// The vector space, stored next to anything computed from these vectors (SDS ledgers, caches).
+    fn space(&self) -> &str {
+        "hash-ngram-v1"
+    }
+}
+
+/// One embedder shared by the router's bank and its semantic NMS, kept across dictionary reloads.
+#[derive(Clone)]
+pub struct SharedEmbedder(pub Arc<dyn TextEmbedder>);
+
+impl SharedEmbedder {
+    pub fn new(e: impl TextEmbedder + 'static) -> Self {
+        Self(Arc::new(e))
+    }
+}
+
+impl TextEmbedder for SharedEmbedder {
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        self.0.embed(text)
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.0.embed_batch(texts)
+    }
+    fn space(&self) -> &str {
+        self.0.space()
+    }
+}
+
+/// granite-embedding-97m-multilingual-r2 (ModernBERT, 384-d, CLS) with a text → vector cache.
+#[cfg(feature = "neural")]
+pub struct GraniteEmbedder {
+    model: zena_nlp::granite::Granite,
+    cache: std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>,
+}
+
+#[cfg(feature = "neural")]
+impl GraniteEmbedder {
+    /// Entries kept before the cache is cleared (span texts of recent utterances, dictionary phrases).
+    const CACHE_MAX: usize = 20_000;
+
+    pub fn new(model: zena_nlp::granite::Granite) -> Self {
+        Self {
+            model,
+            cache: Default::default(),
+        }
+    }
+
+    /// Load from the folder `zena_nlp::models::granite_dir` finds, on the CPU.
+    pub fn load_default() -> anyhow::Result<Self> {
+        let dir = zena_nlp::models::granite_dir().ok_or_else(|| anyhow::anyhow!("granite model not installed"))?;
+        Ok(Self::new(zena_nlp::granite::Granite::load(&dir, &candle_core::Device::Cpu)?))
+    }
+}
+
+#[cfg(feature = "neural")]
+impl TextEmbedder for GraniteEmbedder {
+    fn dim(&self) -> usize {
+        self.model.dim()
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        self.embed_batch(&[text]).pop().unwrap_or_default()
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        let mut cache = self.cache.lock().unwrap();
+        let missing: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            texts
+                .iter()
+                .copied()
+                .filter(|t| !cache.contains_key(*t) && seen.insert(*t))
+                .collect()
+        };
+        if !missing.is_empty() {
+            if cache.len() + missing.len() > Self::CACHE_MAX {
+                cache.clear();
+            }
+            match self.model.embed_batch(&missing) {
+                Ok(vs) => {
+                    for (t, v) in missing.iter().zip(vs) {
+                        cache.insert(t.to_string(), v);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[nlp] granite embedding failed: {e:#}");
+                    return texts.iter().map(|_| vec![0.0; self.model.dim()]).collect();
+                }
+            }
+        }
+        texts.iter().map(|t| cache[*t].clone()).collect()
+    }
+    fn space(&self) -> &str {
+        self.model.space_tag()
+    }
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {

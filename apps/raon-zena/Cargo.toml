@@ -14,6 +14,7 @@ raon-infer = { path = "../../crates/raon-infer" }
 raon-vision = { path = "../../crates/raon-vision" }
 zena-lexicon = { path = "../../crates/zena-lexicon" }
 zena-avatar-mcp = { path = "../../crates/zena-avatar-mcp" }
+zena-sds = { path = "../../crates/zena-sds" }
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
@@ -23,7 +24,9 @@ wgpu = "30"
 winit = "0.30"
 
 [features]
-default = ["lexicon-db"]
+default = ["lexicon-db", "nlp"]
+# NLP-NMS v2: Stanza roles (ONNX Runtime, loaded at run time) + granite embeddings + SDS, when the models are installed.
+nlp = ["nlp-nms-router/stanza"]
 # The word dictionary in LanceDB (hot reload, learning, anchors). Without it the JSON dictionary is used as is.
 lexicon-db = ["zena-lexicon/lancedb"]
 # LLM / screen-encoder acceleration backends (candle-rocm-vulkan fork), same switches as Qntology/logis-center.

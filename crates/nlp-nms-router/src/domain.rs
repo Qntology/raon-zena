@@ -14,6 +14,7 @@
 //! The dictionary's `function` group (request endings, fillers) explains words away: a span made only of them
 //! never names a domain.
 
+use crate::analyze::Analyzer;
 use crate::embed::{cosine, TextEmbedder};
 use crate::korean::is_hangul;
 use crate::normalize::{normalize, Word};
@@ -61,13 +62,41 @@ pub struct DomainScore {
 
 impl<E: TextEmbedder> DomainBank<E> {
     pub fn from_lexicon(lex: &Lexicon, embedder: E) -> Self {
-        let entries = lex
-            .text_nodes()
+        Self::build(lex, embedder, false)
+    }
+
+    /// Like [`Self::from_lexicon`], embedding each phrase by its content words (the rule analyzer strips request
+    /// endings and auxiliaries: "리본 달아 봐" → "리본 달아"), the way spans are embedded when an analyzer runs.
+    /// Otherwise the shared endings dominate the phrases of a group and their domains look alike.
+    pub fn from_lexicon_content(lex: &Lexicon, embedder: E) -> Self {
+        Self::build(lex, embedder, true)
+    }
+
+    fn build(lex: &Lexicon, embedder: E, content_only: bool) -> Self {
+        // Every bias / prejudice phrase in one batch (one forward pass for a neural embedder).
+        let nodes: Vec<_> = lex.text_nodes().collect();
+        let phrases: Vec<String> = nodes
+            .iter()
+            .flat_map(|n| n.bias.iter().chain(&n.prejudice).map(|p| p.text.clone()))
+            .map(|p| {
+                if content_only {
+                    let mut n = normalize(&p);
+                    crate::analyze::RuleAnalyzer.analyze(&mut n);
+                    Self::span_text(&n.words)
+                } else {
+                    p
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = phrases.iter().map(String::as_str).collect();
+        let mut vecs = embedder.embed_batch(&refs).into_iter();
+        let entries = nodes
+            .iter()
             .map(|n| DomainEntry {
                 key: n.key.clone(),
                 action: n.action.clone(),
-                bias: n.bias.iter().map(|p| (embedder.embed(&p.text), p.weight)).collect(),
-                prej: n.prejudice.iter().map(|p| embedder.embed(&p.text)).collect(),
+                bias: n.bias.iter().map(|p| (vecs.next().unwrap_or_default(), p.weight)).collect(),
+                prej: n.prejudice.iter().map(|_| vecs.next().unwrap_or_default()).collect(),
                 exact: n
                     .exact_match
                     .iter()
@@ -111,6 +140,22 @@ impl<E: TextEmbedder> DomainBank<E> {
         [&w.surface, &w.lemma, &w.stem].iter().any(|f| self.function.contains(&compact(f)))
     }
 
+    /// Whether a span can name a domain: at least one content word (analyzer role) that the function bank does
+    /// not explain away.
+    pub fn eligible(&self, words: &[Word]) -> bool {
+        words.iter().any(|w| w.is_content() && !self.is_function_word(w))
+    }
+
+    /// The text a span is embedded as: its content words (all words when it has none).
+    pub fn span_text(words: &[Word]) -> String {
+        let content: Vec<&str> = words.iter().filter(|w| w.is_content()).map(|w| w.surface.as_str()).collect();
+        if content.is_empty() {
+            words.iter().map(|w| w.surface.as_str()).collect::<Vec<_>>().join(" ")
+        } else {
+            content.join(" ")
+        }
+    }
+
     /// STEP 1 (logis-center): exact or agglutinative-prefix match of a span against every `exact_match` entry.
     pub fn exact(&self, words: &[Word]) -> Option<(usize, Hit)> {
         if words.is_empty() {
@@ -119,9 +164,10 @@ impl<E: TextEmbedder> DomainBank<E> {
         let n = words.len();
         let head: String = words[..n - 1].iter().map(|w| compact(&w.surface)).collect();
         let last = &words[n - 1];
-        // The span with its last word as written, josa-peeled, or request-stripped.
-        let forms: Vec<String> = [&last.surface, &last.lemma, &last.stem]
-            .iter()
+        // The span with its last word as written, josa-peeled, request-stripped, or as the analyzer's lemma.
+        let forms: Vec<String> = [Some(&last.surface), Some(&last.lemma), Some(&last.stem), last.alt.as_ref()]
+            .into_iter()
+            .flatten()
             .map(|f| format!("{head}{}", compact(f)))
             .collect();
         let surface = &forms[0];
@@ -150,19 +196,32 @@ impl<E: TextEmbedder> DomainBank<E> {
         (winners.len() == 1).then(|| (winners[0].0, winners[0].2))
     }
 
+    /// Every domain scored for each span, in bank order (`out[span][domain]`): the spans' content texts are
+    /// embedded in one batch, exact / prefix hits override their domain's vector score.
+    pub fn raw_scores(&self, spans: &[&[Word]]) -> Vec<Vec<DomainScore>> {
+        let texts: Vec<String> = spans.iter().map(|s| Self::span_text(s)).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let vecs = self.embedder.embed_batch(&refs);
+        spans.iter().zip(&vecs).map(|(s, v)| self.scores_for(s, v)).collect()
+    }
+
     /// Every domain scored for `words` (a span), best first.
     pub fn score_words(&self, words: &[Word]) -> Vec<DomainScore> {
-        let text = words.iter().map(|w| w.surface.as_str()).collect::<Vec<_>>().join(" ");
-        let v = self.embedder.embed(&text);
+        let v = self.embedder.embed(&Self::span_text(words));
+        let mut out = self.scores_for(words, &v);
+        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        out
+    }
+
+    fn scores_for(&self, words: &[Word], v: &[f32]) -> Vec<DomainScore> {
         let pw = if words.len() <= 2 { 0.3 } else { 0.7 };
         let exact = self.exact(words);
-        let mut out: Vec<DomainScore> = self
-            .entries
+        self.entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let bias = e.bias.iter().map(|(b, w)| cosine(&v, b) * w).fold(0f32, f32::max);
-                let prej = e.prej.iter().map(|p| cosine(&v, p)).fold(0f32, f32::max);
+                let bias = e.bias.iter().map(|(b, w)| cosine(v, b) * w).fold(0f32, f32::max);
+                let prej = e.prej.iter().map(|p| cosine(v, p)).fold(0f32, f32::max);
                 let mut s = DomainScore {
                     index: i,
                     score: (bias - prej * pw).max(0.0),
@@ -172,18 +231,15 @@ impl<E: TextEmbedder> DomainBank<E> {
                 };
                 if let Some((j, h)) = exact {
                     if j == i {
+                        // An exact / prefix match confirms the domain whatever the vectors say.
                         let x = if h == Hit::Exact { EXACT_SCORE } else { PREFIX_SCORE };
-                        if x >= s.score {
-                            s.score = x;
-                            s.hit = h;
-                        }
+                        s.score = s.score.max(x);
+                        s.hit = h;
                     }
                 }
                 s
             })
-            .collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score));
-        out
+            .collect()
     }
 
     /// Every domain scored for free text, best first.
@@ -191,9 +247,9 @@ impl<E: TextEmbedder> DomainBank<E> {
         self.score_words(&normalize(text).words)
     }
 
-    /// The best domain of a span, unless the span is only function words.
+    /// The best domain of a span, unless the span has no content word.
     pub fn best(&self, words: &[Word]) -> Option<DomainScore> {
-        if words.iter().all(|w| self.is_function_word(w)) {
+        if !self.eligible(words) {
             return None;
         }
         self.score_words(words).into_iter().next()

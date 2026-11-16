@@ -87,6 +87,64 @@ pub struct PipelineConfig {
     pub proactive_silence_ms: u64,
     /// Exchanges remembered for Lv3 prompts.
     pub history_turns: usize,
+    /// Which natural-language router runs.
+    pub nlp: NlpMode,
+}
+
+/// The natural-language router (`nlp_nms_router::router::Models`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NlpMode {
+    /// v1: hashed embedder, no analyzer (deterministic; tests).
+    V1,
+    /// v1 scoring + the rule analyzer (auxiliaries, negation).
+    Rules,
+    /// NLP-NMS v2 with the installed models (granite, Stanza, SDS); falls back to `Rules` piece by piece.
+    Auto,
+}
+
+impl std::str::FromStr for NlpMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "v1" | "off" => Ok(NlpMode::V1),
+            "rules" => Ok(NlpMode::Rules),
+            "auto" | "v2" => Ok(NlpMode::Auto),
+            _ => Err(format!("unknown --nlp {s} (auto, rules, v1)")),
+        }
+    }
+}
+
+/// The router for `mode`, with the SDS ledger of its vector space under `%LOCALAPPDATA%\RaonZena\score_dynamics`.
+fn build_router(lexicon: &Lexicon, mode: NlpMode) -> NlpNmsRouter {
+    use nlp_nms_router::router::Models;
+    let models = match mode {
+        NlpMode::V1 => Models::v1(),
+        NlpMode::Rules => Models::rules(),
+        #[cfg(feature = "nlp")]
+        NlpMode::Auto => {
+            use nlp_nms_router::embed::TextEmbedder;
+            let m = Models::auto("korean");
+            let space = m.embedder.space().to_string();
+            let dir = std::env::var_os("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("RaonZena")
+                .join("score_dynamics")
+                .join("spaces")
+                .join(&space);
+            match zena_sds::Ledger::open(&dir, "nms") {
+                Ok(l) => m.with_sds(l),
+                Err(e) => {
+                    eprintln!("[sds] ledger unavailable ({e:#}); fixed thresholds");
+                    m
+                }
+            }
+        }
+        #[cfg(not(feature = "nlp"))]
+        NlpMode::Auto => Models::rules(),
+    };
+    eprintln!("[nlp] router: {}", models.label);
+    NlpNmsRouter::with_models(lexicon, models)
 }
 
 impl Default for PipelineConfig {
@@ -99,6 +157,7 @@ impl Default for PipelineConfig {
             expression_gap_ms: 1500,
             proactive_silence_ms: 90_000,
             history_turns: 4,
+            nlp: NlpMode::V1,
         }
     }
 }
@@ -260,7 +319,8 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
     let geo = ScreenGeometry::new(w as u32, h as u32);
     let mut sensor = LogLumSensor::new(w, h, cfg.sensor_threshold);
     let mut tracker = RoiTracker::default();
-    let mut router = NlpNmsRouter::new(&lexicon);
+    let mut router = build_router(&lexicon, cfg.nlp);
+    let mut sds_flushed = 0u64;
     let mut reactions = ReactionRouter::default();
     let mut cues = CuePlayer::default();
     let mut expressions = ExpressionPlayer::default();
@@ -294,6 +354,16 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             }
         }
         let now = t0.elapsed().as_millis() as u64;
+
+        // SDS observations go to this run's file every 15 s (folded into the ledger at the next start).
+        if now.saturating_sub(sds_flushed) >= 15_000 {
+            sds_flushed = now;
+            if let Some(l) = &router.models.sds {
+                if let Err(e) = l.lock().unwrap().flush() {
+                    eprintln!("[sds] flush failed: {e:#}");
+                }
+            }
+        }
 
         // A new dictionary revision (edited with `zena-lexicon`, or learned).
         for lex in reloads.try_iter() {

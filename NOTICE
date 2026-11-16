@@ -10,6 +10,21 @@ This repository contains code derived from third-party projects:
      weighted error in fit_symmetric / fit_asymmetric is evaluated in closed form (one pass).
    - crates/nlp-nms-router: algorithms ported from commerce/src-tauri/src (see
      crates/nlp-nms-router/NOTICE for the file-by-file list and modifications).
+   - crates/zena-nlp/src/stanza.rs: ported from commerce/src-tauri/src/stanza.rs (the Stanza runner for the
+     stanza-onnx-export format 2 models). Modified: model folders follow Raon Zena's layout, ONNX Runtime is
+     loaded at run time, the Latin dictionary vote and the reqwest manifest fetch were removed, logs go to stderr.
+     crates/zena-nlp/tests/stanza_runtime.rs and tests/fixtures/stanza/decode_cases.json come from
+     commerce/src-tauri/tests (the dictionary-vote test removed).
+   - crates/zena-nlp/src/granite.rs: the ForwardMode::Exact (CLS) forward pass of
+     commerce/src-tauri/src/models/embedding.rs, ported and checked against Hugging Face transformers.
+   - crates/zena-sds: Score Dynamics ported from commerce/src-tauri/src/utils/score_dynamics.rs and the
+     double_center_matrix / exclusive_assign* helpers of commerce/src-tauri/src/utils/ai_utils.rs. Modified: no
+     process-global state (an explicit Ledger value), run files folded on open / close with file locks.
+   - crates/onnxruntime, crates/onnxruntime-sys: vendored from commerce/crates (a fork of
+     nbigaouette/onnxruntime-rs 0.0.14, MIT OR Apache-2.0, with logis-center's `mixed` input module). Modified:
+     OrtGetApiBase is resolved from a library loaded at run time (libloading) instead of being linked, the
+     build script's download of the official ONNX Runtime 1.28.0 prebuilt is optional and non-fatal, and the
+     test / dev-dependency sections were dropped.
 
 2. ggml / llama.cpp — https://github.com/ggml-org/ggml
    MIT License, Copyright (c) Georgi Gerganov.
@@ -54,8 +69,15 @@ This repository contains code derived from third-party projects:
 8. LanceDB — https://github.com/lancedb/lancedb (Apache License 2.0), used as a Cargo dependency
    (lancedb 0.41 and the Lance / Arrow / DataFusion crates it brings). Not vendored.
 
+9. ONNX Runtime — https://github.com/microsoft/onnxruntime (MIT License, Copyright (c) Microsoft Corporation).
+   Not vendored: the onnxruntime-sys build script fetches the official 1.28.0 prebuilt for development builds,
+   and the library is loaded at run time.
+
 Model weights are NOT part of this repository. They are downloaded separately and remain under
 their own licenses:
    - KRAFTON/Raon-1-nano: Apache-2.0
    - KRAFTON/Raon-VisionEncoder: Apache-2.0
    - KRAFTON/Raon-OpenTTS-0.3B: CC-BY-NC-4.0 (non-commercial)
+   - ibm-granite/granite-embedding-97m-multilingual-r2: Apache-2.0
+   - Stanza models (stanza-onnx-export format 2, huggingface.co/Qntology/stanza-<lang>): Apache-2.0 (Stanford
+     Stanza), converted by Qntology

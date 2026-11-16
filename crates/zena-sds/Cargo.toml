@@ -1,0 +1,11 @@
+[package]
+name = "zena-sds"
+description = "Score Dynamics (SDS) for Raon Zena: per-scope adaptive baselines (Welford + recent ring) with hierarchical backoff, decay shapes, confusion ledger, transition priors, double centering and adaptive exclusive assignment — ported from Qntology/logis-center"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde.workspace = true
+serde_json.workspace = true
