@@ -213,8 +213,16 @@ fn main() -> Result<()> {
             if bank.is_empty() {
                 bail!("no screen domain is anchored yet: run `zena-lexicon anchors` first");
             }
-            let perforation = if pass == "full" { None } else { Some(raon_vision::PerforatedCfg::parse(&pass).ok_or_else(|| anyhow!("unknown --pass {pass}"))?) };
-            let cfg = raon_vision::ScreenConfig { max_patches: patches, perforation, seed_labels: 3 };
+            let perforation = if pass == "full" {
+                None
+            } else {
+                Some(raon_vision::PerforatedCfg::parse(&pass).ok_or_else(|| anyhow!("unknown --pass {pass}"))?)
+            };
+            let cfg = raon_vision::ScreenConfig {
+                max_patches: patches,
+                perforation,
+                seed_labels: 3,
+            };
             let grid = zena_sensor::naflex::patchify_frame(&rgb, w, h, patches);
             let r = raon_vision::screen::read_pass(&tower, &cfg, &grid, &bank)?;
             println!(
@@ -222,8 +230,25 @@ fn main() -> Result<()> {
                 r.grid.0, r.grid.1, r.report.tokens_run, r.report.cells, r.encode_ms
             );
             for s in r.scores.iter().take(5) {
-                let express = lex.vision_express(&s.key).map(|e| format!("{:?}/{:?} {:?}", e.emotion, e.motion, e.lines.first())).unwrap_or_default();
-                println!("{:>6.3}  {:<22} {:<8} bias {:.3} prej {:.3} cos {:.3} → {} {}", s.score, s.key, s.kind.as_str(), s.bias, s.prejudice, s.cos, s.link, express);
+                let express = lex
+                    .vision_express(&s.key)
+                    .map(|e| format!("{:?}/{:?} {:?}", e.emotion, e.motion, e.lines.first()))
+                    .unwrap_or_default();
+                println!(
+                    "{:>6.3}  {:<22} {:<8} bias {:.3} prej {:.3} cos {:.3} → {} {}",
+                    s.score,
+                    s.key,
+                    s.kind.as_str(),
+                    s.bias,
+                    s.prejudice,
+                    s.cos,
+                    s.link,
+                    express
+                );
+            }
+            match raon_vision::Acceptance::default().accept(&r.scores) {
+                Some(s) => println!("→ Zena reacts with {} ({})", s.link, s.kind.as_str()),
+                None => println!("→ no reaction (no domain is clearly on screen)"),
             }
             if let Some((x, y)) = r.peak {
                 println!("gaze peak at ({x:.2}, {y:.2})");

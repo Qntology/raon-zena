@@ -242,8 +242,8 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
                     }
                 };
                 eprintln!(
-                    "[screen] {} ({:.2}, {} of {} tokens, {:.0} ms) → {}",
-                    o.key, o.score, o.tokens, o.cells, o.encode_ms, o.link
+                    "[screen] {} (cos {:.3}, p {:.2}, {} of {} tokens, {:.0} ms) → {}",
+                    o.key, o.cos, o.score, o.tokens, o.cells, o.encode_ms, o.link
                 );
                 if let Some(cmd) = expressions.play(&o.link, &e, gaze, now, cfg.expression_gap_ms) {
                     out.send(cmd)?;
@@ -291,7 +291,15 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             }
         }
         // Dictionary expressions first, then the commands (quitting plays the overlay's own farewell sequence).
-        if let Some(c) = routed.expressions.iter().find(|c| !matches!(c.action, Action::System { command: SystemCommand::ExitApp, .. })) {
+        if let Some(c) = routed.expressions.iter().find(|c| {
+            !matches!(
+                c.action,
+                Action::System {
+                    command: SystemCommand::ExitApp,
+                    ..
+                }
+            )
+        }) {
             if let Some(e) = c.action.express() {
                 if let Some(cmd) = expressions.play(&c.key, e, None, now, cfg.expression_gap_ms) {
                     out.send(cmd)?;
@@ -482,6 +490,7 @@ mod tests {
             kind,
             link: String::new(),
             score: 0.9,
+            cos: 0.15,
             peak: None,
             cooldown_s,
             encode_ms: 0.0,
@@ -526,6 +535,7 @@ mod tests {
             kind: VisionKind::Scene,
             link: "react.market".into(),
             score: 0.8,
+            cos: 0.14,
             peak: Some((0.75, 0.25)),
             cooldown_s: 600,
             encode_ms: 0.0,

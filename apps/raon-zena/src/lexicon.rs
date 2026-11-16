@@ -21,6 +21,7 @@ pub struct Loaded {
 }
 
 /// Something the pipeline asks the dictionary service to do.
+#[cfg_attr(not(feature = "lexicon-db"), allow(dead_code))]
 pub enum LexiconMsg {
     /// A span caught by vectors alone, for learning.
     Learn { key: String, span: String },

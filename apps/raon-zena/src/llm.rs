@@ -187,7 +187,7 @@ impl LlmWorker {
     /// Raon-1-nano only holds VRAM / RAM while Zena is actually answering (with the block cache a reload takes
     /// about a second). Requests that arrive while it loads fall back to cached cues, as when it is busy.
     pub fn spawn_lazy(name: &str, loader: Loader, idle: Duration, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
-        Self::start(name.to_string(), Box::new(move || loader()), Some(idle), on_done)
+        Self::start(name.to_string(), Box::new(loader), Some(idle), on_done)
     }
 
     fn start(

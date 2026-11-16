@@ -105,7 +105,7 @@ pub fn first_cells(cols: u32, rows: u32, pattern: PerfPattern) -> Vec<u32> {
                 PerfPattern::Fovea => {
                     let x = (c as f32 + 0.5) / cols as f32;
                     let y = (r as f32 + 0.5) / rows as f32;
-                    if y < 1.0 / 12.0 || y > 11.0 / 12.0 {
+                    if !(1.0 / 12.0..=11.0 / 12.0).contains(&y) {
                         c % 2 == 0 && r % 2 == 0
                     } else if (1.0 / 6.0..5.0 / 6.0).contains(&x) && (1.0 / 6.0..5.0 / 6.0).contains(&y) {
                         true
@@ -142,7 +142,8 @@ pub fn seeds(heats: &[Vec<f32>], cols: u32, rows: u32, cfg: &ExpandCfg) -> Vec<u
                 let v = h[(r * cols + c) as usize];
                 let peak = v.is_finite()
                     && v >= cfg.seed_min
-                    && neighbours(c, r, cols, rows, 1).all(|(cc, rr)| !(h[(rr * cols + cc) as usize] > v));
+                    && neighbours(c, r, cols, rows, 1)
+                        .all(|(cc, rr)| h[(rr * cols + cc) as usize].partial_cmp(&v) != Some(std::cmp::Ordering::Greater));
                 peak.then_some((r * cols + c, v))
             })
             .collect();

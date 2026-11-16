@@ -42,6 +42,44 @@ pub struct AnchorBank {
     pub prejudice_weight: f32,
 }
 
+/// When a screen reading counts: the best domain's cosine reaches its kind's floor and leads the runner-up by a
+/// margin. SigLIP's pair probability swings from ~0 to ~1 over a few hundredths of cosine (scale 100, bias −13.3), so
+/// the decision is made on the cosine. Measured on synthetic screens (docs/EXPRESSION.md): six screens with content
+/// at 0.094–0.198 leading by ≥ 0.077; a blank gradient at 0.019 and a desktop at 0.048, leading by ≤ 0.02.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Acceptance {
+    pub scene: f32,
+    pub event: f32,
+    /// Lower: when in doubt, treat a screen as private.
+    pub privacy: f32,
+    pub margin: f32,
+}
+
+impl Default for Acceptance {
+    fn default() -> Self {
+        Acceptance {
+            scene: 0.08,
+            event: 0.09,
+            privacy: 0.07,
+            margin: 0.03,
+        }
+    }
+}
+
+impl Acceptance {
+    /// The best domain if the reading counts.
+    pub fn accept<'a>(&self, scores: &'a [VisionScore]) -> Option<&'a VisionScore> {
+        let top = scores.iter().max_by(|a, b| a.cos.total_cmp(&b.cos))?;
+        let second = scores.iter().filter(|s| s.key != top.key).map(|s| s.cos).fold(-1.0f32, f32::max);
+        let floor = match top.kind {
+            VisionKind::Scene => self.scene,
+            VisionKind::Event => self.event,
+            VisionKind::Privacy => self.privacy,
+        };
+        (top.cos >= floor && top.cos - second >= self.margin).then_some(top)
+    }
+}
+
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -221,5 +259,41 @@ mod tests {
         assert!(AnchorBank::build(&lex, &anchors, 10.0, -2.0)
             .index_of("vision.game_defeat")
             .is_none());
+    }
+
+    #[test]
+    fn a_reading_counts_when_its_best_cosine_is_high_and_clear() {
+        let sc = |key: &str, kind: VisionKind, cos: f32| VisionScore {
+            key: key.into(),
+            kind,
+            link: String::new(),
+            cooldown_s: 0,
+            bias: 0.0,
+            prejudice: 0.0,
+            score: 0.0,
+            cos,
+        };
+        let a = Acceptance::default();
+        // the measured screens
+        let code = [
+            sc("vision.coding", VisionKind::Scene, 0.094),
+            sc("vision.game_victory", VisionKind::Event, 0.017),
+        ];
+        assert_eq!(a.accept(&code).map(|s| s.key.as_str()), Some("vision.coding"));
+        let desktop = [
+            sc("vision.coding", VisionKind::Scene, 0.048),
+            sc("vision.document", VisionKind::Scene, 0.028),
+        ];
+        assert!(a.accept(&desktop).is_none(), "too weak");
+        let close = [
+            sc("vision.coding", VisionKind::Scene, 0.12),
+            sc("vision.document", VisionKind::Scene, 0.10),
+        ];
+        assert!(a.accept(&close).is_none(), "not clear");
+        let login = [
+            sc("vision.private", VisionKind::Privacy, 0.075),
+            sc("vision.document", VisionKind::Scene, 0.02),
+        ];
+        assert!(a.accept(&login).is_some(), "private screens need less evidence");
     }
 }

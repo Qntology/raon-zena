@@ -139,7 +139,7 @@ impl Loader<'_> {
             }
             w = p;
         }
-        let inner = if self.format == WeightFormat::Q8 && in_pad % 32 == 0 {
+        let inner = if self.format == WeightFormat::Q8 && in_pad.is_multiple_of(32) {
             let bytes = encode(&w, in_pad, Format::Q8_0, None).map_err(|e| anyhow::anyhow!("{weight}: {e}"))?;
             QMatMul::from_qtensor(qtensor_from_ggml(GgmlDType::Q8_0, &bytes, vec![out_pad, in_pad], &self.device)?)?
         } else {

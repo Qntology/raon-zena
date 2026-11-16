@@ -20,7 +20,7 @@ use candle_core::Device;
 use raon_quant::safetensors::SafeTensors;
 use std::path::{Path, PathBuf};
 
-pub use bank::{AnchorBank, VisionScore};
+pub use bank::{Acceptance, AnchorBank, VisionScore};
 pub use perforate::{ExpandCfg, PerfPattern, PerfReport, PerforatedCfg};
 pub use screen::{ScreenConfig, ScreenEncoder, ScreenReading};
 pub use tower::{VisionTower, WeightFormat};
@@ -44,7 +44,7 @@ pub fn fingerprint(path: &Path) -> String {
 /// The vision tower and SigLIP's calibration `(exp(logit_scale), logit_bias)`.
 pub fn load_vision(path: &Path, device: &Device, format: WeightFormat) -> Result<(VisionTower, f32, f32)> {
     let f = checkpoint(path);
-    let st = SafeTensors::open(&[f.clone()]).with_context(|| f.display().to_string())?;
+    let st = SafeTensors::open(std::slice::from_ref(&f)).with_context(|| f.display().to_string())?;
     let tower = VisionTower::load(&st, device, format)?;
     let scale = st.all_f32("logit_scale")?[0].exp();
     let bias = st.all_f32("logit_bias")?[0];

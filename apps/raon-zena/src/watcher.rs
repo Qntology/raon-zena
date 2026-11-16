@@ -7,7 +7,7 @@
 //! A screen the dictionary marks `privacy` (login, banking, payment, personal chat) gets no comment, and the watcher
 //! stops looking for a while.
 
-use raon_vision::{AnchorBank, ScreenConfig, ScreenEncoder, WeightFormat};
+use raon_vision::{Acceptance, AnchorBank, ScreenConfig, ScreenEncoder, WeightFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -46,6 +46,8 @@ pub struct ScreenObservation {
     /// The dictionary node whose expression Zena plays.
     pub link: String,
     pub score: f32,
+    /// Cosine of the domain's best anchor.
+    pub cos: f32,
     /// Centre of the domain's hottest cell, 0..1 screen coordinates.
     pub peak: Option<(f32, f32)>,
     pub cooldown_s: u32,
@@ -69,8 +71,8 @@ pub struct WatcherConfig {
     pub perforate_on_cpu_only: bool,
     /// Mean absolute luma change (0–255) of the thumbnail under which a frame counts as unchanged.
     pub change_min: f32,
-    /// Lowest score a domain needs, per kind.
-    pub min_score: HashMap<VisionKind, f32>,
+    /// When a reading counts (best cosine per kind, lead over the runner-up).
+    pub accept: Acceptance,
     pub privacy_backoff: Duration,
 }
 
@@ -83,7 +85,7 @@ impl WatcherConfig {
             screen: ScreenConfig::default(),
             perforate_on_cpu_only: true,
             change_min: 3.0,
-            min_score: HashMap::from([(VisionKind::Scene, 0.30), (VisionKind::Event, 0.50), (VisionKind::Privacy, 0.25)]),
+            accept: Acceptance::default(),
             privacy_backoff: Duration::from_secs(60),
         }
     }
@@ -180,17 +182,17 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                 };
                 drop(grid);
                 last_thumb = Some(thumb);
-                let Some(top) = reading.scores.first() else { continue };
-                let min = cfg.min_score.get(&top.kind).copied().unwrap_or(0.3);
-                if top.kind == VisionKind::Privacy && top.score >= min {
+                let Some(top) = cfg.accept.accept(&reading.scores) else { continue };
+                if top.kind == VisionKind::Privacy {
                     paused_until = Some(Instant::now() + cfg.privacy_backoff);
                 }
-                if top.score >= min {
+                {
                     let _ = out.send(ScreenObservation {
                         key: top.key.clone(),
                         kind: top.kind,
                         link: top.link.clone(),
                         score: top.score,
+                        cos: top.cos,
                         peak: reading.peak,
                         cooldown_s: top.cooldown_s,
                         encode_ms: reading.encode_ms,

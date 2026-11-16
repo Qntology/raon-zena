@@ -996,10 +996,19 @@ impl LexiconStore {
         self.rt.block_on(async {
             for name in TABLES.iter().copied().chain(std::iter::once(META)) {
                 let Some(t) = self.table(name).await? else { continue };
-                t.optimize(OptimizeAction::Compact { options: CompactionOptions::default(), remap_options: None }).await?;
+                t.optimize(OptimizeAction::Compact {
+                    options: CompactionOptions::default(),
+                    remap_options: None,
+                })
+                .await?;
                 if let Some(k) = keep {
                     let older_than = lancedb::table::optimize::Duration::from_std(k).map_err(|e| anyhow!("{e}"))?;
-                    t.optimize(OptimizeAction::Prune { older_than: Some(older_than), delete_unverified: None, error_if_tagged_old_versions: None }).await?;
+                    t.optimize(OptimizeAction::Prune {
+                        older_than: Some(older_than),
+                        delete_unverified: None,
+                        error_if_tagged_old_versions: None,
+                    })
+                    .await?;
                 }
             }
             if self.table(PHRASES).await?.is_some() {
