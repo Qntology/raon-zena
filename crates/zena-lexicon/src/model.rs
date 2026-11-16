@@ -3,9 +3,16 @@
 //! File layout (`data/zena_lexicon.json`): top-level groups of nodes in the Qntology/logis-center `bias.json` node
 //! format — `{semantic, bias, prejudice, exact_match}` — plus the fields that say how Zena expresses a node:
 //!
-//! * `express`: `{emotion, motion, lines, level}` — a pre-written reaction (Lv2 with lines, Lv1 without), no LLM;
+//! * `express`: `{emotion, motion, emote, lines, level}` — a pre-written reaction (Lv2 with lines, Lv1 without),
+//!   no LLM; `emote` names Zena's own [`CharacterEmote`] (default: the one matching the emotion);
 //! * `command` (+ `window_layer_mode`): a `manage_zena_system` call, optionally with an `express` (wave before exit);
+//! * `asset`: `{action, track, part}` — a `manage_avatar_asset` call (switch the body track, put on an accessory),
+//!   optionally with an `express`;
 //! * `ask`: hand the request to Raon-1-nano (Lv3) under a topic, optionally with an acknowledging `express`.
+//!
+//! The `proactive` group holds lines Zena says on her own after a silence (`proactive.<scene>`, keyed by the name
+//! of the `react` node the screen's scene links to, `proactive.idle` otherwise, `proactive.stretch` after a long
+//! session); they have no phrases, so the router never catches them from text.
 //!
 //! The `function` group is logis-center's function bank (request endings, fillers): its phrases explain words away
 //! and never form a domain. `vision` nodes (noto-sandbox `world_lexicon.json` style) carry English prompts for the
@@ -17,13 +24,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use zena_core::tools::{BodyMotion, EmotionState, SystemCommand, WindowLayerMode};
+use zena_core::tools::{BodyMotion, CharacterEmote, EmotionState, SystemCommand, WindowLayerMode, ZenaAssetArgs};
 
 /// The bundled dictionary (`data/zena_lexicon.json`).
 pub const BUNDLED_JSON: &str = include_str!("../../../data/zena_lexicon.json");
 
 const RESERVED: &[&str] = &["version", "meta", "vision", "vision_prompting"];
 pub const FUNCTION_GROUP: &str = "function";
+pub const PROACTIVE_GROUP: &str = "proactive";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExpressLevel {
@@ -37,6 +45,8 @@ pub enum ExpressLevel {
 pub struct Express {
     pub emotion: EmotionState,
     pub motion: BodyMotion,
+    /// Zena's own emote for this reaction (`None`: the emotion's default).
+    pub emote: Option<CharacterEmote>,
     pub lines: Vec<String>,
     pub level: ExpressLevel,
 }
@@ -51,6 +61,11 @@ pub enum Action {
         mode: Option<WindowLayerMode>,
         express: Option<Express>,
     },
+    /// A `manage_avatar_asset` call (track switch, accessory).
+    Asset {
+        asset: ZenaAssetArgs,
+        express: Option<Express>,
+    },
     /// Raon-1-nano answers (Lv3) under `topic` ("coach", "screen", "market", "chat", ...).
     Ask {
         topic: String,
@@ -62,12 +77,13 @@ impl Action {
     pub fn express(&self) -> Option<&Express> {
         match self {
             Action::Express(e) => Some(e),
-            Action::System { express, .. } | Action::Ask { express, .. } => express.as_ref(),
+            Action::System { express, .. } | Action::Asset { express, .. } | Action::Ask { express, .. } => express.as_ref(),
             Action::None => None,
         }
     }
+    /// Commands (system and asset) dedupe on their own words.
     pub fn is_command(&self) -> bool {
-        matches!(self, Action::System { .. })
+        matches!(self, Action::System { .. } | Action::Asset { .. })
     }
 }
 
@@ -237,6 +253,11 @@ fn express_of(v: &Value) -> Result<Express> {
     let o = v.as_object().ok_or_else(|| anyhow!("express must be an object"))?;
     let emotion = strict(o.get("emotion").and_then(Value::as_str).unwrap_or("NEUTRAL"), "emotion")?;
     let motion = strict(o.get("motion").and_then(Value::as_str).unwrap_or("IDLE"), "motion")?;
+    let emote = match o.get("emote") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(CharacterEmote::parse(s).ok_or_else(|| anyhow!("unknown emote '{s}'"))?),
+        Some(other) => bail!("express.emote must be a string, got {other}"),
+    };
     let lines = match o.get("lines") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a
@@ -259,13 +280,33 @@ fn express_of(v: &Value) -> Result<Express> {
     Ok(Express {
         emotion,
         motion,
+        emote,
         lines,
         level,
     })
 }
 
+fn asset_of(v: &Value) -> Result<ZenaAssetArgs> {
+    let o = v.as_object().ok_or_else(|| anyhow!("asset must be an object"))?;
+    let action = strict(o.get("action").and_then(Value::as_str).unwrap_or(""), "asset action")?;
+    let track = o
+        .get("track")
+        .and_then(Value::as_str)
+        .map(|t| strict(t, "avatar track"))
+        .transpose()?;
+    let part = o
+        .get("part")
+        .and_then(Value::as_str)
+        .map(|p| strict(p, "avatar part"))
+        .transpose()?;
+    Ok(ZenaAssetArgs { action, track, part })
+}
+
 fn express_json(e: &Express) -> Value {
     let mut o = json!({ "emotion": enum_name(&e.emotion), "motion": enum_name(&e.motion), "lines": e.lines });
+    if let Some(m) = e.emote {
+        o["emote"] = json!(m.name());
+    }
     let implied = if e.lines.is_empty() { ExpressLevel::Lv1 } else { ExpressLevel::Lv2 };
     if e.level != implied {
         o["level"] = json!(if e.level == ExpressLevel::Lv1 { "lv1" } else { "lv2" });
@@ -285,6 +326,11 @@ pub(crate) fn node_of(group: &str, name: &str, v: &Value) -> Result<Node> {
         Action::System {
             command: strict(c, "command")?,
             mode,
+            express,
+        }
+    } else if let Some(a) = o.get("asset") {
+        Action::Asset {
+            asset: asset_of(a)?,
             express,
         }
     } else if let Some(topic) = o.get("ask").and_then(Value::as_str) {
@@ -348,6 +394,12 @@ pub fn node_json(n: &Node) -> Value {
             if let Some(m) = mode {
                 o.insert("window_layer_mode".into(), json!(enum_name(m)));
             }
+            if let Some(e) = express {
+                o.insert("express".into(), express_json(e));
+            }
+        }
+        Action::Asset { asset, express } => {
+            o.insert("asset".into(), serde_json::to_value(asset).unwrap_or(Value::Null));
             if let Some(e) = express {
                 o.insert("express".into(), express_json(e));
             }
@@ -451,11 +503,30 @@ impl Lexicon {
             .and_then(|n| n.action.express())
     }
 
-    /// Nodes that can be caught from user text (an action and at least one phrase), excluding the function bank.
+    /// Nodes that can be caught from user text (an action and at least one phrase), excluding the function bank
+    /// and the proactive lines.
     pub fn text_nodes(&self) -> impl Iterator<Item = &Node> {
-        self.nodes
-            .iter()
-            .filter(|n| n.group != FUNCTION_GROUP && n.action != Action::None && (!n.bias.is_empty() || !n.exact_match.is_empty()))
+        self.nodes.iter().filter(|n| {
+            n.group != FUNCTION_GROUP
+                && n.group != PROACTIVE_GROUP
+                && n.action != Action::None
+                && (!n.bias.is_empty() || !n.exact_match.is_empty())
+        })
+    }
+
+    /// What Zena says on her own: `proactive.stretch` for a break, else `proactive.<name>` for the scene whose
+    /// expression node is `scene_link` (`react.coding` → `proactive.coding`), else `proactive.idle`.
+    pub fn proactive(&self, scene_link: Option<&str>, take_break: bool) -> Option<(&str, &Express)> {
+        let scene = scene_link.and_then(|l| l.rsplit('.').next());
+        let keys = [
+            take_break.then(|| format!("{PROACTIVE_GROUP}.stretch")),
+            scene.map(|s| format!("{PROACTIVE_GROUP}.{s}")),
+            Some(format!("{PROACTIVE_GROUP}.idle")),
+        ];
+        keys.into_iter()
+            .flatten()
+            .find_map(|k| self.node(&k))
+            .and_then(|n| n.action.express().map(|e| (n.key.as_str(), e)))
     }
 
     /// The function bank's phrases (request endings, fillers), lowercased.
@@ -628,6 +699,39 @@ mod tests {
         assert!(format!("{:#}", Lexicon::from_json(twice).unwrap_err()).contains("claimed by e.x and e.y"));
         let no_lines = r#"{"e": {"x": {"bias": "a", "express": {"emotion": "JOY", "motion": "NOD", "level": "lv2"}}}}"#;
         assert!(Lexicon::from_json(no_lines).is_err());
+        let bad_emote = r#"{"e": {"x": {"bias": "a", "express": {"emotion": "JOY", "motion": "NOD", "emote": "PARTY", "lines": ["hi"]}}}}"#;
+        assert!(format!("{:#}", Lexicon::from_json(bad_emote).unwrap_err()).contains("unknown emote 'PARTY'"));
+        let bad_part = r#"{"e": {"x": {"bias": "a", "asset": {"action": "EQUIP_PART", "part": "JETPACK"}}}}"#;
+        assert!(format!("{:#}", Lexicon::from_json(bad_part).unwrap_err()).contains("avatar part 'JETPACK'"));
+    }
+
+    #[test]
+    fn emotes_assets_and_proactive_lines() {
+        use zena_core::tools::{AssetAction, AvatarPart, AvatarTrack};
+        let lex = Lexicon::bundled();
+        let e = lex.node("emotion.praise").unwrap().action.express().unwrap();
+        assert_eq!(e.emote, Some(CharacterEmote::ChibiHeart));
+        match &lex.node("avatar.robot_mode").unwrap().action {
+            Action::Asset { asset, express } => {
+                assert_eq!(
+                    (asset.action, asset.track),
+                    (AssetAction::SwitchTrack, Some(AvatarTrack::Solidcraft))
+                );
+                assert!(express.is_some());
+            }
+            a => panic!("{a:?}"),
+        }
+        assert!(matches!(
+            &lex.node("avatar.glasses").unwrap().action,
+            Action::Asset { asset, .. } if asset.part == Some(AvatarPart::Glasses)
+        ));
+        assert!(lex.node("avatar.glasses").unwrap().action.is_command());
+        let (k, _) = lex.proactive(Some("react.coding"), false).unwrap();
+        assert_eq!(k, "proactive.coding");
+        assert_eq!(lex.proactive(Some("react.coding"), true).unwrap().0, "proactive.stretch");
+        assert_eq!(lex.proactive(Some("react.nowhere"), false).unwrap().0, "proactive.idle");
+        assert_eq!(lex.proactive(None, false).unwrap().0, "proactive.idle");
+        assert!(lex.text_nodes().all(|n| n.group != PROACTIVE_GROUP));
     }
 
     #[test]

@@ -8,7 +8,7 @@
   "function": {
     "request": {
       "semantic": "Request endings and politeness markers. They carry no expression domain of their own, so a span made only of them never wins.",
-      "bias": "해 줘, 해줘, 줘, 주세요, 줄래, 해 줄래, 부탁해, 좀, 할래, 하자, 알려 줘, 보여 줘, please, could you, can you, would you, let's"
+      "bias": "해 줘, 해줘, 줘, 주세요, 줄래, 해 줄래, 부탁해, 좀, 할래, 하자, 알려 줘, 보여 줘, 봐, 봐 줘, 해 봐, please, could you, can you, would you, let's"
     },
     "filler": {
       "semantic": "Conversational fillers and intensifiers that do not name anything.",
@@ -78,63 +78,63 @@
       "bias": "이겼다, 이겼어, 클리어했다, 성공했다, 해냈다, 보스 잡았어, 득템했다, 대박이다, 레벨 업했어, 랭크 올랐어, 1등 했어, we won, i did it, victory, nailed it, level up",
       "prejudice": "졌다, 실패했어, 또 죽었어, 망했다, 주식 올랐어",
       "exact_match": ["이겼다", "이겼어", "클리어", "해냈다", "해냈어", "득템", "레벨업", "대박", "we won"],
-      "express": { "emotion": "EXCITED", "motion": "CHEER", "lines": ["해냈다! 최고야!", "우와, 클리어 축하해!", "나이스! 완벽했어!"] }
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "emote": "CHIBI_CHEER", "lines": ["해냈다! 최고야!", "우와, 클리어 축하해!", "나이스! 완벽했어!"] }
     },
     "frustrated": {
       "semantic": "The user lost, died or failed and is frustrated or annoyed.",
       "bias": "또 죽었어, 졌다, 망했다, 짜증 나, 열받아, 왜 안 돼, 너무 어려워, 실패했어, 게임 오버, 억울해, i died again, we lost, this is so hard, so annoying",
       "prejudice": "이겼다, 클리어했다, 해냈다, 주식 떨어졌어",
       "exact_match": ["죽었어", "졌다", "졌어", "망했다", "망했어", "짜증나", "열받아", "억울해"],
-      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["괜찮아, 다음엔 잡을 수 있어.", "패턴 거의 다 봤어, 한 번만 더!", "아깝다… 잠깐 쉬었다 갈까?"] }
+      "express": { "emotion": "WORRIED", "motion": "NOD", "emote": "DIZZY_SPIRAL", "lines": ["괜찮아, 다음엔 잡을 수 있어.", "패턴 거의 다 봤어, 한 번만 더!", "아깝다… 잠깐 쉬었다 갈까?"] }
     },
     "praise": {
       "semantic": "The user praises Zena herself.",
       "bias": "잘했어 제나, 똑똑하다, 최고야, 귀여워, 멋지다, 역시 제나, good job, you are the best, so cute",
       "prejudice": "고마워, 이겼다",
       "exact_match": ["잘했어", "똑똑하다", "귀여워", "멋지다", "역시"],
-      "express": { "emotion": "JOY", "motion": "CLAP", "lines": ["헤헤, 칭찬 고마워!", "칭찬받으니까 힘난다!"] }
+      "express": { "emotion": "JOY", "motion": "CLAP", "emote": "CHIBI_HEART", "lines": ["헤헤, 칭찬 고마워!", "칭찬받으니까 힘난다!"] }
     },
     "thanks": {
       "semantic": "The user thanks Zena.",
       "bias": "고마워, 고맙다, 땡큐, 감사해, 덕분이야, thanks, thank you",
       "prejudice": "잘했어, 귀여워",
       "exact_match": ["고마워", "고맙다", "땡큐", "감사해", "덕분이야", "thanks", "thank you"],
-      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["천만에!", "언제든지 불러 줘!"] }
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "MUSIC_NOTE", "lines": ["천만에!", "언제든지 불러 줘!"] }
     },
     "surprised": {
       "semantic": "The user is startled or shocked by something that just happened.",
       "bias": "헐, 깜짝이야, 뭐야 이거, 말도 안 돼, 이게 뭐야, 실화냐, whoa, what the, no way",
       "prejudice": "무서워, 대박이다",
       "exact_match": ["깜짝이야", "말도 안 돼", "실화냐"],
-      "express": { "emotion": "SURPRISED", "motion": "FLINCH", "lines": ["헉, 나도 깜짝 놀랐어!", "뭐야 뭐야?!"] }
+      "express": { "emotion": "SURPRISED", "motion": "FLINCH", "emote": "EXCLAIM_3D", "lines": ["헉, 나도 깜짝 놀랐어!", "뭐야 뭐야?!"] }
     },
     "scared": {
       "semantic": "The user is scared (horror game, dark place).",
       "bias": "무서워, 소름 돋아, 귀신 나와, 공포 게임, 너무 어두워, scary, i am scared, creepy",
       "prejudice": "깜짝이야, 짜증 나",
       "exact_match": ["무서워", "소름", "무섭다"],
-      "express": { "emotion": "WORRIED", "motion": "HIDE_CROUCH", "lines": ["나도 무서워… 같이 가자.", "천천히, 내가 옆에 있을게."] }
+      "express": { "emotion": "WORRIED", "motion": "HIDE_CROUCH", "emote": "SWEAT_PANIC", "lines": ["나도 무서워… 같이 가자.", "천천히, 내가 옆에 있을게."] }
     },
     "tired": {
       "semantic": "The user is tired, sleepy or worn out.",
       "bias": "피곤해, 졸려, 힘들다, 지쳤어, 눈 아파, 오래 했다, so tired, sleepy, exhausted",
       "prejudice": "너무 어려워, 심심해",
       "exact_match": ["피곤해", "졸려", "지쳤어", "피곤하다"],
-      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["조금 쉬었다 할까?", "물 한 잔 마시고 오자!"] }
+      "express": { "emotion": "WORRIED", "motion": "NOD", "emote": "RELIEF_SIGH", "lines": ["조금 쉬었다 할까?", "물 한 잔 마시고 오자!"] }
     },
     "sad": {
       "semantic": "The user is sad or feeling down.",
       "bias": "슬퍼, 우울해, 속상해, 눈물 나, 기운 없어, i am sad, feeling down",
       "prejudice": "짜증 나, 피곤해",
       "exact_match": ["슬퍼", "우울해", "속상해"],
-      "express": { "emotion": "SORROW", "motion": "NOD", "lines": ["많이 속상했구나… 내가 들어 줄게.", "괜찮아, 오늘은 내가 옆에 있을게."] }
+      "express": { "emotion": "SORROW", "motion": "NOD", "emote": "TEARS", "lines": ["많이 속상했구나… 내가 들어 줄게.", "괜찮아, 오늘은 내가 옆에 있을게."] }
     },
     "greeting": {
       "semantic": "The user says hello or announces they are back.",
       "bias": "안녕, 하이, 좋은 아침, 반가워, 나 왔어, 오랜만이야, hello, hi, good morning",
       "prejudice": "잘 자, 다음에 봐, 종료해 줘",
       "exact_match": ["안녕", "하이", "반가워", "나 왔어", "hello"],
-      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["안녕! 오늘도 같이 하자!", "왔구나! 기다리고 있었어."] }
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "MUSIC_NOTE", "lines": ["안녕! 오늘도 같이 하자!", "왔구나! 기다리고 있었어."] }
     },
     "farewell": {
       "semantic": "The user says goodbye for now (the app keeps running unless they ask to quit).",
@@ -148,7 +148,7 @@
       "bias": "응원해 줘, 파이팅, 힘내자, 집중하자, 할 수 있겠지, cheer me on, let's go",
       "prejudice": "보스 패턴 어떻게 피해",
       "exact_match": ["응원해", "파이팅", "화이팅", "힘내자", "집중하자"],
-      "express": { "emotion": "FOCUSED", "motion": "CHEER", "lines": ["파이팅! 할 수 있어!", "집중! 내가 같이 볼게."] }
+      "express": { "emotion": "FOCUSED", "motion": "CHEER", "emote": "CHIBI_CHEER", "lines": ["파이팅! 할 수 있어!", "집중! 내가 같이 볼게."] }
     },
     "bored": {
       "semantic": "The user is bored and wants something to do.",
@@ -165,14 +165,14 @@
       "bias": "주식 올랐어, 떡상, 익절했어, 수익 났어, 빨간불이야, 상한가, 코인 올랐어, my stock went up, took profit, to the moon",
       "prejudice": "주식 떨어졌어, 손절했어, 이겼다",
       "exact_match": ["떡상", "익절", "상한가", "수익 났어"],
-      "express": { "emotion": "EXCITED", "motion": "CHEER", "lines": ["오, 수익 축하해!", "빨간불이다! 그래도 원칙대로 가자."] }
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "emote": "STAR_EYES", "lines": ["오, 수익 축하해!", "빨간불이다! 그래도 원칙대로 가자."] }
     },
     "stock_down": {
       "semantic": "The user's stock or coin went down or they cut a loss (Korean charts show losses in blue).",
       "bias": "주식 떨어졌어, 떡락, 손절했어, 물렸어, 파란불이야, 하한가, 마이너스야, 코인 떨어졌어, my stock dropped, i lost money",
       "prejudice": "주식 올랐어, 익절했어, 졌다",
       "exact_match": ["떡락", "손절", "물렸어", "하한가"],
-      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["저런… 너무 무리하지 말자.", "한 번 숨 고르고 다시 보자."] }
+      "express": { "emotion": "WORRIED", "motion": "NOD", "emote": "SWEAT_PANIC", "lines": ["저런… 너무 무리하지 말자.", "한 번 숨 고르고 다시 보자."] }
     },
     "ask_market": {
       "semantic": "The user asks about the market or a chart (Zena talks it over but never gives investment advice).",
@@ -191,7 +191,7 @@
       "prejudice": "인벤토리에서 물약 어디 있어, 응원해 줘",
       "exact_match": ["어떻게 피해", "공략", "어떻게 잡아"],
       "ask": "coach",
-      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": [] }
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "emote": "SPARKLE_IDEA", "lines": [] }
     },
     "inventory": {
       "semantic": "The user asks where an item is or how many are left.",
@@ -223,10 +223,120 @@
     }
   },
 
+  "avatar": {
+    "robot_mode": {
+      "semantic": "The user asks Zena to transform into her parametric robot / toy body (Track A, SolidCraft).",
+      "bias": "로봇 모드, 로봇으로 변신, 로봇 제나, 메카 모드, 로봇 변신, robot mode, transform into a robot",
+      "prejudice": "애니 모드, 원래대로",
+      "exact_match": ["로봇 모드", "로봇으로 변신", "메카 모드", "로봇 변신"],
+      "asset": { "action": "SWITCH_TRACK", "track": "SOLIDCRAFT" },
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "emote": "SPARKLE_IDEA", "lines": ["변신! 로봇 제나 출동!", "철컥철컥, 로봇 모드 완료!"] }
+    },
+    "anime_2d": {
+      "semantic": "The user asks for Zena's 2D anime look (Track B-1, layered SD parts).",
+      "bias": "2D 모드, 애니 모드, 일러스트 모드, 2D로 바꿔, 2d mode, anime mode",
+      "prejudice": "3D 모드, 로봇 모드",
+      "exact_match": ["2D 모드", "애니 모드", "일러스트 모드"],
+      "asset": { "action": "SWITCH_TRACK", "track": "SUBCULTURE_2D" },
+      "express": { "emotion": "JOY", "motion": "CHEER", "emote": "CHIBI_CHEER", "lines": ["짜잔, 2D 제나야!"] }
+    },
+    "anime_3d": {
+      "semantic": "The user asks for Zena's 3D anime model (Track B-2, VRM).",
+      "bias": "3D 모드, VRM 모드, 입체 모드, 3D로 바꿔, 3d mode, vrm mode",
+      "prejudice": "2D 모드, 로봇 모드",
+      "exact_match": ["3D 모드", "VRM 모드", "입체 모드"],
+      "asset": { "action": "SWITCH_TRACK", "track": "SUBCULTURE_3D" },
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "STAR_EYES", "lines": ["3D로 나왔어! 잘 보여?"] }
+    },
+    "default_look": {
+      "semantic": "The user wants Zena's default look back.",
+      "bias": "원래대로, 원래 모습, 기본 모습, 기본 모드, 처음 모습, default look, back to normal",
+      "exact_match": ["원래대로", "원래 모습", "기본 모습", "기본 모드"],
+      "asset": { "action": "SWITCH_TRACK", "track": "PROCEDURAL" },
+      "express": { "emotion": "RELIEVED", "motion": "NOD", "lines": ["원래 모습으로 돌아왔어!"] }
+    },
+    "glasses": {
+      "semantic": "The user asks Zena to put on glasses.",
+      "bias": "안경 써 봐, 안경 껴 봐, 안경 써, 안경 착용, put on glasses, wear glasses",
+      "prejudice": "안경 벗어",
+      "exact_match": ["안경", "안경 써", "안경 껴"],
+      "asset": { "action": "EQUIP_PART", "part": "GLASSES" },
+      "express": { "emotion": "FOCUSED", "motion": "NOD", "emote": "SPARKLE_IDEA", "lines": ["어때, 똑똑해 보여?", "안경 장착! 분석 모드야."] }
+    },
+    "headset": {
+      "semantic": "The user asks Zena to put on a headset.",
+      "bias": "헤드셋 써 봐, 헤드폰 써 봐, 헤드셋 착용, put on a headset, wear headphones",
+      "prejudice": "헤드셋 벗어",
+      "exact_match": ["헤드셋", "헤드폰", "헤드셋 써"],
+      "asset": { "action": "EQUIP_PART", "part": "HEADSET" },
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "MUSIC_NOTE", "lines": ["헤드셋 장착! 콜 준비 완료.", "오, 소리 잘 들린다~"] }
+    },
+    "cat_ears": {
+      "semantic": "The user asks Zena to wear cat ears.",
+      "bias": "고양이 귀, 냥이 귀, 고양이 귀 달아 봐, cat ears",
+      "exact_match": ["고양이 귀", "냥이 귀", "고양이귀"],
+      "asset": { "action": "EQUIP_PART", "part": "CAT_EARS" },
+      "express": { "emotion": "JOY", "motion": "CHEER", "emote": "CHIBI_HEART", "lines": ["냥! 어울려?"] }
+    },
+    "ribbon": {
+      "semantic": "The user asks Zena to wear a ribbon.",
+      "bias": "리본 달아 봐, 리본 해 봐, 리본, ribbon, wear a bow",
+      "exact_match": ["리본"],
+      "asset": { "action": "EQUIP_PART", "part": "RIBBON" },
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "CHIBI_HEART", "lines": ["리본 달았어! 예뻐?"] }
+    },
+    "take_off": {
+      "semantic": "The user asks Zena to take her accessories off.",
+      "bias": "다 벗어, 벗어 봐, 액세서리 빼 줘, 장식 빼, 다 빼, take it off, remove accessories",
+      "exact_match": ["벗어", "다 벗어", "액세서리 빼", "장식 빼", "다 빼"],
+      "asset": { "action": "RESET_PARTS" },
+      "express": { "emotion": "NEUTRAL", "motion": "NOD", "lines": ["다 정리했어!", "깔끔하게 원래대로!"] }
+    }
+  },
+
+  "proactive": {
+    "idle": {
+      "semantic": "Said on her own after a long silence on a screen she has no line for.",
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "MUSIC_NOTE", "lines": ["흥흥~ 나 여기 있어!", "조용하네. 뭐 하고 있어?", "심심하면 나한테 말 걸어 줘!"] }
+    },
+    "combat": {
+      "semantic": "A quiet moment during a fight.",
+      "express": { "emotion": "FOCUSED", "motion": "NOD", "emote": "SPARKLE_IDEA", "lines": ["숨 한 번 고르고 가자!", "지금 페이스 좋아!", "회복 아이템 챙겼지?"] }
+    },
+    "menu": {
+      "semantic": "The player has been sitting in a game menu.",
+      "express": { "emotion": "JOY", "motion": "THINK", "emote": "QUESTION", "lines": ["다음엔 뭐 할 거야?", "장비 정리 중이야?"] }
+    },
+    "loading": {
+      "semantic": "A long loading screen.",
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "MUSIC_NOTE", "lines": ["로딩 길다~ 어깨 한 번 돌려 볼까?"] }
+    },
+    "market": {
+      "semantic": "The player has been watching charts for a while.",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": ["차트만 보면 눈 아파. 잠깐 쉬자!", "오늘도 원칙대로 가는 거지?"] }
+    },
+    "video": {
+      "semantic": "The player is watching a video.",
+      "express": { "emotion": "JOY", "motion": "IDLE", "emote": "MUSIC_NOTE", "lines": ["이거 재밌다! 계속 보자."] }
+    },
+    "coding": {
+      "semantic": "The player has been coding quietly.",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "emote": "SPARKLE_IDEA", "lines": ["커밋은 자주! 알지?", "막히면 나한테 설명해 봐. 말하다 보면 풀려!"] }
+    },
+    "work": {
+      "semantic": "The player has been working on a document.",
+      "express": { "emotion": "FOCUSED", "motion": "NOD", "lines": ["잘하고 있어. 물 한 잔 어때?"] }
+    },
+    "stretch": {
+      "semantic": "The same screen for a long session: suggest a break.",
+      "express": { "emotion": "RELIEVED", "motion": "NOD", "emote": "RELIEF_SIGH", "lines": ["벌써 한참 했어! 같이 스트레칭 하자~", "눈 좀 쉬어 주자. 먼 곳 한 번 보기!"] }
+    }
+  },
+
   "react": {
     "combat": {
       "semantic": "Screen-only reaction: a fight is on screen. Zena focuses silently; the event sensor drives the Lv1-Lv3 combat reactions.",
-      "express": { "emotion": "FOCUSED", "motion": "LEAN_FORWARD_POINT", "lines": [], "level": "lv1" }
+      "express": { "emotion": "FOCUSED", "motion": "LEAN_FORWARD_POINT", "emote": "THREAT_ARROW_3D", "lines": [], "level": "lv1" }
     },
     "menu": {
       "semantic": "Screen-only reaction: a game menu, lobby or inventory screen.",

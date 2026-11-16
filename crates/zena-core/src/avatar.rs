@@ -326,6 +326,7 @@ mod tests {
             emotion_state: EmotionState::SurprisedUrgent,
             body_motion: BodyMotion::LeanForwardPoint,
             speech_text: Some("회피기 써!".into()),
+            ..Default::default()
         };
         let l2d = to_live2d(
             &a,

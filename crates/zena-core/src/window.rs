@@ -27,6 +27,8 @@ pub struct WindowState {
     pub mode: WindowLayerMode,
     pub topmost: bool,
     pub visible: bool,
+    /// The in-overlay chat box is open: the window takes focus and keyboard / IME input until it closes.
+    pub typing: bool,
 }
 
 impl Default for WindowState {
@@ -35,6 +37,7 @@ impl Default for WindowState {
             mode: WindowLayerMode::GhostClickThrough,
             topmost: true,
             visible: true,
+            typing: false,
         }
     }
 }
@@ -42,11 +45,14 @@ impl Default for WindowState {
 impl WindowState {
     /// The extended style to apply for the current state.
     pub fn ex_style(&self) -> u32 {
-        let mut s = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let mut s = WS_EX_LAYERED | WS_EX_TOOLWINDOW;
+        if !self.typing {
+            s |= WS_EX_NOACTIVATE;
+        }
         if self.topmost {
             s |= WS_EX_TOPMOST;
         }
-        if self.mode == WindowLayerMode::GhostClickThrough {
+        if self.mode == WindowLayerMode::GhostClickThrough && !self.typing {
             s |= WS_EX_TRANSPARENT;
         }
         s
@@ -54,7 +60,7 @@ impl WindowState {
 
     /// Opacity for the current cursor position.
     pub fn alpha(&self, cursor_over_avatar: bool) -> u8 {
-        if self.mode == WindowLayerMode::GhostClickThrough && cursor_over_avatar {
+        if self.mode == WindowLayerMode::GhostClickThrough && cursor_over_avatar && !self.typing {
             HOVER_ALPHA
         } else {
             255
@@ -110,21 +116,25 @@ pub enum Hotkey {
     Quit,
     HideToggle,
     InteractiveToggle,
+    /// Open / close the chat box (handled by the overlay itself, not a system command).
+    Chat,
 }
 
 impl Hotkey {
-    pub const ALL: [Hotkey; 3] = [Hotkey::Quit, Hotkey::HideToggle, Hotkey::InteractiveToggle];
-    /// Virtual-key code (`'Q'`, `'H'`, `'L'`).
+    pub const ALL: [Hotkey; 4] = [Hotkey::Quit, Hotkey::HideToggle, Hotkey::InteractiveToggle, Hotkey::Chat];
+    /// Virtual-key code (`'Q'`, `'H'`, `'L'`, `'T'`).
     pub fn vk(self) -> u32 {
         match self {
             Hotkey::Quit => b'Q' as u32,
             Hotkey::HideToggle => b'H' as u32,
             Hotkey::InteractiveToggle => b'L' as u32,
+            Hotkey::Chat => b'T' as u32,
         }
     }
     pub fn command(self, st: &WindowState) -> (SystemCommand, Option<WindowLayerMode>) {
         match self {
             Hotkey::Quit => (SystemCommand::ExitApp, None),
+            Hotkey::Chat => (SystemCommand::KeepActive, None),
             Hotkey::HideToggle => (
                 if st.visible {
                     SystemCommand::HideAvatar
@@ -204,6 +214,13 @@ mod tests {
         assert_eq!(pet.ex_style() & WS_EX_TRANSPARENT, 0);
         assert_eq!(st.alpha(true), 76);
         assert_eq!(pet.alpha(true), 255);
+        let typing = WindowState { typing: true, ..st };
+        assert_eq!(
+            typing.ex_style() & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE),
+            0,
+            "the chat box takes focus"
+        );
+        assert_eq!(typing.alpha(true), 255);
     }
 
     #[test]

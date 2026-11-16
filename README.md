@@ -5,11 +5,12 @@
 > 상태: **기반 구현 단계**입니다. 다음은 실제 가중치나 테스트로 검증했습니다.
 > - 양자화기: 원본 KRAFTON 가중치를 실제로 양자화했습니다.
 > - **Raon-1-nano 추론 엔진(candle)**: 공식 PyTorch 구현과 로짓이 일치(KL 2.6e-11, top-1 100%)하고, 실제 모델이 Zena 툴콜을 생성합니다.
-> - LLM 가속은 `logis-center`와 같은 `candle-rocm-vulkan` 포크로 붙였습니다(CUDA / ROCm / Vulkan / Metal). 단, 이 환경에 GPU가 없어 GPU 실행 속도는 측정하지 못했습니다.
+> - LLM 가속은 `logis-center`와 같은 `candle-rocm-vulkan` 포크로 붙였습니다(CUDA / ROCm / Vulkan / Metal). 단, 처음 개발한 환경에는 GPU가 없어 GPU 실행 속도는 측정하지 못했습니다(아래 Windows 클라이언트 항목 참고).
 > - 이벤트 센서, NLP-NMS 라우터, 툴콜·아바타 매핑
 > - **단어 사전 기반 캐릭터 표현**: logis-center `bias.json` 형식의 표현 사전으로 사용자의 말과 PC 화면을 같은 표현 도메인으로 잡아내고, 사전에 적힌 표정·동작·대사로 반응합니다(LLM 없이). 사전은 **LanceDB**에 있으며 실행 중에 고치거나 사용 중에 배우고, 되돌릴 수도 있습니다.
 > - **주기적 화면 감지(Raon-VisionEncoder, candle)**: 공식 PyTorch 출력과 코사인 1.000000 일치. noto-sandbox의 체커·fovea·지뢰찾기 패스를 이식했고, 프레임은 저장하지 않습니다. LLM은 필요할 때만 올립니다. [`docs/EXPRESSION.md`](docs/EXPRESSION.md)
-> - Windows 클라이언트: 타입 체크까지만 했습니다.
+> - Windows 클라이언트: RTX 3050 Laptop + Windows 11에서 실제 오버레이 창을 띄워 스크립트 대화(사전 반응, 트랙 전환, 액세서리, 스트리밍 코칭, 작별 후 종료)를 확인했습니다. `--snapshot`으로 3패스 렌더 결과를 PNG로 확인했습니다. 이 머신에서 `--features cuda` 빌드와 GPU 커널(밀집·Q8_0 matmul)이 CPU 결과와 일치하는 것을 확인했습니다. 단, 가중치가 없어 Raon-1-nano의 GPU 생성 속도는 아직 측정하지 못했습니다.
+> - **캐릭터 챗·전용 이모티콘·투트랙 헤드리스 MCP**: 멀티턴 기억, 스트리밍 툴콜(표정 선행), 능동적 말걸기, 말풍선·채팅창, 14종 캐릭터 전용 이모티콘(SD 스탬프, 3D 프롭, 만화 표정), SolidCraft/서브컬처 MCP 에셋 파이프라인. [`docs/CHARACTER.md`](docs/CHARACTER.md)
 >
 > TTS는 아직 스텁입니다. 자세한 내용은 [현재 범위와 한계](#현재-범위와-한계)를 보세요.
 
@@ -22,10 +23,11 @@
 | `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, **사전 exact·교착어 접두 일치 → bias/prejudice 점수**, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. 의도 표는 코드가 아니라 단어 사전에서 옵니다. |
 | `crates/raon-quant` | §3 | 원본 safetensors를 mmap으로 읽어 **단일 패스 4계층 피라미드 양자화**를 하고 GGUF v3로 씁니다. 그 밖에 imatrix 반영, `--preset zena`(측정 기반 품질 레시피), `kept_ids` 어휘 절삭, 융합 dequant-dot 커널, 자가 검증이 들어 있습니다. |
 | `crates/zena-lexicon` | §2.3 · §4 | **표현 사전**: logis-center `bias.json` 노드 형식(`semantic`/`bias`/`prejudice`/`exact_match`)에 `express`(표정·동작·대사), `command`, `ask`, noto식 `vision` 노드를 더한 `data/zena_lexicon.json`. 기능 `lancedb`로 **LanceDB 저장소**(공식 Rust SDK): 리비전, 핫 리로드, n-gram BM25, 1152-d 앵커 벡터 검색, 학습 후보, Lance 타임트래블 롤백 |
+| `crates/zena-avatar-mcp` | 투트랙 에셋 | CAD/에디터 UI 없는 **헤드리스 MCP** 에셋 파이프라인. MCP(JSON-RPC 2.0, stdio) 클라이언트·서버, Track A **SolidCraft 브리지**(`solidcraft-cli mcp`의 `batch`/`export glb`)와 SolidCraft가 없을 때 같은 결과를 내는 내장 파라메트릭 생성기(3D 감정 프롭·코칭 화살표·액세서리·VRM 이름 모프를 가진 로봇 제나), Track B-1 **SD(치비) 스탬프 합성기**(레이어 PNG 키트 또는 내장 절차 키트), Track B-2 **VRM 0.x/1.0** 표정·휴머노이드 메타데이터, glTF 리더/라이터와 스키닝 수학, 백그라운드 `AssetService`. `zena-subculture-mcp` 바이너리가 Track B를 MCP 도구로 노출합니다. [`docs/CHARACTER.md`](docs/CHARACTER.md) |
 | `crates/raon-vision` | §2.2 | **Raon-VisionEncoder**(SigLIP2 So400m/16, NaFlex) 비전·텍스트 타워와 토크나이저를 candle로 구현. noto-sandbox의 sparse pass(`forward_sparse`/`extend_sparse`/`merge_sparse`), 체커·fovea 첫 패스, 지뢰찾기 확장, 사전 앵커 기반 제로샷 화면 도메인 점수 |
 | `apps/zena-lexicon` | — | 사전 CLI: `import`·`export`·`add`·`remove`·`search`·`show`·`candidates`·`history`·`rollback`·`anchors`·`nearest`·`stats` |
 | `crates/raon-infer` | §2.4 | **Raon-1-nano 순전파**(RDA 18층 + MLA 6층 + Raon-mHC + PLE)를 candle로 구현했습니다. `cuda`/`rocm`/`vulkan`/`metal`/`flash-attn` 기능 플래그와 `Qntology/candle-rocm-vulkan` 포크를 씁니다. 그 밖에 GGUF 블록 디바이스 상주(`QMatMul`), **safetensors 로드 시점 피라미드 양자화**(GGUF 불필요), 프리픽스 상태 캐시, `raon-chat`, `raon-imatrix`가 들어 있습니다. [`docs/INFERENCE.md`](docs/INFERENCE.md) |
-| `apps/raon-zena` | §5 | Windows 오버레이(350×450 마이크로 뷰포트). 구성 요소: winit, 단일 wgpu DX12 디바이스(DirectComposition), DXGI Desktop Duplication, Win32 레이어 플래그와 전역 단축키, 절차적 플레이스홀더 아바타 |
+| `apps/raon-zena` | §5 | Windows 오버레이(350×450 마이크로 뷰포트). 구성 요소: winit, 단일 wgpu DX12 디바이스(DirectComposition), DXGI Desktop Duplication, Win32 레이어 플래그와 전역 단축키. **3패스 렌더러**(본체: 절차적 얼굴 / Track A `.glb` / Track B-1 2D / Track B-2 `.vrm` 툰 셰이딩·모프·스키닝 → 캐릭터 전용 이모티콘·3D 프롭 → 말풍선), **캐릭터 챗**(스트리밍 툴콜로 표정 선행·문장 단위 발화, 멀티턴 기억, 세션 요약, 능동적 말걸기, 오버레이 채팅창+IME), `--snapshot` 헤드리스 렌더 검사 |
 | `scripts/` | §0 A안 | 원본 가중치 병렬 다운로드와 SHA-256 검증(`fetch_models.sh`), llama.cpp `gguf-py` 교차 검증(`xcheck_gguf.py`), 공식 PyTorch 참조 로짓과 비교(`reference_logits.py`, `compare_logits.py`), 보정·평가 텍스트(`calibration/`) |
 | `.github/workflows/cross-verify.yml` | — | CPU 테스트와 `vulkan`/`rocm`/`cuda`(apt CUDA 툴킷) 빌드 검사, Linux·Windows. PR 또는 수동 실행 시 동작합니다. |
 
@@ -73,6 +75,12 @@ Windows 클라이언트는 아래 명령으로 실행합니다. `--features`로 
 LanceDB 사전 저장소를 빌드하려면 `protoc`가 필요합니다(Ubuntu `apt install protobuf-compiler libprotobuf-dev`, Windows `winget install protobuf`).
 `--no-default-features`로 빌드하면 DB 없이 JSON 사전만 씁니다.
 
+Windows에서 CUDA 13.x로 `--features cuda`를 빌드하려면 VS 개발자 셸(`vcvars64.bat`, nvcc가 `cl.exe`를 찾도록)에서 다음 환경 변수를 먼저 설정해야 합니다. CUDA 13의 CCCL 헤더가 MSVC의 전통 전처리기를 거부하기 때문입니다. RTX 3050 Laptop + CUDA 13.3 + MSVC 14.51에서 이 설정으로 `raon-chat`이 빌드되는 것을 확인했습니다.
+
+```bash
+set NVCC_APPEND_FLAGS=-Xcompiler=/Zc:preprocessor
+```
+
 ```bash
 cargo run --release -p raon-zena --features cuda,flash-attn -- --model models/KRAFTON/Raon-1-nano --quant-preset zena --llm-device auto --llm-idle 120 --screen models/KRAFTON/Raon-VisionEncoder --learn
 ```
@@ -93,6 +101,15 @@ cargo run --release -p zena-lexicon-cli -- add emotion.celebrate bias "드디어
 - `Ctrl+Shift+Q`: 작별 인사 후 종료
 - `Ctrl+Shift+H`: 숨기기 / 보이기
 - `Ctrl+Shift+L`: 클릭 투과 모드와 드래그 모드 전환
+- `Ctrl+Shift+T`: 오버레이 채팅창 열기 (한글 IME 지원, Enter 전송, Esc 닫기)
+
+아바타 트랙과 액세서리는 말로 바꿀 수 있습니다("로봇 모드로 변신해 줘", "안경이랑 헤드셋 써 봐", "원래대로"). 시작 트랙은 `--track procedural|solidcraft|subculture-2d|subculture-3d`(3D는 `--vrm 파일.vrm` 필요), 2D 파츠 키트는 `--chibi-kit 폴더`로 지정합니다. SolidCraft(`solidcraft-cli`)가 PATH나 `C:\Program Files\SolidCraft`에 있으면 Track A 에셋을 그 MCP 서버로 만들고, 없으면 내장 생성기로 만듭니다. 침묵 후 먼저 말 걸기는 `--proactive 초`(0이면 끔), 대화 기억 길이는 `--history N`입니다.
+
+렌더러를 창 없이 확인하려면 다음 명령으로 장면 몇 개를 PNG로 그립니다.
+
+```bash
+cargo run --release -p raon-zena -- --snapshot out/snapshots
+```
 
 ## 실측 결과 (원본 가중치, 이 저장소의 도구로 생성)
 

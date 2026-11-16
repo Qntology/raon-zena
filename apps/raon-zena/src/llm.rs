@@ -7,7 +7,9 @@
 //! * [`TemplateBackend`] — a rule-based stand-in emitting the same `<tool_call>` wire format,
 //!   used when no model is configured.
 //!
-//! [`LlmWorker`] runs a backend on its own thread so generation never blocks the sensor loop.
+//! [`LlmWorker`] runs a backend on its own thread so generation never blocks the sensor loop. Backends stream
+//! their text deltas to a [`JobHandler`] while generating, so the avatar can react before the call is complete
+//! (see `zena_core::stream`).
 
 use raon_infer::device::{select_device, Backend};
 use raon_infer::generate::Generator;
@@ -20,9 +22,28 @@ use zena_core::prompt::{build_fast_path_prompt, Situation};
 
 pub trait LlmBackend: Send {
     fn name(&self) -> &'static str;
-    /// Generate a completion for the fast-path prompt. `situation` is passed alongside the
-    /// rendered prompt so non-neural backends can respond without parsing text.
-    fn generate(&mut self, prompt: &str, situation: &Situation) -> String;
+    /// Generate a completion for the fast-path prompt, passing each new piece of text to `on_text` as it is
+    /// produced; returns the whole completion. `situation` is passed alongside the rendered prompt so non-neural
+    /// backends can respond without parsing text.
+    fn generate(&mut self, prompt: &str, situation: &Situation, on_text: &mut dyn FnMut(&str)) -> String;
+}
+
+/// Receives what the LLM thread produces for each job.
+pub trait JobHandler: Send + 'static {
+    /// A piece of the completion, while it is being generated.
+    fn delta(&mut self, _job: &LlmJob, _text: &str) {}
+    /// The whole completion (empty when generation or loading failed).
+    fn done(&mut self, job: LlmJob, text: String);
+}
+
+/// A handler that only wants the finished completion.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct OnDone<F>(pub F);
+
+impl<F: FnMut(LlmJob, String) + Send + 'static> JobHandler for OnDone<F> {
+    fn done(&mut self, job: LlmJob, text: String) {
+        (self.0)(job, text)
+    }
 }
 
 const USER_TURN: &str = "<|im_start|>user\n";
@@ -88,16 +109,25 @@ impl LlmBackend for RaonNanoBackend {
         "raon-1-nano"
     }
 
-    fn generate(&mut self, prompt: &str, _situation: &Situation) -> String {
+    fn generate(&mut self, prompt: &str, _situation: &Situation, on_text: &mut dyn FnMut(&str)) -> String {
         // Special tokens are atomic, so splitting right before the user turn tokenizes exactly
         // like the whole prompt.
         let suffix = prompt.find(USER_TURN).map(|i| &prompt[i..]).unwrap_or(prompt);
-        let run = || -> anyhow::Result<String> {
+        let mut run = || -> anyhow::Result<String> {
             let ids = self.gen.encode(suffix)?;
-            let (text, stats) = self.gen.generate_from(self.prefix.clone(), &ids, self.max_new, |_| {})?;
+            let t0 = std::time::Instant::now();
+            let mut first: Option<f64> = None;
+            let (text, stats) = self.gen.generate_from(self.prefix.clone(), &ids, self.max_new, |d| {
+                first.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1e3);
+                on_text(d)
+            })?;
             eprintln!(
-                "[llm] {} prompt tok, {} new tok, prefill {:.0} ms, {:.1} tok/s",
-                stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_tok_per_s
+                "[llm] {} prompt tok, {} new tok, prefill {:.0} ms, first text {:.0} ms, {:.1} tok/s",
+                stats.prompt_tokens,
+                stats.new_tokens,
+                stats.prefill_ms,
+                first.unwrap_or(0.0),
+                stats.decode_tok_per_s
             );
             Ok(text)
         };
@@ -115,7 +145,19 @@ impl LlmBackend for TemplateBackend {
         "template-stub"
     }
 
-    fn generate(&mut self, _prompt: &str, s: &Situation) -> String {
+    fn generate(&mut self, _prompt: &str, s: &Situation, on_text: &mut dyn FnMut(&str)) -> String {
+        let out = Self::complete(s);
+        // Stream it a few characters at a time, like a model would.
+        let chars: Vec<char> = out.chars().collect();
+        for piece in chars.chunks(6) {
+            on_text(&piece.iter().collect::<String>());
+        }
+        out
+    }
+}
+
+impl TemplateBackend {
+    fn complete(s: &Situation) -> String {
         let (emotion, motion, line) = if let Some(q) = &s.user_query {
             if q.contains("물약") || q.contains("인벤") || q.contains("포션") {
                 (
@@ -172,29 +214,29 @@ pub struct LlmWorker {
 
 impl LlmWorker {
     /// A backend that stays loaded.
-    pub fn spawn(backend: Box<dyn LlmBackend>, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
+    pub fn spawn(backend: Box<dyn LlmBackend>, handler: impl JobHandler) -> Self {
         let name = backend.name().to_string();
         let mut slot = Some(backend);
         Self::start(
             name,
             Box::new(move || slot.take().ok_or_else(|| anyhow::anyhow!("backend already taken"))),
             None,
-            on_done,
+            handler,
         )
     }
 
     /// Not resident: the backend is loaded on the first request and dropped after `idle` without one, so
     /// Raon-1-nano only holds VRAM / RAM while Zena is actually answering (with the block cache a reload takes
     /// about a second). Requests that arrive while it loads fall back to cached cues, as when it is busy.
-    pub fn spawn_lazy(name: &str, loader: Loader, idle: Duration, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
-        Self::start(name.to_string(), Box::new(loader), Some(idle), on_done)
+    pub fn spawn_lazy(name: &str, loader: Loader, idle: Duration, handler: impl JobHandler) -> Self {
+        Self::start(name.to_string(), Box::new(loader), Some(idle), handler)
     }
 
     fn start(
         name: String,
         mut load: Box<dyn FnMut() -> anyhow::Result<Box<dyn LlmBackend>> + Send>,
         idle: Option<Duration>,
-        on_done: impl Fn(LlmJob, String) + Send + 'static,
+        mut handler: impl JobHandler,
     ) -> Self {
         let (tx, rx): (SyncSender<LlmJob>, Receiver<LlmJob>) = sync_channel(0);
         let label = name.clone();
@@ -229,13 +271,16 @@ impl LlmWorker {
                             }
                             Err(e) => {
                                 eprintln!("[llm] {label}: load failed: {e:#}");
-                                on_done(job, String::new());
+                                handler.done(job, String::new());
                                 continue;
                             }
                         }
                     }
-                    let out = backend.as_mut().expect("loaded").generate(&job.prompt, &job.situation);
-                    on_done(job, out);
+                    let out = backend
+                        .as_mut()
+                        .expect("loaded")
+                        .generate(&job.prompt, &job.situation, &mut |d| handler.delta(&job, d));
+                    handler.done(job, out);
                 }
             })
             .expect("spawn llm thread");
@@ -260,7 +305,9 @@ mod tests {
             polar: Some(zena_core::Polar { r: 0.1, theta_deg: 30.0 }),
             ..Default::default()
         };
-        let out = TemplateBackend.generate("", &s);
+        let mut streamed = String::new();
+        let out = TemplateBackend.generate("", &s, &mut |d| streamed.push_str(d));
+        assert_eq!(streamed, out, "the deltas add up to the completion");
         let p = parse_model_output(&out);
         assert!(matches!(p.calls.as_slice(), [ToolCall::ControlZenaAvatar(_)]), "{:?}", p.rejected);
     }
@@ -268,7 +315,7 @@ mod tests {
     #[test]
     fn worker_runs_jobs_off_thread() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let w = LlmWorker::spawn(Box::new(TemplateBackend), move |_, out| tx.send(out).unwrap());
+        let w = LlmWorker::spawn(Box::new(TemplateBackend), OnDone(move |_, out| tx.send(out).unwrap()));
         // sync_channel(0): a send only succeeds when the worker is waiting; retry briefly.
         let mut ok = false;
         for _ in 0..100 {
@@ -300,7 +347,7 @@ mod tests {
                 Ok(Box::new(TemplateBackend) as Box<dyn LlmBackend>)
             }),
             Duration::from_millis(50),
-            move |_, out| tx.send(out).unwrap(),
+            OnDone(move |_, out| tx.send(out).unwrap()),
         );
         assert_eq!(loads.load(Ordering::SeqCst), 0, "nothing is loaded before the first request");
         let submit = |w: &LlmWorker| {

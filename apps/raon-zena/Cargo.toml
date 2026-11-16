@@ -13,6 +13,9 @@ raon-quant = { path = "../../crates/raon-quant" }
 raon-infer = { path = "../../crates/raon-infer" }
 raon-vision = { path = "../../crates/raon-vision" }
 zena-lexicon = { path = "../../crates/zena-lexicon" }
+zena-avatar-mcp = { path = "../../crates/zena-avatar-mcp" }
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
