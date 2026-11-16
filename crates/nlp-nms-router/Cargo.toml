@@ -1,6 +1,6 @@
 [package]
 name = "nlp-nms-router"
-description = "Raon Zena natural-language request router: Korean/English NLP preprocessing, embedding scoring, span / semantic / spatial-text NMS (ported from Qntology/logis-center)"
+description = "Raon Zena natural-language request router: Korean/English NLP preprocessing, embedding scoring, span / semantic / spatial-text NMS (ported from Qntology/logis-center); NLP-NMS v2 with Stanza roles, granite embeddings and SDS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,17 @@ license.workspace = true
 [dependencies]
 zena-core = { path = "../zena-core" }
 zena-lexicon = { path = "../zena-lexicon" }
+zena-sds = { path = "../zena-sds" }
 serde.workspace = true
+anyhow = "1"
+# NLP-NMS v2 models (feature `neural`: granite embeddings; `stanza`: + Stanza roles on ONNX Runtime).
+zena-nlp = { path = "../zena-nlp", default-features = false, optional = true }
+candle-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+default = []
+neural = ["dep:zena-nlp", "dep:candle-core"]
+stanza = ["neural", "zena-nlp/stanza"]

@@ -13,6 +13,8 @@
 //!           [--vision out/raon-ve-vision.pyramid.gguf]   (residency report only)
 //!           [--proactive SECS]                      quiet time before Zena speaks up on her own (0: never; default 90)
 //!           [--history N]                           exchanges remembered for Lv3 prompts (default 4)
+//!           [--nlp auto|rules|v1]                   natural-language router: v2 with installed models (Stanza +
+//!                                                   granite + SDS), v1 + rule analyzer, or v1 (default auto)
 //!           [--track procedural|solidcraft|subculture-2d|subculture-3d]   the avatar body to start with
 //!           [--vrm model.vrm] [--chibi-kit DIR]     Track B assets (3D VRM body, layered 2D SD parts)
 //!           [--solidcraft PATH | --no-solidcraft]   SolidCraft CLI for Track A (default: found on PATH / Program Files)
@@ -68,6 +70,7 @@ struct Args {
     screen_device: raon_infer::device::Backend,
     proactive_s: u64,
     history: usize,
+    nlp: pipeline::NlpMode,
     track: zena_core::tools::AvatarTrack,
     vrm: Option<PathBuf>,
     chibi_kit: Option<PathBuf>,
@@ -111,6 +114,7 @@ fn args() -> Args {
         screen_device: raon_infer::device::Backend::Auto,
         proactive_s: 90,
         history: 4,
+        nlp: pipeline::NlpMode::Auto,
         track: zena_core::tools::AvatarTrack::Procedural,
         vrm: None,
         chibi_kit: None,
@@ -151,6 +155,10 @@ fn args() -> Args {
             "--screen-device" => a.screen_device = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::device::Backend::Auto),
             "--proactive" => a.proactive_s = it.next().and_then(|v| v.parse().ok()).unwrap_or(90),
             "--history" => a.history = it.next().and_then(|v| v.parse().ok()).unwrap_or(4),
+            "--nlp" => match it.next().unwrap_or_default().parse() {
+                Ok(m) => a.nlp = m,
+                Err(e) => eprintln!("{e}"),
+            },
             "--track" => a.track = parse_track(&it.next().unwrap_or_default()),
             "--vrm" => a.vrm = it.next().map(PathBuf::from),
             "--chibi-kit" => a.chibi_kit = it.next().map(PathBuf::from),
@@ -371,6 +379,7 @@ fn main() -> Result<()> {
             learn_min: a.learn.then_some(0.75),
             proactive_silence_ms: a.proactive_s * 1000,
             history_turns: a.history,
+            nlp: a.nlp,
             ..Default::default()
         };
         let lexicon = loaded.lexicon;

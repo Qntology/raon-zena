@@ -4,13 +4,15 @@
 //! domain becomes what its node says: a system command, a dictionary expression Zena plays at once (no LLM), or a
 //! request for Raon-1-nano.
 
+use crate::analyze::{Analyzer, NoAnalyzer, RuleAnalyzer};
 use crate::domain::{DomainBank, Hit};
-use crate::embed::{HashedNgramEmbedder, TextEmbedder};
-use crate::normalize::normalize;
+use crate::embed::{HashedNgramEmbedder, SharedEmbedder, TextEmbedder};
+use crate::normalize::{normalize, Normalized};
 use crate::semantic::{Decision, Item, SemanticNms, Source};
-use crate::span::span_nms;
+use crate::span::{span_assign, span_nms, AssignConfig, SpanHit};
 use crate::spatial::{select_target, BoxCand};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use zena_core::geometry::Polar;
 use zena_core::tools::{AssetAction, SystemCommand, WindowLayerMode, ZenaAssetArgs};
 use zena_lexicon::{Action, Lexicon};
@@ -60,11 +62,129 @@ pub struct RouterOutput {
     pub decisions: Vec<Decision>,
 }
 
+/// How spans become domains.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Selection {
+    /// v1: best domain per span above `accept`, greedy overlap suppression ([`span_nms`]).
+    Greedy { accept: f32 },
+    /// v2: double-centred spans × domains with margin-gated 1:1 assignment ([`span_assign`]).
+    Assign(AssignConfig),
+}
+
+/// The models and thresholds the router runs with.
+#[derive(Clone)]
+pub struct Models {
+    pub embedder: SharedEmbedder,
+    pub analyzer: Arc<dyn Analyzer>,
+    pub selection: Selection,
+    /// Floor of the temporal semantic NMS duplicate threshold (`clamp(μ + 3σ, base, 0.995)`) in this vector space.
+    pub base_tau: f32,
+    /// Score Dynamics ledger (`nms` track): decay shapes of chosen spans, confusion between near-tied domains.
+    pub sds: Option<Arc<Mutex<zena_sds::Ledger>>>,
+    /// A short description for logs ("granite + stanza", ...).
+    pub label: String,
+}
+
+impl Models {
+    /// The v1 router: hashed n-gram embedder, no analyzer, greedy selection.
+    pub fn v1() -> Self {
+        Self {
+            embedder: SharedEmbedder::new(HashedNgramEmbedder::default()),
+            analyzer: Arc::new(NoAnalyzer),
+            selection: Selection::Greedy { accept: 0.6 },
+            base_tau: 0.6,
+            sds: None,
+            label: "hash".into(),
+        }
+    }
+
+    /// v1 scoring with the rule analyzer (auxiliaries, negation): what runs when no model is installed.
+    pub fn rules() -> Self {
+        Self {
+            analyzer: Arc::new(RuleAnalyzer),
+            label: "hash + rules".into(),
+            ..Self::v1()
+        }
+    }
+
+    /// NLP-NMS v2 with whatever models are installed: granite embeddings with double-centred assignment when the
+    /// granite model loads, Stanza roles when its Korean model and ONNX Runtime load; otherwise [`Models::rules`].
+    #[cfg(feature = "neural")]
+    pub fn auto(ui_language: &str) -> Self {
+        let analyzer: Arc<dyn Analyzer> = Self::stanza_analyzer(ui_language);
+        let mut m = match crate::embed::GraniteEmbedder::load_default() {
+            Ok(g) => Self {
+                embedder: SharedEmbedder::new(g),
+                analyzer,
+                selection: Selection::Assign(GRANITE_ASSIGN),
+                base_tau: GRANITE_BASE_TAU,
+                sds: None,
+                label: String::new(),
+            },
+            Err(e) => {
+                eprintln!("[nlp] granite unavailable ({e:#}); hashed embedder");
+                Self { analyzer, ..Self::rules() }
+            }
+        };
+        m.label = format!("{} + {}", m.embedder.space(), m.analyzer.name());
+        m
+    }
+
+    #[cfg(feature = "neural")]
+    fn stanza_analyzer(ui_language: &str) -> Arc<dyn Analyzer> {
+        #[cfg(feature = "stanza")]
+        {
+            let lang = zena_nlp::stanza::lang_code(ui_language).unwrap_or("ko");
+            match crate::analyze::StanzaAnalyzer::warm(lang) {
+                Ok(()) => {
+                    return Arc::new(crate::analyze::StanzaAnalyzer {
+                        ui_language: ui_language.to_string(),
+                    })
+                }
+                Err(e) => eprintln!("[nlp] Stanza unavailable ({e:#}); rule analyzer"),
+            }
+        }
+        let _ = ui_language;
+        Arc::new(RuleAnalyzer)
+    }
+
+    pub fn with_sds(mut self, ledger: zena_sds::Ledger) -> Self {
+        self.sds = Some(Arc::new(Mutex::new(ledger)));
+        self
+    }
+}
+
+/// v2 thresholds in the granite space, calibrated on `data/eval/nlp_nms_ko.jsonl` (`tests/eval_ko.rs`
+/// `calibrate_v2`, objective correct − 2 × false commands). Granite's CLS cosines sit in a narrow band (≈ 0.70–0.87
+/// for short Korean phrases), so the margin on double-centred residuals does most of the work; the lexical bonus
+/// lets shared words break semantic near-ties. Accept 0.62–0.70 score the same here (a plateau, not a spike).
+pub const GRANITE_ASSIGN: AssignConfig = AssignConfig {
+    max_len: 5,
+    accept: 0.66,
+    margin: 0.06,
+    residual: 0.0,
+    lexical_weight: 0.5,
+    lexical_floor: 0.5,
+};
+/// Semantic NMS duplicate floor in the granite space (unrelated short phrases sit higher than in the hashed space).
+pub const GRANITE_BASE_TAU: f32 = 0.85;
+
+/// What one utterance yields before the temporal NMS.
+#[derive(Debug, Clone, Default)]
+pub struct Catch {
+    pub normalized: Option<Normalized>,
+    /// Kept spans: (bank index, span text, score, hit).
+    pub hits: Vec<(usize, String, f32, Hit)>,
+    /// Spans dropped because they were negated ("앱 끄지 마").
+    pub negated: Vec<(usize, String)>,
+}
+
 pub struct NlpNmsRouter {
-    pub bank: DomainBank<HashedNgramEmbedder>,
+    pub bank: DomainBank<SharedEmbedder>,
+    /// The hashed (lexical) bank beside a neural one, for hybrid scoring (`AssignConfig::lexical_weight`).
+    pub lexical: Option<DomainBank<HashedNgramEmbedder>>,
     pub nms: SemanticNms,
-    /// Minimum span score for a domain (span NMS acceptance).
-    pub accept: f32,
+    pub models: Models,
     next_id: u64,
 }
 
@@ -75,23 +195,110 @@ impl Default for NlpNmsRouter {
 }
 
 impl NlpNmsRouter {
+    /// The v1 router (see [`Models::v1`]).
     pub fn new(lex: &Lexicon) -> Self {
+        Self::with_models(lex, Models::v1())
+    }
+
+    pub fn with_models(lex: &Lexicon, models: Models) -> Self {
+        let mut nms = SemanticNms::default();
+        nms.base_tau = models.base_tau;
         Self {
-            bank: DomainBank::from_lexicon(lex, HashedNgramEmbedder::default()),
-            nms: SemanticNms::default(),
-            accept: 0.6,
+            bank: Self::bank(lex, &models),
+            lexical: Self::lexical_bank(lex, &models),
+            nms,
+            models,
             next_id: 1,
         }
     }
 
+    /// Dictionary phrases are embedded like the spans they are compared with: by content words when an analyzer
+    /// runs, as written otherwise (v1).
+    fn bank(lex: &Lexicon, models: &Models) -> DomainBank<SharedEmbedder> {
+        if models.analyzer.name() == "none" {
+            DomainBank::from_lexicon(lex, models.embedder.clone())
+        } else {
+            DomainBank::from_lexicon_content(lex, models.embedder.clone())
+        }
+    }
+
+    fn lexical_bank(lex: &Lexicon, models: &Models) -> Option<DomainBank<HashedNgramEmbedder>> {
+        matches!(models.selection, Selection::Assign(c) if c.lexical_weight > 0.0)
+            .then(|| DomainBank::from_lexicon_content(lex, HashedNgramEmbedder::default()))
+    }
+
     /// Swaps in an updated dictionary; the NMS memory of recent requests stays.
     pub fn reload(&mut self, lex: &Lexicon) {
-        self.bank = DomainBank::from_lexicon(lex, HashedNgramEmbedder::default());
+        self.bank = Self::bank(lex, &self.models);
+        self.lexical = Self::lexical_bank(lex, &self.models);
+    }
+
+    /// Change the selection (thresholds, hybrid weight) and rebuild the lexical bank if it is now needed.
+    pub fn set_selection(&mut self, lex: &Lexicon, selection: Selection) {
+        self.models.selection = selection;
+        self.lexical = Self::lexical_bank(lex, &self.models);
     }
 
     fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    fn sds_scope(&self) -> zena_sds::Scope {
+        zena_sds::Scope::new("nms", self.models.embedder.space(), "")
+    }
+
+    /// One utterance → its domains (no temporal NMS, no state change except SDS observations).
+    pub fn catch(&self, text: &str) -> Catch {
+        let mut n = normalize(text);
+        if n.words.is_empty() {
+            return Catch::default();
+        }
+        self.models.analyzer.analyze(&mut n);
+        let spans: Vec<SpanHit> = match self.models.selection {
+            Selection::Greedy { accept } => span_nms(&n.words, &self.bank, 5, accept),
+            Selection::Assign(cfg) => {
+                let scope = self.sds_scope();
+                let mut cfg = cfg;
+                let ledger = self.models.sds.as_ref().map(|l| l.lock().unwrap());
+                // SDS: once this space has enough observations, the margin follows its usual 1st–2nd gap.
+                if let Some((_, _, m_mean, m_sd)) = ledger.as_ref().and_then(|l| l.decay_baseline(&scope, "nms.span")) {
+                    cfg.margin = (m_mean - m_sd).clamp(cfg.margin * 0.5, cfg.margin * 2.0);
+                }
+                let keys: Vec<String> = (0..self.bank.len()).map(|i| self.bank.entry(i).key.clone()).collect();
+                let allow = |f: usize, r: usize, kind: zena_sds::TieKind| {
+                    kind != zena_sds::TieKind::Flat && ledger.as_ref().is_some_and(|l| l.tie_break_allows(&scope, &keys[f], &keys[r]))
+                };
+                let a = span_assign(&n.words, &self.bank, self.lexical.as_ref(), &cfg, allow);
+                drop(ledger);
+                if let Some(l) = &self.models.sds {
+                    let mut l = l.lock().unwrap();
+                    for c in &a.columns {
+                        l.record_decay(&scope, "nms.span", c);
+                    }
+                    for &(f, r) in &a.held {
+                        l.record_tie(&scope, &keys[f], &keys[r], 0.0);
+                    }
+                }
+                a.hits
+            }
+        };
+        let mut out = Catch::default();
+        for h in spans {
+            let negated = n.words[h.start..h.end].iter().any(|w| w.negated);
+            if negated {
+                out.negated.push((h.index, h.text));
+            } else {
+                out.hits.push((h.index, h.text, h.score, h.hit));
+            }
+        }
+        if out.hits.is_empty() && out.negated.is_empty() && n.addressed {
+            if let Some(i) = self.bank.index_of(SMALL_TALK) {
+                out.hits.push((i, n.text.clone(), 0.5, Hit::Vector));
+            }
+        }
+        out.normalized = Some(n);
+        out
     }
 
     pub fn route(&mut self, inputs: Vec<RouterInput>, now_ms: u64) -> RouterOutput {
@@ -100,19 +307,12 @@ impl NlpNmsRouter {
         for inp in inputs {
             match inp {
                 RouterInput::Utterance { text, t_ms } => {
-                    let n = normalize(&text);
-                    if n.words.is_empty() {
-                        continue;
+                    let c = self.catch(&text);
+                    let Some(n) = c.normalized else { continue };
+                    for (i, span) in &c.negated {
+                        eprintln!("[nlp] negated, not acted on: {} ('{span}')", self.bank.entry(*i).key);
                     }
-                    let mut hits: Vec<(usize, String, f32, Hit)> = span_nms(&n.words, &self.bank, 5, self.accept)
-                        .into_iter()
-                        .map(|h| (h.index, h.text, h.score, h.hit))
-                        .collect();
-                    if hits.is_empty() && n.addressed {
-                        if let Some(i) = self.bank.index_of(SMALL_TALK) {
-                            hits.push((i, n.text.clone(), 0.5, Hit::Vector));
-                        }
-                    }
+                    let hits = c.hits;
                     let full_vec = self.bank.embedder.embed(&n.text);
                     for (index, span, score, hit) in hits {
                         let id = self.id();
@@ -357,6 +557,60 @@ mod tests {
             vec![AssetAction::ResetParts],
             "taking off wins"
         );
+    }
+
+    /// v2 selection on the hashed space (no models needed): negated commands are dropped, SDS sees every chosen
+    /// span, and once a level has its minimum observations the margin follows the ledger.
+    #[test]
+    fn v2_selection_drops_negations_and_feeds_sds() {
+        let models = Models {
+            analyzer: Arc::new(RuleAnalyzer),
+            selection: Selection::Assign(AssignConfig {
+                max_len: 5,
+                accept: 0.6,
+                margin: 0.0,
+                residual: 0.0,
+                lexical_weight: 0.0,
+                lexical_floor: 0.5,
+            }),
+            ..Models::v1()
+        }
+        .with_sds(zena_sds::Ledger::in_memory("nms"));
+        let r = NlpNmsRouter::with_models(&Lexicon::bundled(), models);
+        let keys = |c: &Catch| c.hits.iter().map(|h| r.bank.entry(h.0).key.clone()).collect::<Vec<_>>();
+        assert!(keys(&r.catch("앱 끄지 마")).is_empty());
+        let c = r.catch("클릭 통과 하지 마");
+        assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+        assert_eq!(
+            c.negated.iter().map(|(i, _)| r.bank.entry(*i).key.as_str()).collect::<Vec<_>>(),
+            ["system.ghost_mode"],
+            "the command was caught and held back as negated"
+        );
+        assert_eq!(
+            keys(&r.catch("클릭 통과시켜 줘")),
+            ["system.ghost_mode"],
+            "without the negation it acts"
+        );
+        assert_eq!(keys(&r.catch("고마워")), ["emotion.thanks"]);
+        let scope = zena_sds::Scope::new("nms", "hash-ngram-v1", "");
+        let ledger = r.models.sds.as_ref().unwrap();
+        assert!(
+            ledger.lock().unwrap().decay_baseline(&scope, "nms.span").is_none(),
+            "too few observations"
+        );
+        for t in [
+            "보스 패턴 어떻게 피해",
+            "내 인벤토리에서 물약 어디 있어",
+            "주식 올랐어",
+            "너무 피곤해",
+            "심심해",
+            "무서워",
+        ] {
+            r.catch(t);
+        }
+        let l = ledger.lock().unwrap();
+        assert!(l.observations() >= 6, "{}", l.report());
+        assert!(l.decay_baseline(&scope, "nms.span").is_some(), "{}", l.report());
     }
 
     #[test]

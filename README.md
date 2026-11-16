@@ -20,9 +20,12 @@
 |---|---|---|
 | `crates/zena-core` | §2.1 · §2.4 · §4 · §5 | 화면 중앙 기준 극좌표 `(r, θ)` 변환과 Inward/Outward 흐름 판정, Lv1–Lv3 반응 라우팅, 툴콜 스키마와 Raon 네이티브 `<tool_call>` 파서, Live2D/VRM 파라미터 매핑(한글 중성 기반 비셈 립싱크), Win32 스타일 계산, 안전 종료 시퀀스, FPS 스로틀 |
 | `crates/zena-sensor` | §2.1 · §2.2 | 로그 휘도 차분 **WGSL 컴퓨트 셰이더**(naga로 검증)와 동일한 알고리즘의 CPU 참조 구현, 타일 ROI 클러스터링, 트래커, NaFlex 패치 추출 |
-| `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, **사전 exact·교착어 접두 일치 → bias/prejudice 점수**, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. 의도 표는 코드가 아니라 단어 사전에서 옵니다. |
+| `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, **사전 exact·교착어 접두 일치 → bias/prejudice 점수**, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. 의도 표는 코드가 아니라 단어 사전에서 옵니다. **NLP-NMS v2**: Stanza 역할 분석(내용어 · 보조 용언 · 부정과 그 범위), granite 임베딩 + 해시 혼합 점수, 이중 센터링 후 마진 게이트 1:1 배정, SDS 적응 마진. 부정된 명령("앱 끄지 마")은 실행하지 않습니다. [`docs/plans/relative-value-sds.md`](docs/plans/relative-value-sds.md) §11 |
 | `crates/raon-quant` | §3 | 원본 safetensors를 mmap으로 읽어 **단일 패스 4계층 피라미드 양자화**를 하고 GGUF v3로 씁니다. 그 밖에 imatrix 반영, `--preset zena`(측정 기반 품질 레시피), `kept_ids` 어휘 절삭, 융합 dequant-dot 커널, 자가 검증이 들어 있습니다. |
 | `crates/zena-lexicon` | §2.3 · §4 | **표현 사전**: logis-center `bias.json` 노드 형식(`semantic`/`bias`/`prejudice`/`exact_match`)에 `express`(표정·동작·대사), `command`, `ask`, noto식 `vision` 노드를 더한 `data/zena_lexicon.json`. 기능 `lancedb`로 **LanceDB 저장소**(공식 Rust SDK): 리비전, 핫 리로드, n-gram BM25, 1152-d 앵커 벡터 검색, 학습 후보, Lance 타임트래블 롤백 |
+| `crates/zena-nlp` | NLP-NMS v2 | **Stanza**(stanza-onnx-export format 2, 12개 언어: 토큰 → MWT → 품사 → 원형 → 의존 구문)와 언어 판정, **granite-embedding-97m-multilingual-r2**(ModernBERT, 384차원, CLS; HF 대비 코사인 ≥ 0.9999999). logis-center 에서 이식했습니다. |
+| `crates/zena-sds` | NLP-NMS v2 | logis-center **Score Dynamics** 이식: 스코프 백오프 적응 기준선(Welford + 최근 링), 감쇠 형상, 혼동 사전, 전이 사전 확률, 이중 센터링과 적응 배타 배정, 원장 + 실행별 run 파일 |
+| `crates/onnxruntime(-sys)` | — | logis-center 의 onnxruntime-rs 벤더 판. ONNX Runtime 을 **실행 시 로드**하므로 없으면 Stanza 만 빠지고 앱은 정상 실행됩니다. |
 | `crates/zena-avatar-mcp` | 투트랙 에셋 | CAD/에디터 UI 없는 **헤드리스 MCP** 에셋 파이프라인. MCP(JSON-RPC 2.0, stdio) 클라이언트·서버, Track A **SolidCraft 브리지**(`solidcraft-cli mcp`의 `batch`/`export glb`)와 SolidCraft가 없을 때 같은 결과를 내는 내장 파라메트릭 생성기(3D 감정 프롭·코칭 화살표·액세서리·VRM 이름 모프를 가진 로봇 제나), Track B-1 **SD(치비) 스탬프 합성기**(레이어 PNG 키트 또는 내장 절차 키트), Track B-2 **VRM 0.x/1.0** 표정·휴머노이드 메타데이터, glTF 리더/라이터와 스키닝 수학, 백그라운드 `AssetService`. `zena-subculture-mcp` 바이너리가 Track B를 MCP 도구로 노출합니다. [`docs/CHARACTER.md`](docs/CHARACTER.md) |
 | `crates/raon-vision` | §2.2 | **Raon-VisionEncoder**(SigLIP2 So400m/16, NaFlex) 비전·텍스트 타워와 토크나이저를 candle로 구현. noto-sandbox의 sparse pass(`forward_sparse`/`extend_sparse`/`merge_sparse`), 체커·fovea 첫 패스, 지뢰찾기 확장, 사전 앵커 기반 제로샷 화면 도메인 점수 |
 | `apps/zena-lexicon` | — | 사전 CLI: `import`·`export`·`add`·`remove`·`search`·`show`·`candidates`·`history`·`rollback`·`anchors`·`nearest`·`stats` |
@@ -111,6 +114,12 @@ cargo run --release -p zena-lexicon-cli -- add emotion.celebrate bias "드디어
 cargo run --release -p raon-zena -- --snapshot out/snapshots
 ```
 
+NLP-NMS v2(기본 `--nlp auto`)는 granite 모델(`%LOCALAPPDATA%\RaonZena\models\granite-embedding-97m-multilingual-r2`)과 Stanza format 2 모델(`%LOCALAPPDATA%\RaonZena\models\stanza\ko`, `huggingface.co/Qntology/stanza-ko` 의 `format2` 폴더)이 있으면 씁니다. logis-center 가 이미 받은 폴더도 찾습니다. ONNX Runtime 은 실행 파일 옆, `ORT_DYLIB_PATH`, 또는 개발 빌드가 받아 둔 공식 1.28.0 에서 실행 시 불러옵니다. 오프라인 빌드는 `ORT_STRATEGY=skip` 을 쓰세요. 평가표는 다음 명령으로 봅니다.
+
+```bash
+cargo test --release -p nlp-nms-router --features stanza --test eval_ko -- --nocapture
+```
+
 ## 실측 결과 (원본 가중치, 이 저장소의 도구로 생성)
 
 | 모델 | 원본 | 산출 GGUF | 상주(Device) | 디스크 gather | 시간(4코어 CPU) |
@@ -165,7 +174,7 @@ PRD의 가정 중 실제 모델·코드로 확인한 결과 다르거나 추가 
    - PRD 원안(MLP Q4_K)은 KL 0.10으로 품질 손실이 크고, 주원인은 초반 MLP층입니다. [`docs/INFERENCE.md`](docs/INFERENCE.md#오차-기여도) 참고.
    - GPU에서 정확한 `full` head를 쓰면 `embed_tokens` 404 MiB가 VRAM에 더 올라갑니다.
    - 비전은 320 MiB로, 목표 240 MB보다 큽니다. SO400M의 폭 1152와 4304가 256의 배수가 아니라 K-quant 패딩이 약 11% 생기기 때문입니다. 전부 Q4_K로 내려도 하한이 약 267 MB입니다.
-5. **NLP-NMS 임베딩 모델이 Raon이 아닙니다.** logis-center는 granite-embedding-97m을 씁니다. 이 저장소는 "100% Raon" 원칙에 따라 의존성 없는 해시 n-gram 임베더를 기본으로 두었고, `TextEmbedder` trait으로 교체할 수 있습니다. 해시 임베더는 어휘가 겹치지 않는 바꿔 말하기에 약해서, 표현 사전은 `exact_match`(교착어 접두 일치 포함)에 많이 기댑니다.
+5. **NLP-NMS 텍스트 모델은 Raon이 아닙니다.** NLP-NMS v2는 logis-center처럼 Stanza(형태·구문)와 granite-embedding-97m-multilingual-r2(임베딩)를 씁니다(둘 다 Apache-2.0). 모델이 없으면 의존성 없는 해시 n-gram 임베더와 규칙 분석기로 돌아갑니다. 93문장 한국어 평가 세트에서 v2는 74/93(79.6%), 명령 오탐 1회이고, v1은 64/93, 명령 오탐 9회입니다. 다만 어휘가 겹치지 않는 바꿔 말하기는 아직 38개 중 21개만 맞습니다.
 6. **추론 엔진은 구현했지만 GPU 실측이 남았습니다.**
    - Raon-1-nano는 llama.cpp가 지원하지 않는 커스텀 아키텍처라 candle로 직접 구현했고, 공식 구현과 일치합니다.
    - CPU(이 환경, 4코어)에서는 2–2.7 tok/s로 메모리 대역폭에 묶입니다.

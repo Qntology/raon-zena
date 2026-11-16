@@ -1,0 +1,93 @@
+{"id":"exit-ex","kind":"exact","text":"제나야 앱 꺼 줘","expect":["system.exit_app"]}
+{"id":"exit-pa1","kind":"para","text":"오늘은 여기까지 하고 프로그램 닫을게","expect":["system.exit_app"]}
+{"id":"exit-pa2","kind":"para","text":"이제 프로그램 끝내자","expect":["system.exit_app"]}
+{"id":"hide-ex","kind":"exact","text":"잠깐 숨어 있어","expect":["system.hide_avatar"]}
+{"id":"hide-pa","kind":"para","text":"잠깐만 화면에서 안 보이게 해 줘","expect":["system.hide_avatar"]}
+{"id":"show-ex","kind":"exact","text":"다시 나와","expect":["system.show_avatar"]}
+{"id":"show-pa","kind":"para","text":"제나 모습 다시 보여 줘","expect":["system.show_avatar"]}
+{"id":"top-ex","kind":"exact","text":"맨 앞으로 와","expect":["system.topmost_on"]}
+{"id":"top-pa","kind":"para","text":"게임 위에 항상 떠 있어 줘","expect":["system.topmost_on"]}
+{"id":"back-ex","kind":"exact","text":"창 뒤로 가 줘","expect":["system.topmost_off"]}
+{"id":"back-pa","kind":"para","text":"다른 창 밑으로 내려가 있어","expect":["system.topmost_off"]}
+{"id":"move-ex","kind":"exact","text":"위치 옮길게","expect":["system.interactive_mode"]}
+{"id":"move-pa","kind":"para","text":"너 좀 다른 데로 옮길게","expect":["system.interactive_mode"]}
+{"id":"ghost-ex","kind":"exact","text":"클릭 통과시켜 줘","expect":["system.ghost_mode"]}
+{"id":"ghost-pa","kind":"para","text":"마우스 클릭이 너한테 안 걸리게 해 줘","expect":["system.ghost_mode"]}
+{"id":"win-ex","kind":"exact","text":"이번 판 이겼어","expect":["emotion.celebrate"]}
+{"id":"win-pa1","kind":"para","text":"드디어 보스 잡았다","expect":["emotion.celebrate"]}
+{"id":"win-pa2","kind":"para","text":"전설 아이템 먹었어","expect":["emotion.celebrate"]}
+{"id":"lose-ex","kind":"exact","text":"아 또 죽었어","expect":["emotion.frustrated"]}
+{"id":"lose-pa1","kind":"para","text":"이 구간 진짜 못 깨겠다","expect":["emotion.frustrated"]}
+{"id":"lose-pa2","kind":"para","text":"계속 지기만 하네","expect":["emotion.frustrated"]}
+{"id":"praise-ex","kind":"exact","text":"제나 진짜 똑똑하다","expect":["emotion.praise"]}
+{"id":"praise-pa","kind":"para","text":"너 오늘 완전 센스 있다","expect":["emotion.praise"]}
+{"id":"thanks-ex","kind":"exact","text":"도와줘서 고마워","expect":["emotion.thanks"]}
+{"id":"thanks-pa","kind":"para","text":"덕분에 살았어","expect":["emotion.thanks"]}
+{"id":"surp-ex","kind":"exact","text":"헐 깜짝이야","expect":["emotion.surprised"]}
+{"id":"surp-pa","kind":"para","text":"와 진짜 놀랐네","expect":["emotion.surprised"]}
+{"id":"scared-ex","kind":"exact","text":"여기 너무 무서워","expect":["emotion.scared"]}
+{"id":"scared-pa","kind":"para","text":"귀신 나올 것 같아","expect":["emotion.scared"]}
+{"id":"tired-ex","kind":"exact","text":"오늘 너무 피곤해","expect":["emotion.tired"]}
+{"id":"tired-pa","kind":"para","text":"눈이 자꾸 감긴다","expect":["emotion.tired"]}
+{"id":"sad-ex","kind":"exact","text":"오늘 좀 우울해","expect":["emotion.sad"]}
+{"id":"sad-pa","kind":"para","text":"기분이 축 처지네","expect":["emotion.sad"]}
+{"id":"hello-ex","kind":"exact","text":"제나야 안녕","expect":["emotion.greeting"]}
+{"id":"hello-pa","kind":"para","text":"좋은 아침이야","expect":["emotion.greeting"]}
+{"id":"bye-ex","kind":"exact","text":"나 이제 잘게 잘 자","expect":["emotion.farewell"]}
+{"id":"bye-pa","kind":"para","text":"내일 또 보자","expect":["emotion.farewell"]}
+{"id":"cheer-ex","kind":"exact","text":"파이팅 해 줘","expect":["emotion.cheer_me"]}
+{"id":"cheer-pa","kind":"para","text":"이번 판 응원 좀 해 줘","expect":["emotion.cheer_me"]}
+{"id":"bored-ex","kind":"exact","text":"아 심심해","expect":["emotion.bored"]}
+{"id":"bored-pa","kind":"para","text":"할 게 하나도 없네","expect":["emotion.bored"]}
+{"id":"up-ex","kind":"exact","text":"오늘 떡상했다","expect":["market.stock_up"]}
+{"id":"up-pa","kind":"para","text":"내 주식 많이 올랐어","expect":["market.stock_up"]}
+{"id":"down-ex","kind":"exact","text":"코인 물렸어","expect":["market.stock_down"]}
+{"id":"down-pa","kind":"para","text":"주식이 또 떨어졌어","expect":["market.stock_down"]}
+{"id":"mkt-ex","kind":"exact","text":"이거 지금 사야 돼?","expect":["market.ask_market"]}
+{"id":"mkt-pa","kind":"para","text":"이 종목 들어가도 될까","expect":["market.ask_market"]}
+{"id":"tip-ex","kind":"exact","text":"이 보스 공략 알려 줘","expect":["coach.game_tip"]}
+{"id":"tip-pa1","kind":"para","text":"저 패턴은 어떻게 피해야 돼","expect":["coach.game_tip"]}
+{"id":"tip-pa2","kind":"para","text":"다음에 어디로 가야 돼","expect":["coach.game_tip"]}
+{"id":"inv-ex","kind":"exact","text":"물약 몇 개 남았어","expect":["coach.inventory"]}
+{"id":"inv-pa","kind":"para","text":"회복 아이템 어디 뒀더라","expect":["coach.inventory"]}
+{"id":"scr-ex","kind":"exact","text":"이거 봐 봐","expect":["screen.what_is_this"]}
+{"id":"scr-pa","kind":"para","text":"지금 화면에 뭐가 떠 있는지 알려 줘","expect":["screen.what_is_this"]}
+{"id":"robot-ex","kind":"exact","text":"로봇 모드로 변신해 줘","expect":["avatar.robot_mode"]}
+{"id":"robot-pa","kind":"para","text":"기계 몸으로 바꿔 줘","expect":["avatar.robot_mode"]}
+{"id":"2d-ex","kind":"exact","text":"2D 모드로 바꿔","expect":["avatar.anime_2d"]}
+{"id":"2d-pa","kind":"para","text":"일러스트 그림체로 바뀌어 줘","expect":["avatar.anime_2d"]}
+{"id":"3d-ex","kind":"exact","text":"3D 모드로 보여 줘","expect":["avatar.anime_3d"]}
+{"id":"3d-pa","kind":"para","text":"입체로 바꿔 줘","expect":["avatar.anime_3d"]}
+{"id":"look-ex","kind":"exact","text":"원래 모습으로 바꿔 줘","expect":["avatar.default_look"]}
+{"id":"look-pa","kind":"para","text":"처음 그 모습으로 해 줘","expect":["avatar.default_look"]}
+{"id":"glasses-ex","kind":"exact","text":"안경 써 봐","expect":["avatar.glasses"]}
+{"id":"glasses-pa","kind":"para","text":"동그란 안경 하나 착용해 볼래","expect":["avatar.glasses"]}
+{"id":"headset-ex","kind":"exact","text":"헤드셋 써 봐","expect":["avatar.headset"]}
+{"id":"headset-pa","kind":"para","text":"헤드폰 끼고 있어","expect":["avatar.headset"]}
+{"id":"cat-ex","kind":"exact","text":"고양이 귀 달아 줘","expect":["avatar.cat_ears"]}
+{"id":"cat-pa","kind":"para","text":"냥이 귀 해 봐","expect":["avatar.cat_ears"]}
+{"id":"ribbon-ex","kind":"exact","text":"리본 달아 봐","expect":["avatar.ribbon"]}
+{"id":"ribbon-pa","kind":"para","text":"머리에 리본 하나 해 줘","expect":["avatar.ribbon"]}
+{"id":"off-ex","kind":"exact","text":"액세서리 다 빼 줘","expect":["avatar.take_off"]}
+{"id":"off-pa","kind":"para","text":"장식 전부 벗어","expect":["avatar.take_off"]}
+{"id":"multi-1","kind":"multi","text":"맨 앞으로 나와서 보스 패턴 알려 줘","expect":["system.topmost_on","coach.game_tip"]}
+{"id":"multi-2","kind":"multi","text":"안경이랑 헤드셋 써 봐","expect":["avatar.glasses","avatar.headset"]}
+{"id":"multi-3","kind":"multi","text":"고마워 덕분에 이겼어","expect":["emotion.thanks","emotion.celebrate"]}
+{"id":"neg-exit1","kind":"negation","text":"앱 끄지 마","expect":[]}
+{"id":"neg-exit2","kind":"negation","text":"아직 종료하지 마","expect":[]}
+{"id":"neg-exit3","kind":"negation","text":"끄지 말고 계속 켜 둬","expect":[]}
+{"id":"neg-hide","kind":"negation","text":"숨지 마","expect":[]}
+{"id":"neg-back","kind":"negation","text":"창 뒤로 가지 마","expect":[]}
+{"id":"neg-tip","kind":"negation","text":"보스 패턴 알려주지 마","expect":[]}
+{"id":"neg-robot","kind":"negation","text":"로봇 모드로 바꾸지 마","expect":[]}
+{"id":"neg-glasses","kind":"negation","text":"안경은 쓰지 마","expect":[]}
+{"id":"none-1","kind":"negative","text":"오늘 점심 뭐 먹지","expect":[]}
+{"id":"none-2","kind":"negative","text":"내일 비 온대","expect":[]}
+{"id":"none-3","kind":"negative","text":"회의 자료 정리해야 하는데","expect":[]}
+{"id":"none-4","kind":"negative","text":"택배 언제 오지","expect":[]}
+{"id":"none-5","kind":"negative","text":"라면 끓여야겠다","expect":[]}
+{"id":"none-6","kind":"negative","text":"고양이 사진 귀엽네","expect":[]}
+{"id":"none-7","kind":"negative","text":"버스 놓쳤다","expect":[]}
+{"id":"none-8","kind":"negative","text":"물 마시고 올게","expect":[]}
+{"id":"none-9","kind":"negative","text":"이번 주말에 영화 볼까","expect":[]}
+{"id":"none-10","kind":"negative","text":"엄마한테 전화해야 돼","expect":[]}

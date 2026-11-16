@@ -21,6 +21,7 @@
 //! 7. [`router`]  – glue producing system commands, dictionary expressions (no LLM), Lv3 queries and a
 //!    single gaze target.
 
+pub mod analyze;
 pub mod domain;
 pub mod embed;
 pub mod korean;
@@ -32,3 +33,10 @@ pub mod spatial;
 
 pub use domain::{DomainBank, Hit};
 pub use router::{Caught, NlpNmsRouter, RouterInput, RouterOutput};
+
+/// Where the granite model is installed (tests and diagnostics).
+#[cfg(feature = "neural")]
+#[doc(hidden)]
+pub fn __granite_dir() -> Option<std::path::PathBuf> {
+    zena_nlp::models::granite_dir()
+}

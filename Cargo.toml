@@ -9,6 +9,10 @@ members = [
     "crates/zena-lexicon",
     "crates/raon-vision",
     "crates/zena-avatar-mcp",
+    "crates/zena-sds",
+    "crates/zena-nlp",
+    "crates/onnxruntime",
+    "crates/onnxruntime-sys",
     "apps/raon-zena",
     "apps/zena-lexicon",
 ]
