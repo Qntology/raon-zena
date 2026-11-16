@@ -47,6 +47,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+      - name: protoc (LanceDB's Lance crates compile protobuf definitions)
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            choco install -y --no-progress protoc
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+          fi
+          protoc --version
       - name: CUDA toolkit (apt nvcc for the candle kernel build; no GPU)
         if: matrix.kind == 'cuda-check'
         run: |
@@ -62,3 +71,4 @@ jobs:
           F="${{ matrix.features }}"
           cargo check -p raon-infer --bins ${F:+--features "$F"}
           cargo check -p raon-zena ${F:+--features "$F"}
+          cargo check -p zena-lexicon-cli ${F:+--features "$F"}

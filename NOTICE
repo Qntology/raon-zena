@@ -20,6 +20,9 @@ This repository contains code derived from third-party projects:
 3. KRAFTON Raon-VisionEncoder processor (OpenCLIP-derived), Apache License 2.0 / MIT.
    crates/zena-sensor/src/naflex.rs re-implements the NaFlex resize search and patch layout of
    modeling_raonve.py / raon_vision_encoder/transform.py.
+   The expression dictionary data/zena_lexicon.json uses the node format of logis-center's
+   commerce/src-tauri/src/utils/bias.json (semantic / bias / prejudice / exact_match); its contents
+   are new.
 
 4. Qntology/candle-rocm-vulkan — https://github.com/Qntology/candle-rocm-vulkan
    Apache License 2.0. Used as a Cargo dependency ([patch.crates-io] of candle-core / candle-nn
@@ -28,6 +31,28 @@ This repository contains code derived from third-party projects:
 
 5. crates/raon-infer/src/model.rs re-implements the forward pass of KRAFTON's
    modeling_raon1_nano.py (Apache-2.0) operation by operation.
+
+6. sungu-che/noto-sandbox — https://github.com/sungu-che/noto-sandbox
+   Apache License 2.0.
+   - crates/raon-vision/src/perforate.rs: ported from crates/noto-vision/src/perforate.rs (first-pass
+     patterns, minesweeper seeds / cells_to_open, fill_holes). Modified: the fovea is shaped for a PC
+     screen instead of a robot camera's horizon; the tests were adapted.
+   - crates/raon-vision/src/tower.rs: the sparse passes (forward_sparse / extend_sparse / merge_sparse,
+     LayerKv context, MAP-head value path) follow crates/noto-ml/src/vision.rs and encoder.rs, rewritten
+     for Raon-VisionEncoder's timm weight layout.
+   - crates/raon-vision/src/bank.rs and the contrast heat follow crates/noto-search/src/vision.rs
+     (VisionBank prompt ensembling, bias / prejudice scoring) and crates/noto-vision/src/locate.rs.
+   - crates/zena-lexicon/src/phrase.rs: split_phrase_list / weighted_phrases from
+     crates/noto-search/src/lexicon.rs.
+
+7. KRAFTON Raon-VisionEncoder (timm / OpenCLIP based), Apache License 2.0.
+   crates/raon-vision re-implements the vision tower (timm vit_so400m_patch16_siglip_256 + MAP head in
+   the NaFlex 1-D mode of modeling_raonve.py), the text tower (open_clip TextTransformer) and the
+   tokenizer cleaning (open_clip canonicalize_text); zena-sensor's resize reproduces PIL's bicubic
+   resampling (Pillow, MIT-CMU licence) used by RaonVEProcessor.
+
+8. LanceDB — https://github.com/lancedb/lancedb (Apache License 2.0), used as a Cargo dependency
+   (lancedb 0.41 and the Lance / Arrow / DataFusion crates it brings). Not vendored.
 
 Model weights are NOT part of this repository. They are downloaded separately and remain under
 their own licenses:

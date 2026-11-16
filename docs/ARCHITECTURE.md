@@ -24,9 +24,11 @@ winit 350×450 창 ◄── overlay.rs ◄── AvatarCmd (EventLoopProxy로 �
 | §0 참조 코드 클론 | `Qntology/logis-center` (공개 저장소, git 프록시로 읽기) | 분석 후 이식 |
 | §2.1 극좌표, Inward/Outward | `zena-core/geometry.rs`, `zena-sensor` | 테스트 완료 |
 | §2.1 로그 휘도 차분 셰이더 0.5 ms | `zena-sensor/src/event_diff.wgsl` (naga 검증), CPU 참조 구현 | 셰이더 검증만 함. GPU 디스패치 연결과 지연 측정은 하지 않음 |
-| §2.2 NaFlex 패치 | `zena-sensor/naflex.rs` (공식 프로세서와 같은 이진 탐색과 패치 순서) | 테스트 완료 |
+| §2.2 NaFlex 패치 | `zena-sensor/naflex.rs` (공식 프로세서와 같은 이진 탐색과 패치 순서, PIL bicubic 재현) | 공식 프로세서 패치와 일치(합성 화면 8개 중 7개는 차이 0) |
 | §2.2 1152-d 특징을 `mm_projector`로 투영 | — | **불가**. 공개된 병합기가 없음(아래 참조) |
-| §2.3 NLP + 임베딩 NMS | `nlp-nms-router` | 테스트 완료. 해시 임베더 사용 |
+| §2.3 NLP + 임베딩 NMS | `nlp-nms-router` (도메인 뱅크는 `zena-lexicon` 사전) | 테스트 완료. 해시 임베더 사용 |
+| (표현 사전, 사전 DB) | `zena-lexicon` (`data/zena_lexicon.json`, LanceDB 저장소), `apps/zena-lexicon` CLI | 테스트 완료. [EXPRESSION.md](EXPRESSION.md) |
+| (주기적 화면 감지) | `raon-vision` (Raon-VE 비전·텍스트 타워, 천공 패스), `apps/raon-zena/watcher.rs` | 공식 구현과 코사인 1.000000. GPU 실측은 남음 |
 | §2.4 Lv1–Lv3, non-thinking fast path | `zena-core/reaction.rs`, `prompt.rs` (`<think></think>` 프리필) | 테스트 완료 |
 | §2.4 Raon-1-nano 추론과 툴콜 | `raon-infer` (candle). 앱의 `RaonNanoBackend`가 전용 스레드에서 실행하고 프리픽스 상태를 캐시합니다 | 공식 구현과 로짓 일치. 실제 툴콜 생성 확인. GPU 실측은 남음 |
 | §2.4 55M MTP 추측 디코딩 | MTP 가중치를 T2로 양자화해 GGUF에 포함 | 디코딩 루프는 미구현 |

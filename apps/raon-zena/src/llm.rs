@@ -14,7 +14,8 @@ use raon_infer::generate::Generator;
 use raon_infer::head::HeadMode;
 use raon_infer::model::State;
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::time::Duration;
 use zena_core::prompt::{build_fast_path_prompt, Situation};
 
 pub trait LlmBackend: Send {
@@ -159,22 +160,81 @@ pub struct LlmJob {
     pub level: zena_core::reaction::ReactionLevel,
 }
 
+/// Loads a backend when it is first needed.
+pub type Loader = Box<dyn Fn() -> anyhow::Result<Box<dyn LlmBackend>> + Send>;
+
 /// Runs a backend on its own thread; at most one job in flight (new Lv3 requests are dropped
 /// while busy — the reaction router has already rate-limited them).
 pub struct LlmWorker {
     tx: SyncSender<LlmJob>,
-    pub name: &'static str,
+    pub name: String,
 }
 
 impl LlmWorker {
-    pub fn spawn(mut backend: Box<dyn LlmBackend>, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
-        let name = backend.name();
+    /// A backend that stays loaded.
+    pub fn spawn(backend: Box<dyn LlmBackend>, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
+        let name = backend.name().to_string();
+        let mut slot = Some(backend);
+        Self::start(
+            name,
+            Box::new(move || slot.take().ok_or_else(|| anyhow::anyhow!("backend already taken"))),
+            None,
+            on_done,
+        )
+    }
+
+    /// Not resident: the backend is loaded on the first request and dropped after `idle` without one, so
+    /// Raon-1-nano only holds VRAM / RAM while Zena is actually answering (with the block cache a reload takes
+    /// about a second). Requests that arrive while it loads fall back to cached cues, as when it is busy.
+    pub fn spawn_lazy(name: &str, loader: Loader, idle: Duration, on_done: impl Fn(LlmJob, String) + Send + 'static) -> Self {
+        Self::start(name.to_string(), Box::new(move || loader()), Some(idle), on_done)
+    }
+
+    fn start(
+        name: String,
+        mut load: Box<dyn FnMut() -> anyhow::Result<Box<dyn LlmBackend>> + Send>,
+        idle: Option<Duration>,
+        on_done: impl Fn(LlmJob, String) + Send + 'static,
+    ) -> Self {
         let (tx, rx): (SyncSender<LlmJob>, Receiver<LlmJob>) = sync_channel(0);
+        let label = name.clone();
         std::thread::Builder::new()
             .name("zena-llm".into())
             .spawn(move || {
-                for job in rx {
-                    let out = backend.generate(&job.prompt, &job.situation);
+                let mut backend: Option<Box<dyn LlmBackend>> = None;
+                loop {
+                    let job = match (&backend, idle) {
+                        (Some(_), Some(idle)) => match rx.recv_timeout(idle) {
+                            Ok(j) => j,
+                            Err(RecvTimeoutError::Timeout) => {
+                                backend = None;
+                                eprintln!("[llm] {label}: idle for {}s, unloaded", idle.as_secs());
+                                continue;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        },
+                        _ => match rx.recv() {
+                            Ok(j) => j,
+                            Err(_) => break,
+                        },
+                    };
+                    if backend.is_none() {
+                        let t = std::time::Instant::now();
+                        match load() {
+                            Ok(b) => {
+                                if idle.is_some() {
+                                    eprintln!("[llm] {label}: loaded on demand in {:.1}s", t.elapsed().as_secs_f32());
+                                }
+                                backend = Some(b);
+                            }
+                            Err(e) => {
+                                eprintln!("[llm] {label}: load failed: {e:#}");
+                                on_done(job, String::new());
+                                continue;
+                            }
+                        }
+                    }
+                    let out = backend.as_mut().expect("loaded").generate(&job.prompt, &job.situation);
                     on_done(job, out);
                 }
             })
@@ -224,5 +284,48 @@ mod tests {
         }
         assert!(ok);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().contains("<tool_call>"));
+    }
+
+    #[test]
+    fn a_lazy_backend_loads_on_demand_and_unloads_when_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let loads = Arc::new(AtomicUsize::new(0));
+        let l = loads.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let w = LlmWorker::spawn_lazy(
+            "stub",
+            Box::new(move || {
+                l.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(TemplateBackend) as Box<dyn LlmBackend>)
+            }),
+            Duration::from_millis(50),
+            move |_, out| tx.send(out).unwrap(),
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "nothing is loaded before the first request");
+        let submit = |w: &LlmWorker| {
+            for _ in 0..200 {
+                if w.try_submit(LlmJob {
+                    prompt: String::new(),
+                    situation: Situation::default(),
+                    level: zena_core::reaction::ReactionLevel::Lv3Coaching,
+                }) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("worker never free");
+        };
+        submit(&w);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().contains("<tool_call>"));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(200));
+        submit(&w);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            2,
+            "unloaded while idle, loaded again for the next request"
+        );
     }
 }

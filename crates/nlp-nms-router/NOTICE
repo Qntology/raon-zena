@@ -4,11 +4,15 @@ Copyright 2026 Qntology:
 
 - src/korean.rs   — NOMINAL_TAILS_ML / COPULA_TAILS_ML tables, hangul_tail_agrees,
                     closed-tail peeling (utils/ai_utils.rs)
-- src/intent.rs   — bias/prejudice max-pool field scoring (utils/ai_utils.rs)
+- src/domain.rs   — bias/prejudice max-pool field scoring (utils/ai_utils.rs), exact match before
+                    vectors (exact_match_filter_key) and the agglutinative prefix match
+                    (prefix_match_filter_stem), over the bias.json-format word dictionary
 - src/span.rs     — span NMS (model/query_shipping.rs, model/query_commerce.rs)
 - src/semantic.rs — adaptive μ+3σ duplicate floor (scheduler.rs, EVIDENCE DEDUP)
 - src/spatial.rs  — snap/twin IoU rules (models/siglip2/vision_crop.rs) and
                     exclusive_assign_by_score (utils/ai_utils.rs)
 
 Modifications: rewritten for a real-time game companion (Korean subset, spoken request
-endings, temporal windows, user-over-alert priority, polar proximity, hashed n-gram embedder).
+endings, temporal windows, user-over-alert priority, polar proximity, hashed n-gram embedder);
+the prefix match only accepts up to two Hangul syllables of ending, and the function bank
+(request endings, fillers) comes from the dictionary's `function` group.

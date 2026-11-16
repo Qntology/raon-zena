@@ -6,7 +6,10 @@ members = [
     "crates/raon-quant",
     "crates/nlp-nms-router",
     "crates/raon-infer",
+    "crates/zena-lexicon",
+    "crates/raon-vision",
     "apps/raon-zena",
+    "apps/zena-lexicon",
 ]
 
 [workspace.package]
@@ -31,6 +34,8 @@ panic = "abort"
 
 [profile.dev.package."*"]
 opt-level = 2
+# Dependencies carry no debug info in dev builds: the LanceDB tree (lance, arrow, datafusion) is large.
+debug = false
 
 # LLM acceleration: the candle-rocm-vulkan fork (CUDA / ROCm-HIP / Vulkan / Metal backends, fused
 # attention, TurboQuant), wired exactly like Qntology/logis-center. The fork tracks candle 0.11.0 and
@@ -48,4 +53,8 @@ opt-level = 3
 [profile.dev.package.gemm]
 opt-level = 3
 [profile.dev.package.raon-quant]
+opt-level = 3
+[profile.dev.package.raon-vision]
+opt-level = 3
+[profile.dev.package.zena-sensor]
 opt-level = 3

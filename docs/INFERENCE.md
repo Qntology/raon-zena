@@ -160,6 +160,13 @@ cargo run --release -p raon-zena --features cuda -- --model models/KRAFTON/Raon-
 - **미리 변환한 GGUF**: 원본 7.1 GB 대신 3.0 GB만 배포하면 될 때 씁니다.
 - **GPU 사용 시**: `-hg` 캐시가 `embed_tokens`의 Q8_0 블록도 갖고 있어, 재사용 때는 추가 인코딩이 없습니다.
 
+### 필요할 때만 올리기 (앱)
+
+앱에서는 Raon-1-nano를 상주시키지 않습니다. 사전이 `ask`로 넘긴 첫 요청 때 올라가고, `--llm-idle`(기본 120초) 동안 요청이
+없으면 내려가서 VRAM과 RAM을 돌려줍니다(`LlmWorker::spawn_lazy`). 블록 캐시가 있으면 다시 올리는 데 약 1초가 걸립니다.
+올라가는 중이거나 생성 중에 들어온 요청은 캐시된 대사로 바로 반응합니다. `--llm-idle 0`이면 계속 상주합니다.
+대부분의 반응은 단어 사전과 화면 감지가 LLM 없이 처리합니다([EXPRESSION.md](EXPRESSION.md)).
+
 ## 검증 (공식 PyTorch 구현 대비)
 
 `scripts/reference_logits.py`는 HF 공식 구현을 `trust_remote_code`, float32로 실행합니다. 그 출력과 `raon-chat --dump`의 출력을 `scripts/compare_logits.py`로 비교했습니다. 평가 텍스트는 `scripts/calibration/raon_eval.txt`(278토큰, 한국어/영어/툴콜)이고, 보정 텍스트와 겹치지 않습니다.

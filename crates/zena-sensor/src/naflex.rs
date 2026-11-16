@@ -30,6 +30,134 @@ pub fn image_size_for_max_patches(h: usize, w: usize, patch: usize, max_patches:
     size(lo)
 }
 
+/// PIL's bicubic kernel (`a = -0.5`), support 2.
+fn bicubic(x: f64) -> f64 {
+    let a = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        (((x - 5.0) * x + 8.0) * x - 4.0) * a
+    } else {
+        0.0
+    }
+}
+
+/// Per output pixel: the first input index and the normalised weights (PIL `precompute_coeffs`: the kernel is
+/// stretched by the scale when shrinking, which is what makes PIL's resize antialiased).
+fn coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> {
+    let scale = in_size as f64 / out_size as f64;
+    let filterscale = scale.max(1.0);
+    let support = 2.0 * filterscale;
+    (0..out_size)
+        .map(|xx| {
+            let center = (xx as f64 + 0.5) * scale;
+            let xmin = ((center - support + 0.5).floor().max(0.0)) as usize;
+            let xmax = ((center + support + 0.5).floor() as usize).min(in_size);
+            let mut w: Vec<f64> = (xmin..xmax).map(|x| bicubic((x as f64 - center + 0.5) / filterscale)).collect();
+            let sum: f64 = w.iter().sum();
+            if sum != 0.0 {
+                w.iter_mut().for_each(|v| *v /= sum);
+            }
+            (xmin, w)
+        })
+        .collect()
+}
+
+/// Resizes interleaved 8-bit pixels (`ch` channels) like `PIL.Image.resize(..., BICUBIC)`: horizontal pass, round
+/// and clip to 8 bits, vertical pass (the order and the intermediate rounding PIL uses).
+pub fn resize_bicubic(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: usize) -> Vec<u8> {
+    let clip = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+    let horizontal = if tw == w {
+        src[..w * h * ch].to_vec()
+    } else {
+        let cx = coeffs(w, tw);
+        let mut out = vec![0u8; tw * h * ch];
+        for y in 0..h {
+            for (ox, (x0, ws)) in cx.iter().enumerate() {
+                for c in 0..ch {
+                    let v: f64 = ws
+                        .iter()
+                        .enumerate()
+                        .map(|(k, wt)| wt * src[(y * w + x0 + k) * ch + c] as f64)
+                        .sum();
+                    out[(y * tw + ox) * ch + c] = clip(v);
+                }
+            }
+        }
+        out
+    };
+    if th == h {
+        return horizontal;
+    }
+    let cy = coeffs(h, th);
+    let mut out = vec![0u8; tw * th * ch];
+    for (oy, (y0, ws)) in cy.iter().enumerate() {
+        for x in 0..tw {
+            for c in 0..ch {
+                let v: f64 = ws
+                    .iter()
+                    .enumerate()
+                    .map(|(k, wt)| wt * horizontal[((y0 + k) * tw + x) * ch + c] as f64)
+                    .sum();
+                out[(oy * tw + x) * ch + c] = clip(v);
+            }
+        }
+    }
+    out
+}
+
+/// The patches of a whole image on its NaFlex grid, without padding: `patches[cell * 768..]` is cell `cell`
+/// (row-major), channel-major inside the patch like the released processor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatchGrid {
+    pub grid_h: usize,
+    pub grid_w: usize,
+    pub patches: Vec<f32>,
+}
+
+impl PatchGrid {
+    pub const DIM: usize = 3 * PATCH * PATCH;
+    pub fn cells(&self) -> usize {
+        self.grid_h * self.grid_w
+    }
+    pub fn patch(&self, cell: usize) -> &[f32] {
+        &self.patches[cell * Self::DIM..(cell + 1) * Self::DIM]
+    }
+}
+
+/// `RaonVEProcessor` on an RGB8 image: PIL-bicubic resize to the largest grid within `max_patches`, CLIP mean/std,
+/// `[C, ph, pw]` patches.
+pub fn patchify_frame(rgb: &[u8], w: usize, h: usize, max_patches: usize) -> PatchGrid {
+    let (th, tw) = image_size_for_max_patches(h, w, PATCH, max_patches);
+    let img = resize_bicubic(rgb, w, h, 3, tw, th);
+    let (gh, gw) = (th / PATCH, tw / PATCH);
+    let mut patches = vec![0f32; gh * gw * PatchGrid::DIM];
+    for py in 0..gh {
+        for px in 0..gw {
+            let base = (py * gw + px) * PatchGrid::DIM;
+            for c in 0..3 {
+                for yy in 0..PATCH {
+                    for xx in 0..PATCH {
+                        let v = img[((py * PATCH + yy) * tw + px * PATCH + xx) * 3 + c] as f32 / 255.0;
+                        patches[base + c * PATCH * PATCH + yy * PATCH + xx] = (v - MEAN[c]) / STD[c];
+                    }
+                }
+            }
+        }
+    }
+    PatchGrid {
+        grid_h: gh,
+        grid_w: gw,
+        patches,
+    }
+}
+
+/// BGRA8 (screen capture) to RGB8.
+pub fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
+    bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect()
+}
+
 pub struct NaFlexInput {
     /// `[max_patches, 3*16*16]`, row-major.
     pub patches: Vec<f32>,
@@ -103,6 +231,28 @@ mod tests {
         assert!(w > 3 * h);
         let (h, w) = image_size_for_max_patches(1080, 1920, 16, 256);
         assert!((h / 16) * (w / 16) <= 256 && (h / 16) * (w / 16) >= 230, "{h}x{w}");
+    }
+
+    #[test]
+    fn bicubic_is_identity_at_scale_one_and_averages_when_shrinking() {
+        let src: Vec<u8> = (0..4 * 3 * 3).map(|i| (i * 7 % 256) as u8).collect();
+        assert_eq!(resize_bicubic(&src, 4, 3, 3, 4, 3), src);
+        // A 1-pixel checkerboard shrunk 4x is flat grey (the stretched kernel averages, no aliasing).
+        let (w, h) = (64, 64);
+        let cb: Vec<u8> = (0..w * h).map(|i| if (i % w + i / w) % 2 == 0 { 255 } else { 0 }).collect();
+        let small = resize_bicubic(&cb, w, h, 1, 16, 16);
+        assert!(small[1..15].iter().all(|&v| (120..=135).contains(&v)), "{:?}", &small[..16]);
+    }
+
+    #[test]
+    fn frames_patchify_without_padding() {
+        let (w, h) = (480, 270);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+        let g = patchify_frame(&rgb, w, h, 144);
+        assert!(g.cells() <= 144 && g.cells() >= 120, "{}x{}", g.grid_h, g.grid_w);
+        assert_eq!(g.patches.len(), g.cells() * PatchGrid::DIM);
+        assert!(g.grid_w > g.grid_h);
+        assert_eq!(bgra_to_rgb(&[1, 2, 3, 255, 4, 5, 6, 255]), vec![3, 2, 1, 6, 5, 4]);
     }
 
     #[test]

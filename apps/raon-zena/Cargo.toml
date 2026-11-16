@@ -11,6 +11,8 @@ zena-sensor = { path = "../../crates/zena-sensor" }
 nlp-nms-router = { path = "../../crates/nlp-nms-router" }
 raon-quant = { path = "../../crates/raon-quant" }
 raon-infer = { path = "../../crates/raon-infer" }
+raon-vision = { path = "../../crates/raon-vision" }
+zena-lexicon = { path = "../../crates/zena-lexicon" }
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
@@ -18,12 +20,14 @@ wgpu = "30"
 winit = "0.30"
 
 [features]
-default = []
-# LLM acceleration backends (candle-rocm-vulkan fork), same switches as Qntology/logis-center.
-cuda = ["raon-infer/cuda"]
-rocm = ["raon-infer/rocm"]
-vulkan = ["raon-infer/vulkan"]
-metal = ["raon-infer/metal"]
+default = ["lexicon-db"]
+# The word dictionary in LanceDB (hot reload, learning, anchors). Without it the JSON dictionary is used as is.
+lexicon-db = ["zena-lexicon/lancedb"]
+# LLM / screen-encoder acceleration backends (candle-rocm-vulkan fork), same switches as Qntology/logis-center.
+cuda = ["raon-infer/cuda", "raon-vision/cuda"]
+rocm = ["raon-infer/rocm", "raon-vision/rocm"]
+vulkan = ["raon-infer/vulkan", "raon-vision/vulkan"]
+metal = ["raon-infer/metal", "raon-vision/metal"]
 flash-attn = ["raon-infer/flash-attn"]
 
 [target.'cfg(windows)'.dependencies]

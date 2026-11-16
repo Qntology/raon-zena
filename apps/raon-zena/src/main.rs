@@ -3,17 +3,24 @@
 //! ```text
 //! raon-zena [--synthetic] [--model out/raon-1-nano.zena.gguf | models/KRAFTON/Raon-1-nano]
 //!           [--quant-preset zena|prd|q8] [--imatrix out/raon-1-nano.imatrix.dat] [--quant-cache DIR | --no-quant-cache]
-//!           [--tokenizer tokenizer.json]
-//!           [--llm-device auto|cpu|cuda|rocm|vulkan|metal] [--head full|kept|guarded]
-//!           [--vision out/raon-ve-vision.pyramid.gguf]
+//!           [--tokenizer tokenizer.json] [--llm-device auto|cpu|cuda|rocm|vulkan|metal] [--head full|kept|guarded]
+//!           [--llm-idle SECS]                       unload Raon-1-nano after SECS without a request (0: keep it)
+//!           [--lexicon data/zena_lexicon.json]      dictionary seed (default: the bundled one)
+//!           [--lexicon-db DIR | --no-lexicon-db]    the LanceDB dictionary (default: the per-user one) [--learn]
+//!           [--screen models/KRAFTON/Raon-VisionEncoder] [--screen-every SECS] [--screen-patches N]
+//!           [--screen-pass auto|full|checker|fovea|checker-x|fovea-x] [--screen-format f32|f16|bf16|q8]
+//!           [--screen-device auto|cpu|cuda|rocm|vulkan|metal]
+//!           [--vision out/raon-ve-vision.pyramid.gguf]   (residency report only)
 //! ```
-//! Build with `--features cuda` / `rocm` / `vulkan` / `metal` (+ `flash-attn`) to accelerate the LLM.
-//! Type a line on stdin to talk to Zena while it runs (voice input is not wired yet).
+//! Build with `--features cuda` / `rocm` / `vulkan` / `metal` (+ `flash-attn`) to accelerate the LLM and the screen
+//! encoder. Type a line on stdin to talk to Zena while it runs (voice input is not wired yet).
 
 mod capture;
+mod lexicon;
 mod llm;
 mod overlay;
 mod pipeline;
+mod watcher;
 #[cfg(windows)]
 mod win32;
 
@@ -23,6 +30,7 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use winit::event_loop::EventLoop;
 use zena_core::geometry::ScreenGeometry;
 
@@ -36,6 +44,16 @@ struct Args {
     quant_preset: String,
     imatrix: Option<PathBuf>,
     quant_cache: raon_infer::weights::BlockCache,
+    llm_idle: u64,
+    lexicon: Option<PathBuf>,
+    lexicon_db: Option<PathBuf>,
+    learn: bool,
+    screen: Option<PathBuf>,
+    screen_every: f32,
+    screen_patches: usize,
+    screen_pass: String,
+    screen_format: Option<raon_vision::WeightFormat>,
+    screen_device: raon_infer::device::Backend,
 }
 
 fn args() -> Args {
@@ -49,6 +67,16 @@ fn args() -> Args {
         quant_preset: "zena".into(),
         imatrix: None,
         quant_cache: raon_infer::weights::BlockCache::Default,
+        llm_idle: 120,
+        lexicon: None,
+        lexicon_db: Some(lexicon::default_db()),
+        learn: false,
+        screen: None,
+        screen_every: 3.0,
+        screen_patches: 256,
+        screen_pass: "auto".into(),
+        screen_format: None,
+        screen_device: raon_infer::device::Backend::Auto,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -68,6 +96,17 @@ fn args() -> Args {
                     .unwrap_or_default()
             }
             "--no-quant-cache" => a.quant_cache = raon_infer::weights::BlockCache::Off,
+            "--llm-idle" => a.llm_idle = it.next().and_then(|v| v.parse().ok()).unwrap_or(120),
+            "--lexicon" => a.lexicon = it.next().map(PathBuf::from),
+            "--lexicon-db" => a.lexicon_db = it.next().map(PathBuf::from),
+            "--no-lexicon-db" => a.lexicon_db = None,
+            "--learn" => a.learn = true,
+            "--screen" => a.screen = it.next().map(PathBuf::from),
+            "--screen-every" => a.screen_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(3.0),
+            "--screen-patches" => a.screen_patches = it.next().and_then(|v| v.parse().ok()).unwrap_or(256),
+            "--screen-pass" => a.screen_pass = it.next().unwrap_or_else(|| "auto".into()),
+            "--screen-format" => a.screen_format = it.next().and_then(|v| v.parse().ok()),
+            "--screen-device" => a.screen_device = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::device::Backend::Auto),
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -161,41 +200,124 @@ fn main() -> Result<()> {
         }
     });
     let (ctx, crx) = mpsc::channel::<pipeline::AvatarCmd>();
-    // Lv3 backend: Raon-1-nano when a GGUF is given (CPU / CUDA / ROCm / Vulkan / Metal through the
-    // candle-rocm-vulkan fork, chosen by --llm-device), otherwise the template stub.
-    let backend: Box<dyn llm::LlmBackend> = match &a.model {
-        Some(gguf) => {
-            let tok = a.tokenizer.clone().unwrap_or_else(|| {
-                if gguf.is_dir() {
-                    gguf.join("tokenizer.json")
-                } else {
-                    gguf.with_file_name("tokenizer.json")
-                }
-            });
-            Box::new(llm::RaonNanoBackend::load(
-                gguf,
-                &tok,
-                a.llm_device,
-                a.head,
-                &a.quant_preset,
-                a.imatrix.as_deref(),
-                &a.quant_cache,
-            )?)
-        }
-        None => Box::new(llm::TemplateBackend),
+
+    // The word dictionary: LanceDB (seeded from the JSON on first run) or the JSON itself.
+    let loaded = match &a.lexicon_db {
+        Some(db) => lexicon::open(db, a.lexicon.as_deref())?,
+        None => lexicon::Loaded {
+            lexicon: lexicon::read_json(a.lexicon.as_deref())?,
+            anchors: Default::default(),
+            source: "JSON".into(),
+        },
     };
-    let worker = {
+    eprintln!(
+        "[lexicon] {} — {} domains, {} screen domains",
+        loaded.source,
+        loaded.lexicon.nodes.len(),
+        loaded.lexicon.vision.len()
+    );
+
+    // The periodic screen watcher (Raon-VisionEncoder vision tower only; anchors come from the dictionary).
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<watcher::ScreenFrame>(1);
+    let (obs_tx, obs_rx) = mpsc::channel::<watcher::ScreenObservation>();
+    let (anchor_tx, anchor_rx) = mpsc::channel::<watcher::AnchorsUpdate>();
+    let screen_on = a.screen.is_some();
+    if let Some(model) = &a.screen {
+        let mut cfg = watcher::WatcherConfig::new(model.clone());
+        cfg.backend = a.screen_device;
+        cfg.format = a.screen_format;
+        cfg.screen.max_patches = a.screen_patches;
+        match a.screen_pass.as_str() {
+            // noto-sandbox's measurements: the perforated pass pays off on the CPU only.
+            "auto" => cfg.screen.perforation = raon_vision::PerforatedCfg::parse("fovea"),
+            "full" => {
+                cfg.screen.perforation = None;
+                cfg.perforate_on_cpu_only = false;
+            }
+            p => {
+                cfg.screen.perforation =
+                    Some(raon_vision::PerforatedCfg::parse(p).ok_or_else(|| anyhow::anyhow!("unknown --screen-pass {p}"))?);
+                cfg.perforate_on_cpu_only = false;
+            }
+        }
+        anchor_tx.send(watcher::AnchorsUpdate {
+            lexicon: loaded.lexicon.clone(),
+            anchors: loaded.anchors.clone(),
+        })?;
+        watcher::spawn(cfg, frame_rx, anchor_rx, obs_tx);
+    }
+    let (lex_tx, lex_rx) = mpsc::channel();
+    let learn_tx = a
+        .lexicon_db
+        .clone()
+        .map(|db| lexicon::spawn_service(db, Duration::from_secs(3), 3, lex_tx, screen_on.then_some(anchor_tx)));
+
+    // Lv3 backend: Raon-1-nano when a model is given (CPU / CUDA / ROCm / Vulkan / Metal through the
+    // candle-rocm-vulkan fork, chosen by --llm-device), loaded on demand and dropped when idle; otherwise the
+    // template stub.
+    let on_done = {
         let ctx = ctx.clone();
-        llm::LlmWorker::spawn(backend, move |job, text| {
+        move |job: llm::LlmJob, text: String| {
             for cmd in pipeline::completion_to_cmds(&text, job.level) {
                 let _ = ctx.send(cmd);
             }
-        })
+        }
+    };
+    let worker = match &a.model {
+        Some(model) => {
+            let tok = a.tokenizer.clone().unwrap_or_else(|| {
+                if model.is_dir() {
+                    model.join("tokenizer.json")
+                } else {
+                    model.with_file_name("tokenizer.json")
+                }
+            });
+            let (model, dev, head, preset, imatrix, cache) = (
+                model.clone(),
+                a.llm_device,
+                a.head,
+                a.quant_preset.clone(),
+                a.imatrix.clone(),
+                a.quant_cache.clone(),
+            );
+            let loader: llm::Loader = Box::new(move || {
+                Ok(Box::new(llm::RaonNanoBackend::load(
+                    &model,
+                    &tok,
+                    dev,
+                    head,
+                    &preset,
+                    imatrix.as_deref(),
+                    &cache,
+                )?) as Box<dyn llm::LlmBackend>)
+            });
+            if a.llm_idle == 0 {
+                llm::LlmWorker::spawn(loader()?, on_done)
+            } else {
+                llm::LlmWorker::spawn_lazy("raon-1-nano", loader, Duration::from_secs(a.llm_idle), on_done)
+            }
+        }
+        None => llm::LlmWorker::spawn(Box::new(llm::TemplateBackend), on_done),
     };
     {
         let running = running.clone();
+        let links = pipeline::Links {
+            llm: worker,
+            utterances: urx,
+            out: ctx,
+            lexicon: lex_rx,
+            learn: if a.learn { learn_tx } else { None },
+            screen_frames: screen_on.then_some(frame_tx),
+            screen: screen_on.then_some(obs_rx),
+        };
+        let cfg = pipeline::PipelineConfig {
+            screen_interval_ms: (a.screen_every * 1000.0) as u64,
+            learn_min: a.learn.then_some(0.75),
+            ..Default::default()
+        };
+        let lexicon = loaded.lexicon;
         std::thread::spawn(move || {
-            let r = pipeline::run(src, worker, urx, ctx, pipeline::PipelineConfig::default());
+            let r = pipeline::run(src, links, lexicon, cfg);
             if running.load(Ordering::SeqCst) {
                 if let Err(e) = r {
                     eprintln!("pipeline stopped: {e:#}");

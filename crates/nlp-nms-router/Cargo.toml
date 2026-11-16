@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 zena-core = { path = "../zena-core" }
+zena-lexicon = { path = "../zena-lexicon" }
 serde.workspace = true

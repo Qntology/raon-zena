@@ -7,6 +7,8 @@
 > - **Raon-1-nano 추론 엔진(candle)**: 공식 PyTorch 구현과 로짓이 일치(KL 2.6e-11, top-1 100%)하고, 실제 모델이 Zena 툴콜을 생성합니다.
 > - LLM 가속은 `logis-center`와 같은 `candle-rocm-vulkan` 포크로 붙였습니다(CUDA / ROCm / Vulkan / Metal). 단, 이 환경에 GPU가 없어 GPU 실행 속도는 측정하지 못했습니다.
 > - 이벤트 센서, NLP-NMS 라우터, 툴콜·아바타 매핑
+> - **단어 사전 기반 캐릭터 표현**: logis-center `bias.json` 형식의 표현 사전으로 사용자의 말과 PC 화면을 같은 표현 도메인으로 잡아내고, 사전에 적힌 표정·동작·대사로 반응합니다(LLM 없이). 사전은 **LanceDB**에 있으며 실행 중에 고치거나 사용 중에 배우고, 되돌릴 수도 있습니다.
+> - **주기적 화면 감지(Raon-VisionEncoder, candle)**: 공식 PyTorch 출력과 코사인 1.000000 일치. noto-sandbox의 체커·fovea·지뢰찾기 패스를 이식했고, 프레임은 저장하지 않습니다. LLM은 필요할 때만 올립니다. [`docs/EXPRESSION.md`](docs/EXPRESSION.md)
 > - Windows 클라이언트: 타입 체크까지만 했습니다.
 >
 > TTS는 아직 스텁입니다. 자세한 내용은 [현재 범위와 한계](#현재-범위와-한계)를 보세요.
@@ -17,8 +19,11 @@
 |---|---|---|
 | `crates/zena-core` | §2.1 · §2.4 · §4 · §5 | 화면 중앙 기준 극좌표 `(r, θ)` 변환과 Inward/Outward 흐름 판정, Lv1–Lv3 반응 라우팅, 툴콜 스키마와 Raon 네이티브 `<tool_call>` 파서, Live2D/VRM 파라미터 매핑(한글 중성 기반 비셈 립싱크), Win32 스타일 계산, 안전 종료 시퀀스, FPS 스로틀 |
 | `crates/zena-sensor` | §2.1 · §2.2 | 로그 휘도 차분 **WGSL 컴퓨트 셰이더**(naga로 검증)와 동일한 알고리즘의 CPU 참조 구현, 타일 ROI 클러스터링, 트래커, NaFlex 패치 추출 |
-| `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. |
+| `crates/nlp-nms-router` | §2.3 | `Qntology/logis-center`에서 이식한 기능: 조사 박리, **사전 exact·교착어 접두 일치 → bias/prejudice 점수**, 스팬 NMS, μ+3σ 적응 중복 임계, snap/twin 박스 NMS, 배타 할당. 여기에 시간축 의미 NMS와 공간-텍스트 NMS를 더했습니다. 의도 표는 코드가 아니라 단어 사전에서 옵니다. |
 | `crates/raon-quant` | §3 | 원본 safetensors를 mmap으로 읽어 **단일 패스 4계층 피라미드 양자화**를 하고 GGUF v3로 씁니다. 그 밖에 imatrix 반영, `--preset zena`(측정 기반 품질 레시피), `kept_ids` 어휘 절삭, 융합 dequant-dot 커널, 자가 검증이 들어 있습니다. |
+| `crates/zena-lexicon` | §2.3 · §4 | **표현 사전**: logis-center `bias.json` 노드 형식(`semantic`/`bias`/`prejudice`/`exact_match`)에 `express`(표정·동작·대사), `command`, `ask`, noto식 `vision` 노드를 더한 `data/zena_lexicon.json`. 기능 `lancedb`로 **LanceDB 저장소**(공식 Rust SDK): 리비전, 핫 리로드, n-gram BM25, 1152-d 앵커 벡터 검색, 학습 후보, Lance 타임트래블 롤백 |
+| `crates/raon-vision` | §2.2 | **Raon-VisionEncoder**(SigLIP2 So400m/16, NaFlex) 비전·텍스트 타워와 토크나이저를 candle로 구현. noto-sandbox의 sparse pass(`forward_sparse`/`extend_sparse`/`merge_sparse`), 체커·fovea 첫 패스, 지뢰찾기 확장, 사전 앵커 기반 제로샷 화면 도메인 점수 |
+| `apps/zena-lexicon` | — | 사전 CLI: `import`·`export`·`add`·`remove`·`search`·`show`·`candidates`·`history`·`rollback`·`anchors`·`nearest`·`stats` |
 | `crates/raon-infer` | §2.4 | **Raon-1-nano 순전파**(RDA 18층 + MLA 6층 + Raon-mHC + PLE)를 candle로 구현했습니다. `cuda`/`rocm`/`vulkan`/`metal`/`flash-attn` 기능 플래그와 `Qntology/candle-rocm-vulkan` 포크를 씁니다. 그 밖에 GGUF 블록 디바이스 상주(`QMatMul`), **safetensors 로드 시점 피라미드 양자화**(GGUF 불필요), 프리픽스 상태 캐시, `raon-chat`, `raon-imatrix`가 들어 있습니다. [`docs/INFERENCE.md`](docs/INFERENCE.md) |
 | `apps/raon-zena` | §5 | Windows 오버레이(350×450 마이크로 뷰포트). 구성 요소: winit, 단일 wgpu DX12 디바이스(DirectComposition), DXGI Desktop Duplication, Win32 레이어 플래그와 전역 단축키, 절차적 플레이스홀더 아바타 |
 | `scripts/` | §0 A안 | 원본 가중치 병렬 다운로드와 SHA-256 검증(`fetch_models.sh`), llama.cpp `gguf-py` 교차 검증(`xcheck_gguf.py`), 공식 PyTorch 참조 로짓과 비교(`reference_logits.py`, `compare_logits.py`), 보정·평가 텍스트(`calibration/`) |
@@ -65,9 +70,23 @@ cargo test --workspace --release
 ```
 
 Windows 클라이언트는 아래 명령으로 실행합니다. `--features`로 GPU 백엔드를 고르며, 실행 중 stdin에 문장을 입력하면 제나에게 말을 걸 수 있습니다.
+LanceDB 사전 저장소를 빌드하려면 `protoc`가 필요합니다(Ubuntu `apt install protobuf-compiler libprotobuf-dev`, Windows `winget install protobuf`).
+`--no-default-features`로 빌드하면 DB 없이 JSON 사전만 씁니다.
 
 ```bash
-cargo run --release -p raon-zena --features cuda,flash-attn -- --model out/raon-1-nano.zena.gguf --llm-device auto --vision out/raon-ve-vision.pyramid.gguf
+cargo run --release -p raon-zena --features cuda,flash-attn -- --model models/KRAFTON/Raon-1-nano --quant-preset zena --llm-device auto --llm-idle 120 --screen models/KRAFTON/Raon-VisionEncoder --learn
+```
+
+첫 실행 때 사용자별 LanceDB 사전(`%LOCALAPPDATA%\RaonZena\lexicon.lance`)이 `data/zena_lexicon.json`으로 만들어집니다. 화면 도메인을 쓰려면 앵커를 한 번 계산해야 합니다. 이 단계에서만 텍스트 타워(0.7B)를 올립니다.
+
+```bash
+cargo run --release -p zena-lexicon-cli -- anchors --model models/KRAFTON/Raon-VisionEncoder --tokenizer models/timm/ViT-SO400M-16-SigLIP2-256/tokenizer.json
+```
+
+실행 중에도 사전을 고칠 수 있습니다. Zena가 3초 안에 다시 읽습니다.
+
+```bash
+cargo run --release -p zena-lexicon-cli -- add emotion.celebrate bias "드디어 깼다"
 ```
 
 단축키:
@@ -129,7 +148,7 @@ PRD의 가정 중 실제 모델·코드로 확인한 결과 다르거나 추가 
    - PRD 원안(MLP Q4_K)은 KL 0.10으로 품질 손실이 크고, 주원인은 초반 MLP층입니다. [`docs/INFERENCE.md`](docs/INFERENCE.md#오차-기여도) 참고.
    - GPU에서 정확한 `full` head를 쓰면 `embed_tokens` 404 MiB가 VRAM에 더 올라갑니다.
    - 비전은 320 MiB로, 목표 240 MB보다 큽니다. SO400M의 폭 1152와 4304가 256의 배수가 아니라 K-quant 패딩이 약 11% 생기기 때문입니다. 전부 Q4_K로 내려도 하한이 약 267 MB입니다.
-5. **NLP-NMS 임베딩 모델이 Raon이 아닙니다.** logis-center는 granite-embedding-97m을 씁니다. 이 저장소는 "100% Raon" 원칙에 따라 의존성 없는 해시 n-gram 임베더를 기본으로 두었고, `TextEmbedder` trait으로 교체할 수 있습니다.
+5. **NLP-NMS 임베딩 모델이 Raon이 아닙니다.** logis-center는 granite-embedding-97m을 씁니다. 이 저장소는 "100% Raon" 원칙에 따라 의존성 없는 해시 n-gram 임베더를 기본으로 두었고, `TextEmbedder` trait으로 교체할 수 있습니다. 해시 임베더는 어휘가 겹치지 않는 바꿔 말하기에 약해서, 표현 사전은 `exact_match`(교착어 접두 일치 포함)에 많이 기댑니다.
 6. **추론 엔진은 구현했지만 GPU 실측이 남았습니다.**
    - Raon-1-nano는 llama.cpp가 지원하지 않는 커스텀 아키텍처라 candle로 직접 구현했고, 공식 구현과 일치합니다.
    - CPU(이 환경, 4코어)에서는 2–2.7 tok/s로 메모리 대역폭에 묶입니다.
@@ -138,6 +157,7 @@ PRD의 가정 중 실제 모델·코드로 확인한 결과 다르거나 추가 
    - MTP 추측 디코딩 루프는 아직 없습니다.
    - 음성 입력(ASR) 모델도 스택에 없습니다.
 7. **KPI는 검증하지 않았습니다.** 15 ms / 45 ms 지연과 RAM 25 MB는 Windows와 GPU 실기에서 측정해야 합니다. 이 환경(Linux 컨테이너, GPU 없음)에서는 Windows 타깃 `cargo check`까지만 했습니다.
+8. **화면 감지는 CPU에서 느립니다.** 이 4코어 환경에서 비전 타워 한 번(F32)이 256패치 약 4.7초, 144패치 약 2.8초입니다. GPU에서는 전체 패스를 씁니다(실측은 남음). 화면 도메인 점수는 PIL로 그린 합성 화면 4종으로만 확인했습니다. 실제 게임·차트 화면에서 임계값(`min_score`)을 조정해야 합니다.
 
 ## 라이선스
 
