@@ -1,0 +1,345 @@
+{
+  "version": 1,
+  "meta": {
+    "name": "zena-expression-lexicon",
+    "semantic": "Raon Zena expression dictionary. Every node uses the Qntology/logis-center bias.json node format (semantic, bias, prejudice, exact_match): bias and prejudice are comma-separated multilingual phrase lists, exact_match confirms a node before any vector is computed (exact or agglutinative prefix match). Zena-specific fields say how the character expresses the node: express (emotion, motion, lines), command (manage_zena_system), ask (hand the request to Raon-1-nano). The vision group follows noto-sandbox's world_lexicon: English prompts for the Raon-VisionEncoder (SigLIP2) text tower, prompt-ensembled with vision_prompting.templates, each linked to the expression node the character plays when the screen shows it."
+  },
+
+  "function": {
+    "request": {
+      "semantic": "Request endings and politeness markers. They carry no expression domain of their own, so a span made only of them never wins.",
+      "bias": "해 줘, 해줘, 줘, 주세요, 줄래, 해 줄래, 부탁해, 좀, 할래, 하자, 알려 줘, 보여 줘, please, could you, can you, would you, let's"
+    },
+    "filler": {
+      "semantic": "Conversational fillers and intensifiers that do not name anything.",
+      "bias": "음, 어, 아, 그, 저기, 그냥, 막, 진짜, 완전, 약간, 너무, 되게, 지금, 방금, 오늘, um, uh, like, just, so, really"
+    }
+  },
+
+  "system": {
+    "exit_app": {
+      "semantic": "The user wants the Zena application to quit (not just hide).",
+      "bias": "종료해 줘, 앱 꺼 줘, 프로그램 종료, 오늘 그만 켜둘게, 이제 꺼도 돼, 제나 꺼, quit the app, exit, close zena",
+      "prejudice": "숨어 있어, 게임 종료됐어, 창 뒤로 가, 잘 자",
+      "exact_match": ["종료해", "종료해줘", "꺼줘", "앱 꺼", "앱꺼", "quit", "exit app"],
+      "command": "EXIT_APP",
+      "express": { "emotion": "JOY", "motion": "WAVE_GOODBYE", "lines": ["오늘도 고마웠어, 다음에 봐!"] }
+    },
+    "hide_avatar": {
+      "semantic": "The user wants Zena hidden for a while, the app keeps running.",
+      "bias": "잠깐 숨어 있어, 모습 숨겨 줘, 안 보이게 해 줘, 잠깐 사라져, hide yourself",
+      "prejudice": "종료해 줘, 다시 나와",
+      "exact_match": ["숨어있어", "숨어 있어", "숨겨줘", "모습만 숨겨", "hide"],
+      "command": "HIDE_AVATAR"
+    },
+    "show_avatar": {
+      "semantic": "The user wants a hidden Zena to come back.",
+      "bias": "다시 나와, 다시 보여 줘, 돌아와, 모습 보여 줘, show yourself",
+      "prejudice": "맨 앞으로 나와, 숨어 있어",
+      "exact_match": ["다시 나와", "돌아와"],
+      "command": "SHOW_AVATAR",
+      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["짠, 나 왔어!"] }
+    },
+    "topmost_on": {
+      "semantic": "Keep the Zena window above every other window.",
+      "bias": "화면 맨 앞으로 나와, 항상 위에 떠 있어, 제일 앞에 있어, always on top",
+      "prejudice": "다른 창 뒤로 가, 다시 나와",
+      "exact_match": ["맨 앞으로", "항상 위"],
+      "command": "SET_TOPMOST_ON"
+    },
+    "topmost_off": {
+      "semantic": "Let other windows cover the Zena window.",
+      "bias": "다른 창 뒤로 가 있어, 창 뒤로 가, 뒤에 가 있어, go behind other windows",
+      "prejudice": "화면 맨 앞으로 나와, 숨어 있어",
+      "exact_match": ["뒤로 가 있어", "창 뒤로"],
+      "command": "SET_TOPMOST_OFF"
+    },
+    "interactive_mode": {
+      "semantic": "The user wants to drag or click Zena (the window takes mouse input).",
+      "bias": "위치 옮길게, 너 좀 움직일게, 드래그할게, let me move you",
+      "prejudice": "클릭 통과, 전투 모드",
+      "exact_match": ["위치 옮길", "드래그"],
+      "command": "KEEP_ACTIVE",
+      "window_layer_mode": "INTERACTIVE_PET"
+    },
+    "ghost_mode": {
+      "semantic": "Clicks must pass through Zena to the game (combat mode).",
+      "bias": "클릭 통과시켜 줘, 전투 모드로 해, 클릭 안 걸리게, click through",
+      "prejudice": "위치 옮길게",
+      "exact_match": ["클릭 통과", "전투 모드"],
+      "command": "KEEP_ACTIVE",
+      "window_layer_mode": "GHOST_CLICK_THROUGH"
+    }
+  },
+
+  "emotion": {
+    "celebrate": {
+      "semantic": "The user won, cleared, succeeded or got a rare drop and is happy about it.",
+      "bias": "이겼다, 이겼어, 클리어했다, 성공했다, 해냈다, 보스 잡았어, 득템했다, 대박이다, 레벨 업했어, 랭크 올랐어, 1등 했어, we won, i did it, victory, nailed it, level up",
+      "prejudice": "졌다, 실패했어, 또 죽었어, 망했다, 주식 올랐어",
+      "exact_match": ["이겼다", "이겼어", "클리어", "해냈다", "해냈어", "득템", "레벨업", "대박", "we won"],
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "lines": ["해냈다! 최고야!", "우와, 클리어 축하해!", "나이스! 완벽했어!"] }
+    },
+    "frustrated": {
+      "semantic": "The user lost, died or failed and is frustrated or annoyed.",
+      "bias": "또 죽었어, 졌다, 망했다, 짜증 나, 열받아, 왜 안 돼, 너무 어려워, 실패했어, 게임 오버, 억울해, i died again, we lost, this is so hard, so annoying",
+      "prejudice": "이겼다, 클리어했다, 해냈다, 주식 떨어졌어",
+      "exact_match": ["죽었어", "졌다", "졌어", "망했다", "망했어", "짜증나", "열받아", "억울해"],
+      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["괜찮아, 다음엔 잡을 수 있어.", "패턴 거의 다 봤어, 한 번만 더!", "아깝다… 잠깐 쉬었다 갈까?"] }
+    },
+    "praise": {
+      "semantic": "The user praises Zena herself.",
+      "bias": "잘했어 제나, 똑똑하다, 최고야, 귀여워, 멋지다, 역시 제나, good job, you are the best, so cute",
+      "prejudice": "고마워, 이겼다",
+      "exact_match": ["잘했어", "똑똑하다", "귀여워", "멋지다", "역시"],
+      "express": { "emotion": "JOY", "motion": "CLAP", "lines": ["헤헤, 칭찬 고마워!", "칭찬받으니까 힘난다!"] }
+    },
+    "thanks": {
+      "semantic": "The user thanks Zena.",
+      "bias": "고마워, 고맙다, 땡큐, 감사해, 덕분이야, thanks, thank you",
+      "prejudice": "잘했어, 귀여워",
+      "exact_match": ["고마워", "고맙다", "땡큐", "감사해", "덕분이야", "thanks", "thank you"],
+      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["천만에!", "언제든지 불러 줘!"] }
+    },
+    "surprised": {
+      "semantic": "The user is startled or shocked by something that just happened.",
+      "bias": "헐, 깜짝이야, 뭐야 이거, 말도 안 돼, 이게 뭐야, 실화냐, whoa, what the, no way",
+      "prejudice": "무서워, 대박이다",
+      "exact_match": ["깜짝이야", "말도 안 돼", "실화냐"],
+      "express": { "emotion": "SURPRISED", "motion": "FLINCH", "lines": ["헉, 나도 깜짝 놀랐어!", "뭐야 뭐야?!"] }
+    },
+    "scared": {
+      "semantic": "The user is scared (horror game, dark place).",
+      "bias": "무서워, 소름 돋아, 귀신 나와, 공포 게임, 너무 어두워, scary, i am scared, creepy",
+      "prejudice": "깜짝이야, 짜증 나",
+      "exact_match": ["무서워", "소름", "무섭다"],
+      "express": { "emotion": "WORRIED", "motion": "HIDE_CROUCH", "lines": ["나도 무서워… 같이 가자.", "천천히, 내가 옆에 있을게."] }
+    },
+    "tired": {
+      "semantic": "The user is tired, sleepy or worn out.",
+      "bias": "피곤해, 졸려, 힘들다, 지쳤어, 눈 아파, 오래 했다, so tired, sleepy, exhausted",
+      "prejudice": "너무 어려워, 심심해",
+      "exact_match": ["피곤해", "졸려", "지쳤어", "피곤하다"],
+      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["조금 쉬었다 할까?", "물 한 잔 마시고 오자!"] }
+    },
+    "sad": {
+      "semantic": "The user is sad or feeling down.",
+      "bias": "슬퍼, 우울해, 속상해, 눈물 나, 기운 없어, i am sad, feeling down",
+      "prejudice": "짜증 나, 피곤해",
+      "exact_match": ["슬퍼", "우울해", "속상해"],
+      "express": { "emotion": "SORROW", "motion": "NOD", "lines": ["많이 속상했구나… 내가 들어 줄게.", "괜찮아, 오늘은 내가 옆에 있을게."] }
+    },
+    "greeting": {
+      "semantic": "The user says hello or announces they are back.",
+      "bias": "안녕, 하이, 좋은 아침, 반가워, 나 왔어, 오랜만이야, hello, hi, good morning",
+      "prejudice": "잘 자, 다음에 봐, 종료해 줘",
+      "exact_match": ["안녕", "하이", "반가워", "나 왔어", "hello"],
+      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["안녕! 오늘도 같이 하자!", "왔구나! 기다리고 있었어."] }
+    },
+    "farewell": {
+      "semantic": "The user says goodbye for now (the app keeps running unless they ask to quit).",
+      "bias": "잘 자, 다음에 봐, 나 갈게, 이따 봐, 바이바이, good night, bye, see you",
+      "prejudice": "종료해 줘, 앱 꺼 줘, 안녕 반가워",
+      "exact_match": ["잘 자", "잘자", "다음에 봐", "이따 봐", "바이바이", "bye"],
+      "express": { "emotion": "JOY", "motion": "WAVE_GOODBYE", "lines": ["잘 가! 다음에 또 보자.", "푹 쉬어! 바이바이~"] }
+    },
+    "cheer_me": {
+      "semantic": "The user asks Zena to cheer them on or to focus together.",
+      "bias": "응원해 줘, 파이팅, 힘내자, 집중하자, 할 수 있겠지, cheer me on, let's go",
+      "prejudice": "보스 패턴 어떻게 피해",
+      "exact_match": ["응원해", "파이팅", "화이팅", "힘내자", "집중하자"],
+      "express": { "emotion": "FOCUSED", "motion": "CHEER", "lines": ["파이팅! 할 수 있어!", "집중! 내가 같이 볼게."] }
+    },
+    "bored": {
+      "semantic": "The user is bored and wants something to do.",
+      "bias": "심심해, 지루해, 할 거 없어, 노잼, i am bored",
+      "prejudice": "피곤해",
+      "exact_match": ["심심해", "지루해", "노잼"],
+      "express": { "emotion": "JOY", "motion": "THINK", "lines": ["그럼 새 맵 구경 갈래?", "음… 오늘은 다른 캐릭터 해 볼까?"] }
+    }
+  },
+
+  "market": {
+    "stock_up": {
+      "semantic": "The user's stock or coin went up, or they took profit (Korean charts show gains in red).",
+      "bias": "주식 올랐어, 떡상, 익절했어, 수익 났어, 빨간불이야, 상한가, 코인 올랐어, my stock went up, took profit, to the moon",
+      "prejudice": "주식 떨어졌어, 손절했어, 이겼다",
+      "exact_match": ["떡상", "익절", "상한가", "수익 났어"],
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "lines": ["오, 수익 축하해!", "빨간불이다! 그래도 원칙대로 가자."] }
+    },
+    "stock_down": {
+      "semantic": "The user's stock or coin went down or they cut a loss (Korean charts show losses in blue).",
+      "bias": "주식 떨어졌어, 떡락, 손절했어, 물렸어, 파란불이야, 하한가, 마이너스야, 코인 떨어졌어, my stock dropped, i lost money",
+      "prejudice": "주식 올랐어, 익절했어, 졌다",
+      "exact_match": ["떡락", "손절", "물렸어", "하한가"],
+      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["저런… 너무 무리하지 말자.", "한 번 숨 고르고 다시 보자."] }
+    },
+    "ask_market": {
+      "semantic": "The user asks about the market or a chart (Zena talks it over but never gives investment advice).",
+      "bias": "이 차트 어때, 지금 사야 돼, 팔아야 돼, 주식 어떻게 생각해, should i buy, what about this chart",
+      "prejudice": "주식 올랐어, 주식 떨어졌어",
+      "exact_match": ["사야 돼", "팔아야 돼"],
+      "ask": "market",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": [] }
+    }
+  },
+
+  "coach": {
+    "game_tip": {
+      "semantic": "The user asks how to beat, dodge or progress in the game.",
+      "bias": "보스 패턴 어떻게 피해, 이거 어떻게 잡아, 공략 알려 줘, 지금 뭐 해야 돼, 어디로 가야 돼, how do i dodge this, any tips",
+      "prejudice": "인벤토리에서 물약 어디 있어, 응원해 줘",
+      "exact_match": ["어떻게 피해", "공략", "어떻게 잡아"],
+      "ask": "coach",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": [] }
+    },
+    "inventory": {
+      "semantic": "The user asks where an item is or how many are left.",
+      "bias": "인벤토리에서 물약 어디 있어, 가방에 아이템 어디 있어, 포션 몇 개 남았어, where is my potion",
+      "prejudice": "보스 패턴 어떻게 피해",
+      "exact_match": ["인벤토리", "물약", "포션", "가방"],
+      "ask": "coach",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": [] }
+    }
+  },
+
+  "screen": {
+    "what_is_this": {
+      "semantic": "The user asks Zena about what is on the screen right now; the answer uses the latest screen domain the watcher saw.",
+      "bias": "이거 뭐야, 화면 봐 봐, 이거 봐 봐, 뭐 보여, 지금 뭐 하는 것 같아, what is this, look at my screen",
+      "prejudice": "뭐야 이거 깜짝이야, 인벤토리에서 물약 어디 있어",
+      "exact_match": ["화면 봐", "이거 봐", "뭐 보여"],
+      "ask": "screen",
+      "express": { "emotion": "FOCUSED", "motion": "LEAN_FORWARD_POINT", "lines": [] }
+    }
+  },
+
+  "chitchat": {
+    "small_talk": {
+      "semantic": "Open small talk addressed to Zena; Raon-1-nano answers.",
+      "bias": "기분 어때, 뭐 하고 있었어, 오늘 어땠어, 이야기하자, 너는 뭐 좋아해, how are you, what are you doing",
+      "prejudice": "보스 패턴 어떻게 피해, 종료해 줘",
+      "ask": "chat"
+    }
+  },
+
+  "react": {
+    "combat": {
+      "semantic": "Screen-only reaction: a fight is on screen. Zena focuses silently; the event sensor drives the Lv1-Lv3 combat reactions.",
+      "express": { "emotion": "FOCUSED", "motion": "LEAN_FORWARD_POINT", "lines": [], "level": "lv1" }
+    },
+    "menu": {
+      "semantic": "Screen-only reaction: a game menu, lobby or inventory screen.",
+      "express": { "emotion": "NEUTRAL", "motion": "IDLE", "lines": [], "level": "lv1" }
+    },
+    "loading": {
+      "semantic": "Screen-only reaction: a loading screen; a good moment for a short break line.",
+      "express": { "emotion": "JOY", "motion": "NOD", "lines": ["로딩 중엔 스트레칭 한 번!", "물 한 모금 어때?"] }
+    },
+    "market": {
+      "semantic": "Screen-only reaction: a price chart or trading app is open.",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": ["차트 보는 중이구나. 무리하지 말자!", "오늘 장은 어때?"] }
+    },
+    "video": {
+      "semantic": "Screen-only reaction: a video or stream is playing.",
+      "express": { "emotion": "JOY", "motion": "IDLE", "lines": ["뭐 보는 거야? 같이 보자!"] }
+    },
+    "coding": {
+      "semantic": "Screen-only reaction: code editor or terminal.",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "lines": ["코딩 중이구나. 조용히 응원할게!", "버그 잡으면 알려 줘!"] }
+    },
+    "work": {
+      "semantic": "Screen-only reaction: documents, spreadsheets, slides or web pages.",
+      "express": { "emotion": "FOCUSED", "motion": "NOD", "lines": ["작업 파이팅!"] }
+    },
+    "privacy": {
+      "semantic": "Screen-only reaction to a private screen (login, banking, payment, personal chat): Zena looks away and says nothing, and the watcher backs off.",
+      "express": { "emotion": "NEUTRAL", "motion": "HIDE_CROUCH", "lines": [], "level": "lv1" }
+    }
+  },
+
+  "vision_prompting": {
+    "semantic": "Prompt ensembling for the SigLIP2 text tower (noto-sandbox world_lexicon): every vision phrase is embedded once per template and the unit mean is its anchor. Background phrases are never subtracted as prejudice.",
+    "templates": [
+      "a screenshot of {}.",
+      "a computer screen showing {}.",
+      "{} on a monitor.",
+      "a cropped screenshot of {}.",
+      "a low resolution screenshot of {}."
+    ],
+    "background": ["a computer desktop", "a blank screen"]
+  },
+
+  "vision": {
+    "game_combat": {
+      "kind": "scene",
+      "link": "react.combat",
+      "semantic": "A fight in a video game.",
+      "bias": "a video game battle with monsters, an action game fight with spell effects, an rpg boss fight, a first person shooter game, a fantasy game character attacking enemies",
+      "prejudice": "a stock market chart, a spreadsheet, source code in an editor, a computer desktop"
+    },
+    "game_victory": {
+      "kind": "event",
+      "link": "emotion.celebrate",
+      "semantic": "A victory or level-complete screen.",
+      "bias": "a victory screen in a video game, a level complete screen, the word victory in large letters, a winning screen with a trophy",
+      "prejudice": "a game over screen, a defeat screen"
+    },
+    "game_defeat": {
+      "kind": "event",
+      "link": "emotion.frustrated",
+      "semantic": "A game over or defeat screen.",
+      "bias": "a game over screen, a defeat screen in a video game, the words you died in red letters, a red defeat banner",
+      "prejudice": "a victory screen, a level complete screen"
+    },
+    "game_menu": {
+      "kind": "scene",
+      "link": "react.menu",
+      "semantic": "A game menu, lobby, character select or inventory screen.",
+      "bias": "a video game main menu, a character selection screen, a game inventory screen with item slots, a game lobby",
+      "prejudice": "a video game battle with monsters, a loading screen"
+    },
+    "loading": {
+      "kind": "event",
+      "link": "react.loading",
+      "semantic": "A loading screen.",
+      "bias": "a loading screen with a progress bar, a game loading screen with tips, a spinning loading icon",
+      "prejudice": "a video game main menu"
+    },
+    "stock_chart": {
+      "kind": "scene",
+      "link": "react.market",
+      "semantic": "A stock, coin or other price chart, or a trading app.",
+      "bias": "a stock price candlestick chart, a stock trading app, a financial chart with price lines, a cryptocurrency exchange chart",
+      "prejudice": "a video game, source code in an editor, a spreadsheet"
+    },
+    "video": {
+      "kind": "scene",
+      "link": "react.video",
+      "semantic": "A video player, movie or live stream.",
+      "bias": "a video player playing a movie, a youtube video, a live stream with a chat, an anime episode",
+      "prejudice": "a video game battle with monsters"
+    },
+    "coding": {
+      "kind": "scene",
+      "link": "react.coding",
+      "semantic": "A code editor, IDE or terminal.",
+      "bias": "source code in a code editor, a programming ide with syntax highlighting, a terminal window with commands",
+      "prejudice": "a text document, a spreadsheet"
+    },
+    "document": {
+      "kind": "scene",
+      "link": "react.work",
+      "semantic": "A document, spreadsheet, slide deck or article page.",
+      "bias": "a text document, a spreadsheet with tables, a web page article, a presentation slide",
+      "prejudice": "source code in a code editor, a stock price candlestick chart"
+    },
+    "private": {
+      "kind": "privacy",
+      "link": "react.privacy",
+      "semantic": "A private screen: login, password, banking, payment or a personal chat. Nothing is said about it and the watcher backs off.",
+      "bias": "a login page with a password field, an online banking page, a payment form with a credit card number, a messenger chat with personal messages",
+      "prejudice": "a video game main menu"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+KRAFTON Raon Zena
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains code derived from third-party projects:
+
+1. Qntology/logis-center — https://github.com/Qntology/logis-center
+   Apache License 2.0, Copyright 2026 Qntology.
+   - crates/raon-quant/src/kquant.rs: vendored from commerce/crates/ggml-kquant/src/lib.rs
+     (commit 1913209). Modified: English docs and Format::ggml_type added; the per-candidate
+     weighted error in fit_symmetric / fit_asymmetric is evaluated in closed form (one pass).
+   - crates/nlp-nms-router: algorithms ported from commerce/src-tauri/src (see
+     crates/nlp-nms-router/NOTICE for the file-by-file list and modifications).
+
+2. ggml / llama.cpp — https://github.com/ggml-org/ggml
+   MIT License, Copyright (c) Georgi Gerganov.
+   The Q8_0 / Q4_K / Q5_K / Q6_K block layouts and the scale packing in
+   crates/raon-quant/src/kquant.rs and crates/raon-quant/src/kernels.rs follow ggml's
+   reference quantize/dequantize routines so the output is bit-compatible with GGUF readers.
+
+3. KRAFTON Raon-VisionEncoder processor (OpenCLIP-derived), Apache License 2.0 / MIT.
+   crates/zena-sensor/src/naflex.rs re-implements the NaFlex resize search and patch layout of
+   modeling_raonve.py / raon_vision_encoder/transform.py.
+   The expression dictionary data/zena_lexicon.json uses the node format of logis-center's
+   commerce/src-tauri/src/utils/bias.json (semantic / bias / prejudice / exact_match); its contents
+   are new.
+
+4. Qntology/candle-rocm-vulkan — https://github.com/Qntology/candle-rocm-vulkan
+   Apache License 2.0. Used as a Cargo dependency ([patch.crates-io] of candle-core / candle-nn
+   0.11.0, and candle-rocm) for the CUDA / ROCm / Vulkan / Metal LLM backends, wired the same way
+   as Qntology/logis-center. Not vendored.
+
+5. crates/raon-infer/src/model.rs re-implements the forward pass of KRAFTON's
+   modeling_raon1_nano.py (Apache-2.0) operation by operation.
+
+6. sungu-che/noto-sandbox — https://github.com/sungu-che/noto-sandbox
+   Apache License 2.0.
+   - crates/raon-vision/src/perforate.rs: ported from crates/noto-vision/src/perforate.rs (first-pass
+     patterns, minesweeper seeds / cells_to_open, fill_holes). Modified: the fovea is shaped for a PC
+     screen instead of a robot camera's horizon; the tests were adapted.
+   - crates/raon-vision/src/tower.rs: the sparse passes (forward_sparse / extend_sparse / merge_sparse,
+     LayerKv context, MAP-head value path) follow crates/noto-ml/src/vision.rs and encoder.rs, rewritten
+     for Raon-VisionEncoder's timm weight layout.
+   - crates/raon-vision/src/bank.rs and the contrast heat follow crates/noto-search/src/vision.rs
+     (VisionBank prompt ensembling, bias / prejudice scoring) and crates/noto-vision/src/locate.rs.
+   - crates/zena-lexicon/src/phrase.rs: split_phrase_list / weighted_phrases from
+     crates/noto-search/src/lexicon.rs.
+
+7. KRAFTON Raon-VisionEncoder (timm / OpenCLIP based), Apache License 2.0.
+   crates/raon-vision re-implements the vision tower (timm vit_so400m_patch16_siglip_256 + MAP head in
+   the NaFlex 1-D mode of modeling_raonve.py), the text tower (open_clip TextTransformer) and the
+   tokenizer cleaning (open_clip canonicalize_text); zena-sensor's resize reproduces PIL's bicubic
+   resampling (Pillow, MIT-CMU licence) used by RaonVEProcessor.
+
+8. LanceDB — https://github.com/lancedb/lancedb (Apache License 2.0), used as a Cargo dependency
+   (lancedb 0.41 and the Lance / Arrow / DataFusion crates it brings). Not vendored.
+
+Model weights are NOT part of this repository. They are downloaded separately and remain under
+their own licenses:
+   - KRAFTON/Raon-1-nano: Apache-2.0
+   - KRAFTON/Raon-VisionEncoder: Apache-2.0
+   - KRAFTON/Raon-OpenTTS-0.3B: CC-BY-NC-4.0 (non-commercial)

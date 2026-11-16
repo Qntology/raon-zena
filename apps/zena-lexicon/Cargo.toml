@@ -1,0 +1,25 @@
+[package]
+name = "zena-lexicon-cli"
+description = "Edit Raon Zena's word dictionary in LanceDB: import / export the bias.json form, add or remove phrases and lines, search, learned candidates, revisions and rollback, SigLIP2 anchors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zena-lexicon"
+path = "src/main.rs"
+
+[dependencies]
+zena-lexicon = { path = "../../crates/zena-lexicon", features = ["lancedb"] }
+raon-vision = { path = "../../crates/raon-vision" }
+raon-infer = { path = "../../crates/raon-infer" }
+zena-sensor = { path = "../../crates/zena-sensor" }
+anyhow = "1"
+serde_json.workspace = true
+
+[features]
+default = []
+cuda = ["raon-vision/cuda"]
+rocm = ["raon-vision/rocm"]
+vulkan = ["raon-vision/vulkan"]
+metal = ["raon-vision/metal"]

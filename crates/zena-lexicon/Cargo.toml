@@ -1,0 +1,20 @@
+[package]
+name = "zena-lexicon"
+description = "Raon Zena expression dictionary: logis-center bias.json node format, character expressions, and a LanceDB store for updating it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zena-core = { path = "../zena-core" }
+anyhow = "1"
+serde.workspace = true
+serde_json.workspace = true
+# The dictionary store (feature `lancedb`): the official LanceDB Rust SDK (Arrow comes through `lancedb::arrow`).
+lancedb = { version = "0.41", default-features = false, optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[features]
+default = []
+lancedb = ["dep:lancedb", "dep:futures", "dep:tokio"]
