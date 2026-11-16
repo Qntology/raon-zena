@@ -96,6 +96,9 @@ pub struct SessionContext {
     pub affinity: f32,
     /// 0 (calm) .. 1 (frantic): combat and defeats raise it, it decays over time.
     pub tension: f32,
+    /// Recommendations for what is on screen: one line per record (at most 3), each saying the local and the
+    /// global verdict side by side (`zena_verdict::Stance::line`). Empty: nothing to recommend.
+    pub verdicts: Vec<String>,
 }
 
 impl SessionContext {
@@ -129,6 +132,9 @@ impl SessionContext {
         let mut s = format!("[세션] {}\n", parts.join(" / "));
         if let Some(t) = self.tone() {
             s.push_str(&format!("[말투] {t}\n"));
+        }
+        for v in self.verdicts.iter().take(3) {
+            s.push_str(&format!("[추천] {v}\n"));
         }
         s
     }
@@ -304,5 +310,18 @@ mod tests {
         assert_eq!(d.turns()[0].user.as_ref().unwrap().chars().count(), 61);
         d.push(None, "  ");
         assert_eq!(d.len(), 1, "nothing said, nothing remembered");
+    }
+
+    #[test]
+    fn verdict_lines_follow_the_session_line_at_most_three() {
+        let ctx = SessionContext {
+            verdicts: (1..=4).map(|i| format!("공략 {i}: 내 기록과 서버 평가 모두 추천")).collect(),
+            ..Default::default()
+        };
+        let s = ctx.render();
+        assert!(s.contains("[추천] 공략 1: 내 기록과 서버 평가 모두 추천\n"));
+        assert!(s.contains("[추천] 공략 3:"));
+        assert!(!s.contains("공략 4"), "at most three");
+        assert!(!SessionContext::default().render().contains("[추천]"));
     }
 }

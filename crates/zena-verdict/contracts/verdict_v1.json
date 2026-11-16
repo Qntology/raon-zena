@@ -1,0 +1,1127 @@
+{
+  "recipe": "pd-verdict/1",
+  "generated_by": "contracts/gen_verdict_v1.py",
+  "tolerance": 1e-09,
+  "params": {
+    "k": 2.0,
+    "eps": 0.05,
+    "enter": 0.5,
+    "exit": 0.3,
+    "floor": 0.1,
+    "strong": 0.8,
+    "min_evidence": 2.0,
+    "duel_rate": 0.65,
+    "duel_min": 3,
+    "tracks": {
+      "pd": {
+        "half_life_ms": 7776000000,
+        "min_obs": {
+          "secondary": 5,
+          "primary": 10,
+          "global": 30
+        }
+      },
+      "drop": {
+        "half_life_ms": 1209600000,
+        "min_obs": {
+          "secondary": 6,
+          "primary": 3,
+          "global": 10
+        }
+      },
+      "web": {
+        "half_life_ms": 1209600000,
+        "min_obs": {
+          "secondary": 8,
+          "primary": 4,
+          "global": 12
+        }
+      },
+      "chat": {
+        "half_life_ms": 1209600000,
+        "min_obs": {
+          "secondary": 6,
+          "primary": 3,
+          "global": 10
+        }
+      },
+      "coach": {
+        "half_life_ms": 1209600000,
+        "min_obs": {
+          "secondary": 6,
+          "primary": 3,
+          "global": 10
+        }
+      }
+    },
+    "weights": {
+      "vote": 1.0,
+      "vote_outcome": 0.5,
+      "manual": 2.0,
+      "feedback": 1.0,
+      "outcome": 1.0,
+      "reaction": 0.6,
+      "engage": 0.2,
+      "model": 0.3
+    }
+  },
+  "cases": [
+    {
+      "name": "premium_by_rank_in_secondary_scope",
+      "note": "오늘 · 1일 전 · 8일 전 추천 3표. r ≥ strong 이라 grade +2",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763164800000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1762560000000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": 0.05,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 2.9325745603491056,
+        "value": 0.5945322314887727,
+        "level": "secondary",
+        "rank": 0.9746722692629883,
+        "tier": "premium",
+        "grade": 2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_high",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "unrated_with_one_vote",
+      "note": "E = 1 < min_evidence. 기준선이 있으므로 순위는 계산하지만 등급은 unrated",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": 0.05,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 1.0,
+        "value": 0.3333333333333333,
+        "level": "secondary",
+        "rank": 0.8121570079614577,
+        "tier": "unrated",
+        "grade": null,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "low_evidence",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "withdrawn_vote_is_ignored",
+      "note": "sign 0 은 E 에도 v 에도 들어가지 않는다",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 0,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 5,
+          "mean": 0.1,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 2.0,
+        "value": 0.5,
+        "level": "secondary",
+        "rank": 0.9216685544064713,
+        "tier": "premium",
+        "grade": 2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_high",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "neutral_near_baseline",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 7,
+          "mean": 0.3,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 4.0,
+        "value": 0.3333333333333333,
+        "level": "secondary",
+        "rank": 0.13254878839087836,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 0,
+        "reasons": [
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "floor_blocks_premium",
+      "note": "순위는 높지만 v = 0 < floor 라 추천이 아니다",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 5,
+          "mean": -0.5,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 8.0,
+        "value": 0.0,
+        "level": "secondary",
+        "rank": 0.9640275800758169,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 0,
+        "reasons": [
+          "floor",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "discount_by_rank_primary_backoff",
+      "note": "secondary n 3 < 5 라 primary 로 넘어감. r ≤ −strong 이라 grade −2",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 3,
+          "mean": 0.0,
+          "sd": 0.1
+        },
+        "primary": {
+          "n": 12,
+          "mean": 0.2,
+          "sd": 0.3
+        }
+      },
+      "expect": {
+        "evidence": 3.0,
+        "value": -0.6,
+        "level": "primary",
+        "rank": -0.9795254256751327,
+        "tier": "discount",
+        "grade": -2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_low",
+          "level:primary"
+        ]
+      }
+    },
+    {
+      "name": "global_backoff_discount",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 2,
+          "mean": 0.0,
+          "sd": 0.1
+        },
+        "primary": {
+          "n": 4,
+          "mean": 0.0,
+          "sd": 0.1
+        },
+        "global": {
+          "n": 40,
+          "mean": 0.1,
+          "sd": 0.4
+        }
+      },
+      "expect": {
+        "evidence": 4.0,
+        "value": -0.3333333333333333,
+        "level": "global",
+        "rank": -0.7455955907602021,
+        "tier": "discount",
+        "grade": -1,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_low",
+          "level:global"
+        ]
+      }
+    },
+    {
+      "name": "no_baseline_stays_neutral",
+      "note": "표본이 없으면 단정하지 않는다",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {},
+      "expect": {
+        "evidence": 3.0,
+        "value": 0.6,
+        "level": null,
+        "rank": null,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 0,
+        "reasons": [
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "duel_win_without_baseline",
+      "note": "기준선 없이 대결 승률 0.8 로 추천. 순위가 없으므로 grade +1",
+      "now_ms": 1763251200000,
+      "track": "drop",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "manual",
+          "sign": 1,
+          "weight": 2.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "outcome",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 0.5,
+          "at_ms": 1763164800000
+        }
+      ],
+      "baseline": {},
+      "duel": {
+        "wins": 4,
+        "losses": 1
+      },
+      "expect": {
+        "evidence": 2.4758475765053096,
+        "value": 0.5531572588623367,
+        "level": null,
+        "rank": null,
+        "tier": "premium",
+        "grade": 1,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "duel_win",
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "duel_needs_three_meetings",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "drop",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "manual",
+          "sign": 1,
+          "weight": 2.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "feedback",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {},
+      "duel": {
+        "wins": 2,
+        "losses": 0
+      },
+      "expect": {
+        "evidence": 3.0,
+        "value": 0.6,
+        "level": null,
+        "rank": null,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 0,
+        "reasons": [
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "duel_loss_without_baseline",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "drop",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "reaction",
+          "sign": -1,
+          "weight": 0.6,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "reaction",
+          "sign": -1,
+          "weight": 0.6,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "outcome",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 2,
+          "mean": 0.0,
+          "sd": 0.1
+        },
+        "primary": {
+          "n": 2,
+          "mean": 0.0,
+          "sd": 0.1
+        },
+        "global": {
+          "n": 5,
+          "mean": 0.0,
+          "sd": 0.1
+        }
+      },
+      "duel": {
+        "wins": 1,
+        "losses": 3
+      },
+      "expect": {
+        "evidence": 2.2,
+        "value": -0.5238095238095238,
+        "level": null,
+        "rank": null,
+        "tier": "discount",
+        "grade": -1,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "duel_loss",
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "superseded_is_discount",
+      "note": "근거가 모자라도 대체된 기록은 discount, grade −2",
+      "now_ms": 1763251200000,
+      "track": "drop",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "engage",
+          "sign": 1,
+          "weight": 0.2,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {},
+      "superseded": true,
+      "expect": {
+        "evidence": 0.2,
+        "value": 0.09090909090909091,
+        "level": null,
+        "rank": null,
+        "tier": "discount",
+        "grade": -2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "superseded",
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "hysteresis_holds_premium",
+      "note": "r 이 exit 와 enter 사이: 직전 premium 을 유지하고 since 도 그대로",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "premium",
+        "since_ms": 1762000000000
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": 0.25,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 4.0,
+        "value": 0.3333333333333333,
+        "level": "secondary",
+        "rank": 0.3215127375316343,
+        "tier": "premium",
+        "grade": 1,
+        "since_ms": 1762000000000,
+        "reasons": [
+          "held",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "hysteresis_releases_premium",
+      "note": "r < exit: neutral 로 내려가고 since = now",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "premium",
+        "since_ms": 1762000000000
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": 0.28,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 4.0,
+        "value": 0.3333333333333333,
+        "level": "secondary",
+        "rank": 0.21015483788347483,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "hysteresis_holds_discount",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "discount",
+        "since_ms": 1762000000000
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": -1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": -0.25,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 4.0,
+        "value": -0.3333333333333333,
+        "level": "secondary",
+        "rank": -0.3215127375316343,
+        "tier": "discount",
+        "grade": -1,
+        "since_ms": 1762000000000,
+        "reasons": [
+          "held",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "decay_half_life_boundary",
+      "note": "반감기 하나 전의 4표: E = 2.0 = min_evidence (경계는 판정 가능)",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1755475200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1755475200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1755475200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1755475200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 5,
+          "mean": 0.0,
+          "sd": 0.3
+        }
+      },
+      "expect": {
+        "evidence": 2.0,
+        "value": 0.5,
+        "level": "secondary",
+        "rank": 0.8913734677347187,
+        "tier": "premium",
+        "grade": 2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_high",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "future_timestamp_counts_as_now",
+      "note": "시계가 앞선 관측은 나이 0",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763337600000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {},
+      "expect": {
+        "evidence": 2.0,
+        "value": 0.5,
+        "level": null,
+        "rank": null,
+        "tier": "neutral",
+        "grade": 0,
+        "since_ms": 0,
+        "reasons": [
+          "no_baseline"
+        ]
+      }
+    },
+    {
+      "name": "zero_weight_counts_nothing",
+      "note": "게스트 · 자기 글 표(가중치 0)는 근거가 되지 않는다",
+      "now_ms": 1763251200000,
+      "track": "pd",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 0.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 0.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "vote",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 6,
+          "mean": 0.0,
+          "sd": 0.2
+        }
+      },
+      "expect": {
+        "evidence": 1.0,
+        "value": 0.3333333333333333,
+        "level": "secondary",
+        "rank": 0.8700616617426719,
+        "tier": "unrated",
+        "grade": null,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "low_evidence",
+          "level:secondary"
+        ]
+      }
+    },
+    {
+      "name": "local_mixed_kinds_primary_level",
+      "note": "",
+      "now_ms": 1763251200000,
+      "track": "chat",
+      "prev": {
+        "tier": "neutral",
+        "since_ms": 0
+      },
+      "obs": [
+        {
+          "kind": "feedback",
+          "sign": 1,
+          "weight": 1.0,
+          "credit": 0.5,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "reaction",
+          "sign": 1,
+          "weight": 0.6,
+          "credit": 1.0,
+          "at_ms": 1763078400000
+        },
+        {
+          "kind": "engage",
+          "sign": 1,
+          "weight": 0.2,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "model",
+          "sign": -1,
+          "weight": 0.3,
+          "credit": 1.0,
+          "at_ms": 1763251200000
+        },
+        {
+          "kind": "manual",
+          "sign": 1,
+          "weight": 2.0,
+          "credit": 1.0,
+          "at_ms": 1763164800000
+        }
+      ],
+      "baseline": {
+        "secondary": {
+          "n": 0,
+          "mean": 0.0,
+          "sd": 0.0
+        },
+        "primary": {
+          "n": 3,
+          "mean": 0.1,
+          "sd": 0.15
+        }
+      },
+      "expect": {
+        "evidence": 3.446824504579583,
+        "value": 0.5226576516621803,
+        "level": "primary",
+        "rank": 0.9712157249155032,
+        "tier": "premium",
+        "grade": 2,
+        "since_ms": 1763251200000,
+        "reasons": [
+          "rank_high",
+          "level:primary"
+        ]
+      }
+    }
+  ]
+}
