@@ -44,6 +44,14 @@ pub fn show(hwnd: HWND, visible: bool) {
     }
 }
 
+/// Bring the overlay to the foreground for typing (the hotkey that asked for it grants the right to).
+pub fn focus(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 pub fn set_alpha(hwnd: HWND, alpha: u8) {
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
@@ -61,7 +69,7 @@ pub fn cursor_over(hwnd: HWND) -> bool {
     }
 }
 
-/// Register Ctrl+Shift+{Q,H,L} on a dedicated thread with its own message loop and forward
+/// Register Ctrl+Shift+{Q,H,L,T} on a dedicated thread with its own message loop and forward
 /// presses through `send`.
 pub fn spawn_hotkeys(send: impl Fn(Hotkey) + Send + 'static) {
     std::thread::spawn(move || unsafe {

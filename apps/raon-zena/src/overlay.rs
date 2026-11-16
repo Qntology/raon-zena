@@ -1,40 +1,57 @@
-//! The 350×450 transparent micro-viewport: winit window + one wgpu device, procedural avatar,
-//! dynamic FPS, Win32 layering and the graceful shutdown sequence.
+//! The 350×450 transparent micro-viewport: winit window + one wgpu device, the three-pass scene
+//! ([`crate::renderers::scene`]: body → emote & props → speech bubble), dynamic FPS, Win32 layering, the in-overlay
+//! chat box and the graceful shutdown sequence.
+//!
+//! Streamed answers arrive as [`AvatarCmd::Expression`] (the face and motion first) and [`AvatarCmd::Speak`]
+//! sentences that queue after what Zena is saying and append to the bubble.
 
+use crate::assets::{AssetLink, Assets};
 use crate::pipeline::AvatarCmd;
+use crate::renderers::scene::{EmoteShow, Loaded, Missing, Scene, Stage};
+use crate::renderers::{depth_texture, FrameParams};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
-use zena_core::avatar::{live2d_gaze_params, live2d_mouth, look_at_event, AvatarPlacement, Viseme};
+use zena_core::avatar::{live2d_gaze_params, live2d_mouth, look_at_event, AvatarPlacement, LookAt, Viseme};
 use zena_core::geometry::{Polar, ScreenGeometry};
 use zena_core::reaction::ReactionLevel;
-use zena_core::tools::{BodyMotion, EmotionState, SystemCommand, WindowLayerMode, ZenaAvatarArgs};
+use zena_core::tools::{
+    AssetAction, AvatarPart, AvatarTrack, BodyMotion, CharacterEmote, EmotionState, SystemCommand, WindowLayerMode, ZenaAssetArgs,
+    ZenaAvatarArgs,
+};
 use zena_core::window::{apply_command, frame_interval, Hotkey, ShutdownPhase, WindowEffect, WindowState, VIEWPORT_H, VIEWPORT_W};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum UserEvent {
     Cmd(AvatarCmd),
     #[cfg_attr(not(windows), allow(dead_code))]
     Hotkey(Hotkey),
+    /// An asset decoded by the asset service.
+    Asset(Box<Loaded>),
+    /// An asset that could not be produced.
+    AssetFailed(Missing),
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
-struct Uniforms {
-    gaze: [f32; 2],
-    head: [f32; 2],
-    mouth_open: f32,
-    mouth_form: f32,
-    brow: f32,
-    eye_open: f32,
-    alpha: f32,
-    time: f32,
-    _pad: [f32; 2],
+impl std::fmt::Debug for Loaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Loaded::Stamp { emote, frames, .. } => write!(f, "Stamp({emote:?}, {frames} frames)"),
+            Loaded::Prop { emote, angle, .. } => write!(f, "Prop({emote:?}, {angle}°)"),
+            Loaded::Part { part, .. } => write!(f, "Part({part:?})"),
+            Loaded::Body2d { w, h, .. } => write!(f, "Body2d({w}x{h})"),
+            Loaded::BodyMesh { track, mesh, vrm } => {
+                write!(f, "BodyMesh({track:?}, {} vertices, vrm {})", mesh.positions.len(), vrm.is_some())
+            }
+        }
+    }
 }
 
 struct Gfx {
@@ -42,9 +59,8 @@ struct Gfx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    ubuf: wgpu::Buffer,
-    bind: wgpu::BindGroup,
+    depth: wgpu::TextureView,
+    scene: Scene,
 }
 
 /// Smoothed animation state (targets set by commands, current values eased per frame).
@@ -54,11 +70,30 @@ struct Anim {
     head: [f32; 2],
     emotion: EmotionState,
     motion: BodyMotion,
+    motion_start: Instant,
     level: ReactionLevel,
     speech_start: Instant,
     speech_ms: u32,
     visemes: Vec<(u32, Viseme)>,
     expression_until: Instant,
+    emote: Option<(CharacterEmote, Instant)>,
+    look: LookAt,
+}
+
+/// The line on show (streamed sentences append while the answer lasts).
+#[derive(Default)]
+struct Bubble {
+    text: String,
+    /// The next sentence starts a new bubble (a new answer began).
+    fresh: bool,
+}
+
+/// The in-overlay chat box.
+#[derive(Default)]
+struct Chat {
+    open: bool,
+    text: String,
+    preedit: String,
 }
 
 pub struct Overlay {
@@ -67,13 +102,25 @@ pub struct Overlay {
     state: WindowState,
     shutdown: ShutdownPhase,
     anim: Anim,
+    bubble: Bubble,
+    chat: Chat,
+    track: AvatarTrack,
+    parts: Vec<AvatarPart>,
+    assets: Option<Assets>,
+    requested: HashSet<Missing>,
+    pending: Vec<Loaded>,
+    font: Option<std::path::PathBuf>,
     t0: Instant,
     screen: ScreenGeometry,
+    utterances: Sender<String>,
     pub capture_running: Arc<AtomicBool>,
 }
 
+const BUBBLE_HOLD_MS: u64 = 2500;
+const EMOTE_FADE_S: f32 = 0.45;
+
 impl Overlay {
-    pub fn new(capture_running: Arc<AtomicBool>, screen: ScreenGeometry) -> Self {
+    pub fn new(capture_running: Arc<AtomicBool>, screen: ScreenGeometry, utterances: Sender<String>) -> Self {
         let now = Instant::now();
         Self {
             window: None,
@@ -86,16 +133,56 @@ impl Overlay {
                 head: [0.0; 2],
                 emotion: EmotionState::Neutral,
                 motion: BodyMotion::Idle,
+                motion_start: now,
                 level: ReactionLevel::Lv1Silent,
                 speech_start: now,
                 speech_ms: 0,
                 visemes: vec![],
                 expression_until: now,
+                emote: None,
+                look: LookAt::default(),
             },
+            bubble: Bubble::default(),
+            chat: Chat::default(),
+            track: AvatarTrack::Procedural,
+            parts: Vec::new(),
+            assets: None,
+            requested: HashSet::new(),
+            pending: Vec::new(),
+            font: None,
             t0: now,
             screen,
+            utterances,
             capture_running,
         }
+    }
+
+    /// The asset service (track bodies, emote stamps and props, accessories) and the body track to start with.
+    pub fn with_assets(mut self, assets: Assets, track: AvatarTrack) -> Self {
+        // Prefetch every stamp and the props that do not depend on a direction, so the first emote of each kind
+        // does not pop in late; the arrow, the parts and the bodies are asked for when first shown.
+        let mut first: Vec<Missing> = CharacterEmote::ALL.iter().map(|e| Missing::Stamp(*e)).collect();
+        first.extend(
+            CharacterEmote::ALL
+                .iter()
+                .filter(|e| e.form() == zena_core::tools::EmoteForm::Prop && **e != CharacterEmote::ThreatArrow3d)
+                .map(|e| Missing::Prop(*e, 0)),
+        );
+        if track != AvatarTrack::Procedural {
+            first.push(Missing::Body(track));
+        }
+        for m in first {
+            assets.request(&m);
+            self.requested.insert(m);
+        }
+        self.assets = Some(assets);
+        self.track = track;
+        self
+    }
+
+    pub fn with_font(mut self, font: Option<std::path::PathBuf>) -> Self {
+        self.font = font;
+        self
     }
 
     fn now_ms(&self) -> u64 {
@@ -106,23 +193,95 @@ impl Overlay {
         self.anim.speech_start.elapsed() < Duration::from_millis(self.anim.speech_ms as u64)
     }
 
-    fn act(&mut self, args: &ZenaAvatarArgs, level: ReactionLevel, visemes: Vec<(u32, Viseme)>, speech_ms: u32) {
+    /// Gaze, emotion, motion and emote (no speech).
+    fn express(&mut self, args: &ZenaAvatarArgs, level: ReactionLevel) {
         if let Some(g) = args.gaze_target {
             self.anim.gaze = Some(Polar {
                 r: g.distance_norm,
                 theta_deg: g.angle_deg,
             });
         }
+        if args.body_motion != self.anim.motion || args.body_motion != BodyMotion::Idle {
+            self.anim.motion_start = Instant::now();
+        }
         self.anim.emotion = args.emotion_state;
         self.anim.motion = args.body_motion;
+        self.anim.level = self.anim.level.max(level);
+        let now = Instant::now();
+        let showing = self.anim.emote.is_some() && now < self.anim.expression_until;
+        match args.emote() {
+            Some(e) if showing && self.anim.emote.map(|x| x.0) == Some(e) => {}
+            Some(e) => self.anim.emote = Some((e, now)),
+            None => {}
+        }
+        let speech_end = self.anim.speech_start + Duration::from_millis(self.anim.speech_ms as u64);
+        self.anim.expression_until = speech_end.max(now) + Duration::from_millis(1800);
+    }
+
+    /// A whole reaction: replaces what Zena was saying.
+    fn act(&mut self, args: &ZenaAvatarArgs, level: ReactionLevel, visemes: Vec<(u32, Viseme)>, speech_ms: u32) {
         self.anim.level = level;
         self.anim.visemes = visemes;
         self.anim.speech_ms = speech_ms;
         self.anim.speech_start = Instant::now();
-        self.anim.expression_until = Instant::now() + Duration::from_millis(speech_ms as u64 + 1200);
+        self.express(args, level);
         if let Some(t) = &args.speech_text {
-            // TTS backend hook (Raon-OpenTTS); until then the line is logged.
+            // TTS backend hook (Raon-OpenTTS); until then the line is logged and shown in the bubble.
             eprintln!("[zena:{level:?}] {t}");
+            self.bubble.text = t.clone();
+            self.bubble.fresh = false;
+        }
+    }
+
+    /// A streamed sentence: queued after the current speech.
+    fn speak(&mut self, text: &str, level: ReactionLevel, visemes: Vec<(u32, Viseme)>, ms: u32) {
+        eprintln!("[zena:{level:?}] {text}");
+        if self.speaking() {
+            let off = self.anim.speech_ms;
+            // The previous timeline ends with a closing rest; the next sentence takes its place.
+            if self.anim.visemes.last().is_some_and(|(t, v)| *v == Viseme::Rest && *t >= off) {
+                self.anim.visemes.pop();
+            }
+            self.anim.visemes.extend(visemes.into_iter().map(|(t, v)| (t + off, v)));
+            self.anim.speech_ms += ms;
+        } else {
+            self.anim.speech_start = Instant::now();
+            self.anim.visemes = visemes;
+            self.anim.speech_ms = ms;
+        }
+        if self.bubble.fresh || self.bubble.text.is_empty() {
+            self.bubble.text = text.to_string();
+            self.bubble.fresh = false;
+        } else {
+            self.bubble.text.push(' ');
+            self.bubble.text.push_str(text);
+        }
+        self.anim.level = self.anim.level.max(level);
+        let end = self.anim.speech_start + Duration::from_millis(self.anim.speech_ms as u64);
+        self.anim.expression_until = self.anim.expression_until.max(end + Duration::from_millis(1800));
+    }
+
+    fn asset(&mut self, a: &ZenaAssetArgs) {
+        match a.action {
+            AssetAction::SwitchTrack => {
+                if let Some(t) = a.track {
+                    eprintln!("[avatar] track → {t:?}");
+                    self.track = t;
+                }
+            }
+            AssetAction::EquipPart => {
+                if let Some(p) = a.part.filter(|p| !self.parts.contains(p)) {
+                    eprintln!("[avatar] equip {p:?}");
+                    self.parts.push(p);
+                    self.parts.sort();
+                }
+            }
+            AssetAction::RemovePart => {
+                if let Some(p) = a.part {
+                    self.parts.retain(|x| *x != p);
+                }
+            }
+            AssetAction::ResetParts => self.parts.clear(),
         }
     }
 
@@ -132,19 +291,16 @@ impl Overlay {
                 WindowEffect::BeginShutdown => {
                     if self.shutdown == ShutdownPhase::Running {
                         self.shutdown = ShutdownPhase::Farewell { started_ms: self.now_ms() };
+                        let line = "오늘도 수고했어! 또 봐~";
                         let bye = ZenaAvatarArgs {
-                            gaze_target: None,
                             emotion_state: EmotionState::Joy,
                             body_motion: BodyMotion::WaveGoodbye,
-                            speech_text: Some("오늘도 수고했어! 또 봐~".into()),
+                            character_emote: Some(CharacterEmote::ChibiHeart),
+                            speech_text: Some(line.into()),
+                            ..Default::default()
                         };
                         let ms = 1800;
-                        self.act(
-                            &bye,
-                            ReactionLevel::Lv3Coaching,
-                            zena_core::avatar::viseme_timeline("오늘도 수고했어! 또 봐~", ms),
-                            ms,
-                        );
+                        self.act(&bye, ReactionLevel::Lv3Coaching, zena_core::avatar::viseme_timeline(line, ms), ms);
                     }
                 }
                 WindowEffect::ApplyStyle => self.platform_style(),
@@ -174,6 +330,41 @@ impl Overlay {
         }
     }
 
+    /// Open / close the chat box: the window takes focus and IME input while it is open.
+    fn set_chat(&mut self, open: bool) {
+        if self.chat.open == open {
+            return;
+        }
+        self.chat.open = open;
+        self.chat.preedit.clear();
+        self.state.typing = open;
+        if !open {
+            self.chat.text.clear();
+        }
+        self.platform_style();
+        if let Some(w) = &self.window {
+            w.set_ime_allowed(open);
+            if open {
+                w.focus_window();
+            }
+        }
+        #[cfg(windows)]
+        if open {
+            if let Some(h) = self.hwnd() {
+                crate::win32::focus(h);
+            }
+        }
+    }
+
+    fn submit_chat(&mut self) {
+        let text = std::mem::take(&mut self.chat.text);
+        if !text.trim().is_empty() {
+            eprintln!("[you] {text}");
+            let _ = self.utterances.send(text);
+        }
+        self.set_chat(false);
+    }
+
     #[cfg(windows)]
     fn hwnd(&self) -> Option<windows::Win32::Foundation::HWND> {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -192,11 +383,11 @@ impl Overlay {
         #[cfg(not(windows))]
         if let Some(w) = &self.window {
             // Best effort elsewhere: click-through via winit where supported.
-            let _ = w.set_cursor_hittest(self.state.mode == WindowLayerMode::InteractivePet);
+            let _ = w.set_cursor_hittest(self.state.mode == WindowLayerMode::InteractivePet || self.state.typing);
         }
     }
 
-    fn uniforms(&mut self) -> Uniforms {
+    fn frame_params(&mut self, width: u32, height: u32) -> FrameParams {
         let t = self.t0.elapsed().as_secs_f32();
         // Gaze: from the avatar's head on the desktop toward the event.
         let (mut tx, mut ty, mut hx, mut hy) = (0.0, 0.0, 0.0, 0.0);
@@ -208,6 +399,7 @@ impl Overlay {
                 viewer_depth_px: 900.0,
             };
             let look = look_at_event(&self.screen, &place, p);
+            self.anim.look = look;
             let prm = live2d_gaze_params(look);
             (hx, hy, tx, ty) = (prm[0].1 / 30.0, prm[1].1 / 30.0, prm[3].1, prm[4].1);
         }
@@ -218,6 +410,7 @@ impl Overlay {
         self.anim.head[1] += (hy - self.anim.head[1]) * k * 0.5;
         if Instant::now() > self.anim.expression_until {
             self.anim.emotion = EmotionState::Neutral;
+            self.anim.motion = BodyMotion::Idle;
         }
         let (brow, eye_open, base_form) = match self.anim.emotion {
             EmotionState::Joy | EmotionState::Excited => (0.0, 0.9, 0.8),
@@ -228,10 +421,10 @@ impl Overlay {
             EmotionState::Relieved => (-0.2, 0.8, 0.5),
             EmotionState::Neutral => (0.0, 1.0, 0.2),
         };
-        let (mut mouth_open, mut mouth_form) = (0.0, base_form);
+        let (mut mouth_open, mut mouth_form, mut viseme) = (0.0, base_form, Viseme::Rest);
         if self.speaking() {
             let el = self.anim.speech_start.elapsed().as_millis() as u32;
-            let v = self
+            viseme = self
                 .anim
                 .visemes
                 .iter()
@@ -241,7 +434,7 @@ impl Overlay {
                 .unwrap_or(Viseme::Rest);
             // Stand-in for the TTS RMS envelope.
             let rms = 0.25 + 0.2 * (t * 17.0).sin().abs();
-            let m = live2d_mouth(rms, v);
+            let m = live2d_mouth(rms, viseme);
             mouth_open = m[0].1;
             mouth_form = 0.5 * base_form + 0.5 * m[1].1;
         }
@@ -255,25 +448,94 @@ impl Overlay {
                 false
             }
         };
-        // Hover fade (30 %) is applied in the shader so the layered window keeps alpha 255.
-        let alpha = self.state.alpha(hover);
-        Uniforms {
+        // Hover fade (30 %) is applied in the shaders so the layered window keeps alpha 255.
+        FrameParams {
             gaze: self.anim.eye,
             head: self.anim.head,
             mouth_open,
             mouth_form,
             brow,
             eye_open,
-            alpha: alpha as f32 / 255.0,
+            alpha: self.state.alpha(hover) as f32 / 255.0,
             time: t,
-            _pad: [0.0; 2],
+            width,
+            height,
+            emotion: self.anim.emotion,
+            motion: self.anim.motion,
+            viseme,
+            look: self.anim.look,
+            motion_t: self.anim.motion_start.elapsed().as_secs_f32(),
+            lift: 0.0,
         }
     }
 
+    fn emote_show(&self) -> Option<EmoteShow> {
+        let (e, since) = self.anim.emote?;
+        let now = Instant::now();
+        let left = self.anim.expression_until.saturating_duration_since(now).as_secs_f32();
+        let fade = (left / EMOTE_FADE_S).clamp(0.0, 1.0);
+        if fade <= 0.0 {
+            return None;
+        }
+        // The arrow points from Zena's head toward what she looks at.
+        let l = self.anim.look;
+        let angle_deg = if l.yaw_deg.abs() + l.pitch_deg.abs() > 1.0 {
+            l.pitch_deg.atan2(l.yaw_deg).to_degrees()
+        } else {
+            self.anim.gaze.map(|g| g.theta_deg).unwrap_or(0.0)
+        };
+        Some(EmoteShow {
+            emote: e,
+            age: since.elapsed().as_secs_f32(),
+            fade,
+            angle_deg,
+        })
+    }
+
+    fn bubble_alpha(&self) -> f32 {
+        if self.bubble.text.is_empty() {
+            return 0.0;
+        }
+        let end = self.anim.speech_start + Duration::from_millis(self.anim.speech_ms as u64 + BUBBLE_HOLD_MS);
+        let left = end.saturating_duration_since(Instant::now()).as_secs_f32();
+        (left / 0.5).clamp(0.0, 1.0)
+    }
+
     fn render(&mut self) {
-        let u = self.uniforms();
-        let Some(g) = &self.gfx else { return };
-        g.queue.write_buffer(&g.ubuf, 0, bytemuck::bytes_of(&u));
+        let Some((w, h)) = self.gfx.as_ref().map(|g| (g.config.width, g.config.height)) else {
+            return;
+        };
+        for asset in std::mem::take(&mut self.pending) {
+            if let Some(g) = &mut self.gfx {
+                g.scene.load(&g.device, &g.queue, asset);
+            }
+        }
+        let params = self.frame_params(w, h);
+        let emote = self.emote_show();
+        let bubble_alpha = self.bubble_alpha();
+        if bubble_alpha <= 0.0 && !self.speaking() {
+            self.bubble.fresh = true;
+        }
+        let caret = (self.t0.elapsed().as_millis() / 500) % 2 == 0;
+        let Some(g) = &mut self.gfx else { return };
+        let stage = Stage {
+            params,
+            track: self.track,
+            parts: &self.parts,
+            emote,
+            bubble: (bubble_alpha > 0.0).then_some((self.bubble.text.as_str(), bubble_alpha)),
+            input: self
+                .chat
+                .open
+                .then_some((self.chat.text.as_str(), self.chat.preedit.as_str(), caret)),
+        };
+        if let Some(a) = &self.assets {
+            for m in g.scene.missing(&stage) {
+                if self.requested.insert(m.clone()) {
+                    a.request(&m);
+                }
+            }
+        }
         let frame = match g.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
@@ -290,29 +552,12 @@ impl Overlay {
         let mut enc = g
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zena") });
-        {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("avatar"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            rp.set_pipeline(&g.pipeline);
-            rp.set_bind_group(0, &g.bind, &[]);
-            rp.draw(0..3, 0..1);
-        }
+        g.scene.render(&g.device, &g.queue, &mut enc, &view, &g.depth, &stage);
         g.queue.submit([enc.finish()]);
         g.queue.present(frame);
     }
 
-    fn init_gfx(window: Arc<Window>) -> anyhow::Result<Gfx> {
+    fn init_gfx(window: Arc<Window>, font: Option<&std::path::Path>) -> anyhow::Result<Gfx> {
         #[allow(unused_mut)]
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         #[cfg(windows)]
@@ -346,76 +591,44 @@ impl Overlay {
             .unwrap_or(caps.alpha_modes[0]);
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("avatar"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("avatar.wgsl").into()),
-        });
-        let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("u"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ubuf.as_entire_binding(),
-            }],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&bgl)],
-            ..Default::default()
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("avatar"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        eprintln!(
+            "[overlay] {} ({:?}), {}x{} {:?}",
+            adapter.get_info().name,
+            adapter.get_info().backend,
+            config.width,
+            config.height,
+            config.format
+        );
+        let depth = depth_texture(&device, config.width, config.height);
+        let scene = Scene::new(&device, config.format, font);
         Ok(Gfx {
             surface,
             device,
             queue,
             config,
-            pipeline,
-            ubuf,
-            bind,
+            depth,
+            scene,
         })
+    }
+
+    fn on_key(&mut self, ev: &winit::event::KeyEvent) {
+        if !self.chat.open || ev.state != ElementState::Pressed {
+            return;
+        }
+        match &ev.logical_key {
+            Key::Named(NamedKey::Enter) if self.chat.preedit.is_empty() => self.submit_chat(),
+            Key::Named(NamedKey::Escape) => self.set_chat(false),
+            Key::Named(NamedKey::Backspace) if self.chat.preedit.is_empty() => {
+                self.chat.text.pop();
+            }
+            _ => {
+                if let Some(t) = &ev.text {
+                    if self.chat.preedit.is_empty() {
+                        self.chat.text.extend(t.chars().filter(|c| !c.is_control()));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -437,7 +650,7 @@ impl ApplicationHandler<UserEvent> for Overlay {
             attrs.with_skip_taskbar(true)
         };
         let window = Arc::new(el.create_window(attrs).expect("create window"));
-        match Self::init_gfx(window.clone()) {
+        match Self::init_gfx(window.clone(), self.font.as_deref()) {
             Ok(g) => self.gfx = Some(g),
             Err(e) => eprintln!("GPU init failed: {e:#}"),
         }
@@ -459,10 +672,35 @@ impl ApplicationHandler<UserEvent> for Overlay {
                 visemes,
                 speech_ms,
             }) => self.act(&args, level, visemes, speech_ms),
+            UserEvent::Cmd(AvatarCmd::Expression { args, level }) => {
+                // A new streamed answer: its first sentence opens a new bubble.
+                if !self.speaking() {
+                    self.bubble.fresh = true;
+                }
+                self.express(&args, level)
+            }
+            UserEvent::Cmd(AvatarCmd::Speak {
+                text,
+                level,
+                visemes,
+                speech_ms,
+            }) => self.speak(&text, level, visemes, speech_ms),
             UserEvent::Cmd(AvatarCmd::System(c, m)) => self.system(c, m),
+            UserEvent::Cmd(AvatarCmd::Asset(a)) => self.asset(&a),
+            UserEvent::Hotkey(Hotkey::Chat) => {
+                let open = !self.chat.open;
+                self.set_chat(open);
+            }
             UserEvent::Hotkey(h) => {
                 let (c, m) = h.command(&self.state);
                 self.system(c, m);
+            }
+            UserEvent::Asset(a) => self.pending.push(*a),
+            UserEvent::AssetFailed(m) => {
+                eprintln!("[assets] {m:?} unavailable");
+                if let Some(g) = &mut self.gfx {
+                    g.scene.failed.insert(m);
+                }
             }
         }
         if let Some(w) = &self.window {
@@ -478,6 +716,7 @@ impl ApplicationHandler<UserEvent> for Overlay {
                     g.config.width = s.width.max(1);
                     g.config.height = s.height.max(1);
                     g.surface.configure(&g.device, &g.config);
+                    g.depth = depth_texture(&g.device, g.config.width, g.config.height);
                 }
             }
             WindowEvent::MouseInput {
@@ -491,8 +730,20 @@ impl ApplicationHandler<UserEvent> for Overlay {
                     }
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
+            WindowEvent::Ime(Ime::Preedit(text, _)) if self.chat.open => self.chat.preedit = text,
+            WindowEvent::Ime(Ime::Commit(text)) if self.chat.open => {
+                self.chat.preedit.clear();
+                self.chat.text.push_str(&text);
+            }
+            WindowEvent::Focused(false) if self.chat.open => self.set_chat(false),
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
+        }
+        if self.chat.open {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
         if self.shutdown == ShutdownPhase::Exit {
             el.exit();
@@ -516,8 +767,11 @@ impl ApplicationHandler<UserEvent> for Overlay {
             }
             self.shutdown = next;
         }
-        let level = if self.speaking() {
+        let animating = self.emote_show().is_some() || self.bubble_alpha() > 0.0;
+        let level = if self.speaking() || self.chat.open {
             ReactionLevel::Lv3Coaching
+        } else if animating {
+            ReactionLevel::Lv2Cached
         } else {
             self.anim.level.min(ReactionLevel::Lv2Cached)
         };
@@ -533,5 +787,20 @@ impl ApplicationHandler<UserEvent> for Overlay {
         if self.shutdown != ShutdownPhase::Running {
             el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
         }
+        if !animating && !self.speaking() {
+            self.anim.level = ReactionLevel::Lv1Silent;
+        }
+    }
+}
+
+/// Forwards what the asset service produced to the UI thread.
+pub struct OverlayAssets(pub winit::event_loop::EventLoopProxy<UserEvent>);
+
+impl AssetLink for OverlayAssets {
+    fn ready(&self, l: Loaded) {
+        let _ = self.0.send_event(UserEvent::Asset(Box::new(l)));
+    }
+    fn failed(&self, m: Missing) {
+        let _ = self.0.send_event(UserEvent::AssetFailed(m));
     }
 }

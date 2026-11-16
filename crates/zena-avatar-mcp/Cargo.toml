@@ -1,0 +1,18 @@
+[package]
+name = "zena-avatar-mcp"
+description = "Raon Zena dual-track avatar assets: headless MCP (JSON-RPC 2.0 over stdio) client/server, SolidCraft bridge, parametric 3D emote props (glTF), SD chibi emote stamps, VRM metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zena-core = { path = "../zena-core" }
+anyhow = "1"
+serde.workspace = true
+serde_json.workspace = true
+gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "zena-subculture-mcp"
+path = "src/bin/zena-subculture-mcp.rs"

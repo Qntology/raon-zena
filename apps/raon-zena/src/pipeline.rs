@@ -1,10 +1,21 @@
 //! Worker thread: capture → event sensor → tracker → NLP-NMS router (word dictionary) → reaction routing →
 //! dictionary expressions / (Lv3) generation → avatar commands for the UI thread. Every few seconds a downscaled
 //! frame also goes to the screen watcher, whose observations come back as dictionary expressions too.
+//!
+//! Character chat on top of that:
+//! * **multi-turn memory** — the last few exchanges ([`Dialogue`]) and a session summary ([`SessionTracker`]: scene
+//!   time, win/loss streaks, affinity, tension) go into every Lv3 prompt's user turn;
+//! * **streamed tool calls** — [`StreamToAvatar`] turns Raon-1-nano's deltas into an expression first and the line
+//!   sentence by sentence ([`AvatarCmd::Expression`], [`AvatarCmd::Speak`]);
+//! * **proactive chatter** — after a silence Zena says a `proactive.*` dictionary line for the current scene, or
+//!   suggests a break after a long session ([`ProactiveTimer`]);
+//! * **avatar assets** — "로봇 모드로 변신해 줘" / "안경 써 봐" become [`AvatarCmd::Asset`].
+//!
+//! Utterances are handled on every tick, also while the screen is static and the capture has no new frame.
 
 use crate::capture::FrameSource;
 use crate::lexicon::LexiconMsg;
-use crate::llm::{LlmJob, LlmWorker};
+use crate::llm::{JobHandler, LlmJob, LlmWorker};
 use crate::watcher::{ScreenFrame, ScreenObservation};
 use nlp_nms_router::{Caught, Hit, NlpNmsRouter, RouterInput};
 use std::collections::HashMap;
@@ -13,11 +24,11 @@ use std::time::Instant;
 use zena_core::avatar::viseme_timeline;
 use zena_core::cues::{cue, cue_for_reason, CuePlayer};
 use zena_core::geometry::{FlowDirection, ScreenGeometry};
-use zena_core::prompt::{build_fast_path_prompt, Situation};
+use zena_core::prompt::{build_fast_path_prompt, Dialogue, Situation};
 use zena_core::reaction::{Observation, ReactionLevel, ReactionRouter};
-use zena_core::tools::{
-    parse_model_output, BodyMotion, EmotionState, GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAvatarArgs,
-};
+use zena_core::session::{Proactive, ProactiveTimer, SessionTracker};
+use zena_core::stream::{StreamEvent, ToolCallStream};
+use zena_core::tools::{GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAssetArgs, ZenaAvatarArgs};
 use zena_lexicon::{Action, Express, ExpressLevel, Lexicon, VisionKind};
 use zena_sensor::naflex::bgra_to_rgb;
 use zena_sensor::{extract_rois, LogLumSensor, RoiTracker};
@@ -27,14 +38,40 @@ use zena_sensor::{extract_rois, LogLumSensor, RoiTracker};
 pub enum AvatarCmd {
     /// Lv1: look toward an event, no speech.
     Gaze(GazeTarget),
-    /// Lv2/Lv3: full expression with optional speech and its viseme timeline.
+    /// Lv2/Lv3: a whole reaction — expression with optional speech and its viseme timeline (replaces what Zena was
+    /// saying).
     Act {
         args: ZenaAvatarArgs,
         level: ReactionLevel,
         visemes: Vec<(u32, zena_core::avatar::Viseme)>,
         speech_ms: u32,
     },
+    /// Streamed: gaze / emotion / motion / emote to play now; the line follows as [`AvatarCmd::Speak`].
+    Expression {
+        args: ZenaAvatarArgs,
+        level: ReactionLevel,
+    },
+    /// Streamed: the next sentence, queued after what Zena is saying.
+    Speak {
+        text: String,
+        level: ReactionLevel,
+        visemes: Vec<(u32, zena_core::avatar::Viseme)>,
+        speech_ms: u32,
+    },
     System(SystemCommand, Option<WindowLayerMode>),
+    /// Switch the avatar track / put on or take off an accessory.
+    Asset(ZenaAssetArgs),
+}
+
+impl AvatarCmd {
+    /// The words Zena says with this command.
+    pub fn speech(&self) -> Option<&str> {
+        match self {
+            AvatarCmd::Act { args, .. } => args.speech_text.as_deref(),
+            AvatarCmd::Speak { text, .. } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 pub struct PipelineConfig {
@@ -46,6 +83,10 @@ pub struct PipelineConfig {
     pub learn_min: Option<f32>,
     /// Minimum spacing of two dictionary expressions of the same domain.
     pub expression_gap_ms: u64,
+    /// Quiet time before Zena speaks up on her own (0: never).
+    pub proactive_silence_ms: u64,
+    /// Exchanges remembered for Lv3 prompts.
+    pub history_turns: usize,
 }
 
 impl Default for PipelineConfig {
@@ -56,8 +97,17 @@ impl Default for PipelineConfig {
             screen_interval_ms: 3000,
             learn_min: None,
             expression_gap_ms: 1500,
+            proactive_silence_ms: 90_000,
+            history_turns: 4,
         }
     }
+}
+
+/// What Zena answered to a request, reported back by the LLM thread for the dialogue memory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    pub user: Option<String>,
+    pub zena: String,
 }
 
 /// The channels the pipeline talks through besides the frame source.
@@ -71,10 +121,12 @@ pub struct Links {
     /// Frames for the screen watcher and what it saw.
     pub screen_frames: Option<SyncSender<ScreenFrame>>,
     pub screen: Option<Receiver<ScreenObservation>>,
+    /// Zena's Lv3 answers (from [`StreamToAvatar`]).
+    pub replies: Option<Receiver<Reply>>,
 }
 
 /// Rough speaking time for Korean TTS (≈ 7 syllables per second) until real TTS durations exist.
-fn speech_ms(text: &str) -> u32 {
+pub fn speech_ms(text: &str) -> u32 {
     (text.chars().filter(|c| !c.is_whitespace()).count() as u32 * 140).max(400)
 }
 
@@ -109,6 +161,7 @@ impl ExpressionPlayer {
                 gaze_target: gaze,
                 emotion_state: e.emotion,
                 body_motion: e.motion,
+                character_emote: e.emote,
                 speech_text: line,
             },
             level,
@@ -166,6 +219,31 @@ fn topic_context(c: &Caught, lex: &Lexicon, screen: Option<&(String, f32)>) -> V
     out
 }
 
+/// How a caught dictionary domain moves the session summary.
+fn session_signal(session: &mut SessionTracker, key: &str, now: u64) {
+    match key {
+        "emotion.celebrate" => session.victory(now),
+        "emotion.frustrated" => session.defeat(now),
+        "emotion.praise" | "emotion.thanks" => session.affinity(0.08),
+        _ => {}
+    }
+}
+
+/// Sends avatar commands; anything Zena says counts as activity for the proactive timer.
+struct Out<'a> {
+    tx: &'a Sender<AvatarCmd>,
+}
+
+impl Out<'_> {
+    fn send(&self, cmd: AvatarCmd, now: u64, proactive: &mut ProactiveTimer) -> anyhow::Result<()> {
+        if cmd.speech().is_some() {
+            proactive.touch(now);
+        }
+        self.tx.send(cmd)?;
+        Ok(())
+    }
+}
+
 pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cfg: PipelineConfig) -> anyhow::Result<()> {
     let Links {
         llm,
@@ -175,7 +253,9 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
         learn,
         screen_frames,
         screen,
+        replies,
     } = links;
+    let out = Out { tx: &out };
     let (w, h) = src.size();
     let geo = ScreenGeometry::new(w as u32, h as u32);
     let mut sensor = LogLumSensor::new(w, h, cfg.sensor_threshold);
@@ -185,22 +265,33 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
     let mut cues = CuePlayer::default();
     let mut expressions = ExpressionPlayer::default();
     let mut gate = ScreenGate::default();
+    let mut session = SessionTracker::default();
+    let mut dialogue = Dialogue::new(cfg.history_turns);
+    let mut proactive = ProactiveTimer::new(cfg.proactive_silence_ms);
+    let mut scene_link: Option<String> = None;
+    let mut quiet_until = 0u64;
     let mut last_screen: Option<(String, f32)> = None;
     let mut last_frame_sent: Option<u64> = None;
     let t0 = Instant::now();
     eprintln!(
-        "pipeline: {w}x{h} sensor, dictionary revision {} ({} domains), Lv3 backend = {}, screen watcher {}",
+        "pipeline: {w}x{h} sensor, dictionary revision {} ({} domains), Lv3 backend = {}, screen watcher {}, proactive {}",
         lexicon.version,
         router.bank.len(),
         llm.name,
-        if screen_frames.is_some() { "on" } else { "off" }
+        if screen_frames.is_some() { "on" } else { "off" },
+        if cfg.proactive_silence_ms > 0 {
+            format!("after {}s", cfg.proactive_silence_ms / 1000)
+        } else {
+            "off".into()
+        }
     );
     loop {
-        let Some(frame) = src.next_frame()? else {
-            continue;
-        };
-        if (frame.width, frame.height) != (w, h) {
-            anyhow::bail!("frame size changed {}x{} -> {}x{}", w, h, frame.width, frame.height);
+        // A static screen gives no frame; everything but the sensor still runs.
+        let frame = src.next_frame()?;
+        if let Some(f) = &frame {
+            if (f.width, f.height) != (w, h) {
+                anyhow::bail!("frame size changed {}x{} -> {}x{}", w, h, f.width, f.height);
+            }
         }
         let now = t0.elapsed().as_millis() as u64;
 
@@ -211,12 +302,23 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             lexicon = lex;
         }
 
+        // What Zena answered (dialogue memory). Her automatic coaching calls are not conversation: only answers to
+        // the player are remembered, so warnings do not push the exchange out of the window.
+        if let Some(rx) = &replies {
+            for r in rx.try_iter().filter(|r| !r.zena.trim().is_empty()) {
+                proactive.touch(now);
+                if r.user.is_some() {
+                    dialogue.push(r.user.as_deref(), &r.zena);
+                }
+            }
+        }
+
         // Periodic screen sampling: one RGB copy every interval, dropped if the watcher is still busy.
-        if let Some(tx) = &screen_frames {
+        if let (Some(tx), Some(f)) = (&screen_frames, &frame) {
             if last_frame_sent.is_none_or(|t| now.saturating_sub(t) >= cfg.screen_interval_ms) {
                 last_frame_sent = Some(now);
                 let _ = tx.try_send(ScreenFrame {
-                    rgb: bgra_to_rgb(&frame.bgra),
+                    rgb: bgra_to_rgb(&f.bgra),
                     w,
                     h,
                 });
@@ -225,8 +327,27 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
         if let Some(rx) = &screen {
             for o in rx.try_iter() {
                 last_screen = (o.kind != VisionKind::Privacy).then(|| (o.key.clone(), o.score));
+                match o.kind {
+                    VisionKind::Scene => {
+                        let what = lexicon
+                            .vision_node(&o.key)
+                            .map(|v| v.semantic.clone())
+                            .unwrap_or_else(|| o.key.clone());
+                        session.scene(&o.key, &what, now);
+                        scene_link = Some(o.link.clone());
+                    }
+                    VisionKind::Privacy => quiet_until = now + o.cooldown_s as u64 * 1000,
+                    VisionKind::Event => {}
+                }
                 if !gate.admit(&o, now) {
                     continue;
+                }
+                if o.kind == VisionKind::Event {
+                    match o.key.as_str() {
+                        "vision.game_defeat" => session.defeat(now),
+                        "vision.game_victory" => session.victory(now),
+                        _ => {}
+                    }
                 }
                 let Some(e) = lexicon.vision_express(&o.key).cloned() else {
                     continue;
@@ -246,20 +367,29 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
                     o.key, o.cos, o.score, o.tokens, o.cells, o.encode_ms, o.link
                 );
                 if let Some(cmd) = expressions.play(&o.link, &e, gaze, now, cfg.expression_gap_ms) {
-                    out.send(cmd)?;
+                    out.send(cmd, now, &mut proactive)?;
                 }
             }
         }
 
-        let stats = sensor.process_bgra(&frame.bgra);
-        let rois = extract_rois(&stats, &geo, cfg.min_tile_events);
-        let tracks = tracker.update(rois, now).to_vec();
+        let tracks = match &frame {
+            Some(f) => {
+                let stats = sensor.process_bgra(&f.bgra);
+                let rois = extract_rois(&stats, &geo, cfg.min_tile_events);
+                tracker.update(rois, now).to_vec()
+            }
+            None => Vec::new(),
+        };
         let max_energy = tracks.iter().map(|t| t.roi.energy).fold(1.0f32, f32::max);
 
         let mut inputs: Vec<RouterInput> = utterances
             .try_iter()
             .map(|text| RouterInput::Utterance { text, t_ms: now })
             .collect();
+        if !inputs.is_empty() {
+            proactive.touch(now);
+            session.affinity(0.01);
+        }
         for t in tracks.iter().filter(|t| t.age >= 1) {
             let label = match (t.flow, t.roi.polar.r) {
                 (FlowDirection::Inward, r) if r < 0.22 => "근접 위협",
@@ -274,7 +404,11 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
                 t_ms: now,
             });
         }
-        let routed = router.route(inputs, now);
+        let routed = if inputs.is_empty() {
+            Default::default()
+        } else {
+            router.route(inputs, now)
+        };
 
         // Learning: spans the dictionary caught by vectors alone.
         if let (Some(tx), Some(min)) = (&learn, cfg.learn_min) {
@@ -290,6 +424,9 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
                 });
             }
         }
+        for c in &routed.expressions {
+            session_signal(&mut session, &c.key, now);
+        }
         // Dictionary expressions first, then the commands (quitting plays the overlay's own farewell sequence).
         if let Some(c) = routed.expressions.iter().find(|c| {
             !matches!(
@@ -302,12 +439,18 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
         }) {
             if let Some(e) = c.action.express() {
                 if let Some(cmd) = expressions.play(&c.key, e, None, now, cfg.expression_gap_ms) {
-                    out.send(cmd)?;
+                    if let Some(line) = cmd.speech() {
+                        dialogue.push(Some(&c.utterance), line);
+                    }
+                    out.send(cmd, now, &mut proactive)?;
                 }
             }
         }
-        for (c, m) in routed.system {
-            out.send(AvatarCmd::System(c, m))?;
+        for (c, m) in &routed.system {
+            out.send(AvatarCmd::System(*c, *m), now, &mut proactive)?;
+        }
+        for a in &routed.assets {
+            out.send(AvatarCmd::Asset(a.clone()), now, &mut proactive)?;
         }
 
         // Pick the strongest surviving signal for this tick.
@@ -319,7 +462,7 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             // Acknowledge at once (e.g. a thinking pose) while Raon-1-nano answers.
             if let Some(e) = q.action.express() {
                 if let Some(cmd) = expressions.play(&q.key, e, None, now, cfg.expression_gap_ms) {
-                    out.send(cmd)?;
+                    out.send(cmd, now, &mut proactive)?;
                 }
             }
         }
@@ -335,44 +478,79 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             obs.radial_velocity = tr.map(|t| t.radial_velocity).unwrap_or(0.0);
             label = Some(l.clone());
         }
-        if obs.user_query.is_none() && obs.polar.is_none() {
-            continue;
+        if obs.user_query.is_some() || obs.polar.is_some() {
+            let d = reactions.route(&obs, now);
+            if obs.user_query.is_none() && d.level >= ReactionLevel::Lv2Cached {
+                session.combat(obs.energy, now);
+            }
+            match d.level {
+                ReactionLevel::Lv1Silent => {
+                    if let Some(p) = obs.polar {
+                        out.send(
+                            AvatarCmd::Gaze(GazeTarget {
+                                angle_deg: p.theta_deg,
+                                distance_norm: p.r,
+                            }),
+                            now,
+                            &mut proactive,
+                        )?;
+                    }
+                }
+                ReactionLevel::Lv2Cached => {
+                    out.send(cached_cue(&mut cues, d.reason, obs.polar, d.level), now, &mut proactive)?;
+                }
+                ReactionLevel::Lv3Coaching => {
+                    let mut context = Vec::new();
+                    if let Some(q) = &query {
+                        context = topic_context(q, &lexicon, last_screen.as_ref());
+                    }
+                    let sit = Situation {
+                        event_label: label,
+                        polar: obs.polar,
+                        flow: obs.flow,
+                        hp_ratio: obs.hp_ratio,
+                        user_query: obs.user_query.clone(),
+                        context,
+                        history: dialogue.turns(),
+                        session: Some(session.snapshot(now)),
+                    };
+                    let prompt = build_fast_path_prompt(&sit);
+                    eprintln!(
+                        "[lv3] {}{} ({} remembered turns)",
+                        d.reason,
+                        query
+                            .as_ref()
+                            .map(|q| format!(" → {} ({:?} {:.2} on '{}'): {}", q.key, q.hit, q.score, q.span, q.utterance))
+                            .unwrap_or_default(),
+                        sit.history.len()
+                    );
+                    // Generation runs on the LLM thread (loading the model first if it is not resident); if it is
+                    // busy, fall back to an immediate cached cue so Zena still reacts.
+                    if !llm.try_submit(LlmJob {
+                        prompt,
+                        situation: sit,
+                        level: d.level,
+                    }) {
+                        out.send(
+                            cached_cue(&mut cues, d.reason, obs.polar, ReactionLevel::Lv2Cached),
+                            now,
+                            &mut proactive,
+                        )?;
+                    }
+                }
+            }
         }
-        let d = reactions.route(&obs, now);
-        match d.level {
-            ReactionLevel::Lv1Silent => {
-                if let Some(p) = obs.polar {
-                    out.send(AvatarCmd::Gaze(GazeTarget {
-                        angle_deg: p.theta_deg,
-                        distance_norm: p.r,
-                    }))?;
-                }
-            }
-            ReactionLevel::Lv2Cached => {
-                out.send(cached_cue(&mut cues, d.reason, obs.polar, d.level))?;
-            }
-            ReactionLevel::Lv3Coaching => {
-                let mut context = Vec::new();
-                if let Some(q) = &query {
-                    context = topic_context(q, &lexicon, last_screen.as_ref());
-                }
-                let sit = Situation {
-                    event_label: label,
-                    polar: obs.polar,
-                    flow: obs.flow,
-                    hp_ratio: obs.hp_ratio,
-                    user_query: obs.user_query.clone(),
-                    context,
-                };
-                let prompt = build_fast_path_prompt(&sit);
-                // Generation runs on the LLM thread (loading the model first if it is not resident); if it is
-                // busy, fall back to an immediate cached cue so Zena still reacts.
-                if !llm.try_submit(LlmJob {
-                    prompt,
-                    situation: sit,
-                    level: d.level,
-                }) {
-                    out.send(cached_cue(&mut cues, d.reason, obs.polar, ReactionLevel::Lv2Cached))?;
+
+        // Nothing has happened for a while: Zena speaks up on her own.
+        if let Some(kind) = proactive.due(now, session.scene_ms(now), now < quiet_until) {
+            if let Some((key, e)) = lexicon.proactive(scene_link.as_deref(), kind == Proactive::Break) {
+                let (key, e) = (key.to_string(), e.clone());
+                if let Some(cmd) = expressions.play(&key, &e, None, now, 0) {
+                    if let Some(line) = cmd.speech() {
+                        eprintln!("[proactive] {key}");
+                        dialogue.push(None, line);
+                    }
+                    out.send(cmd, now, &mut proactive)?;
                 }
             }
         }
@@ -393,6 +571,7 @@ fn cached_cue(cues: &mut CuePlayer, reason: &str, polar: Option<zena_core::Polar
             emotion_state: c.emotion,
             body_motion: c.motion,
             speech_text: Some(line.clone()),
+            ..Default::default()
         },
         level,
         visemes: viseme_timeline(&line, ms),
@@ -400,66 +579,137 @@ fn cached_cue(cues: &mut CuePlayer, reason: &str, polar: Option<zena_core::Polar
     }
 }
 
-/// Turn a model completion into avatar commands (runs on the LLM thread).
-pub fn completion_to_cmds(completion: &str, level: ReactionLevel) -> Vec<AvatarCmd> {
-    let mut cmds = Vec::new();
-    let parsed = parse_model_output(completion);
-    if parsed.calls.is_empty() && !parsed.preamble.is_empty() {
-        // A plain-text answer (no tool call): speak it with a neutral expression.
-        let args = ZenaAvatarArgs {
-            gaze_target: None,
-            emotion_state: EmotionState::Neutral,
-            body_motion: BodyMotion::Nod,
-            speech_text: None,
-        };
-        let args = ToolCall::ControlZenaAvatar(ZenaAvatarArgs {
-            speech_text: Some(parsed.preamble.clone()),
-            ..args
-        })
-        .sanitized();
-        if let ToolCall::ControlZenaAvatar(args) = args {
-            let text = args.speech_text.clone().unwrap_or_default();
+/// One streamed event as an avatar command.
+pub fn event_cmd(ev: StreamEvent, level: ReactionLevel) -> Option<AvatarCmd> {
+    match ev {
+        StreamEvent::Expression(args) | StreamEvent::Call(ToolCall::ControlZenaAvatar(args)) => Some(AvatarCmd::Expression { args, level }),
+        StreamEvent::Speech(text) => {
             let ms = speech_ms(&text);
-            cmds.push(AvatarCmd::Act {
+            Some(AvatarCmd::Speak {
                 visemes: viseme_timeline(&text, ms),
                 speech_ms: ms,
-                args,
+                text,
                 level,
+            })
+        }
+        StreamEvent::Call(ToolCall::ManageZenaSystem(s)) => Some(AvatarCmd::System(s.command, s.window_layer_mode)),
+        StreamEvent::Call(ToolCall::ManageAvatarAsset(a)) => Some(AvatarCmd::Asset(a)),
+        StreamEvent::Rejected { name, error } => {
+            eprintln!("[llm] rejected tool call {name}: {error}");
+            None
+        }
+    }
+}
+
+/// Turn a whole model completion into avatar commands (the same commands streaming produces).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn completion_to_cmds(completion: &str, level: ReactionLevel) -> Vec<AvatarCmd> {
+    let mut s = ToolCallStream::new();
+    let mut ev = s.push(completion);
+    ev.extend(s.finish());
+    ev.into_iter().filter_map(|e| event_cmd(e, level)).collect()
+}
+
+/// The LLM thread's handler: parses the completion while it streams and sends avatar commands at once — the
+/// expression as soon as its parameters close, the line sentence by sentence — then reports the answer for the
+/// dialogue memory.
+pub struct StreamToAvatar {
+    out: Sender<AvatarCmd>,
+    replies: Option<Sender<Reply>>,
+    stream: ToolCallStream,
+    streamed: bool,
+}
+
+impl StreamToAvatar {
+    pub fn new(out: Sender<AvatarCmd>, replies: Option<Sender<Reply>>) -> Self {
+        Self {
+            out,
+            replies,
+            stream: ToolCallStream::new(),
+            streamed: false,
+        }
+    }
+
+    fn emit(&self, events: Vec<StreamEvent>, level: ReactionLevel) {
+        for cmd in events.into_iter().filter_map(|e| event_cmd(e, level)) {
+            let _ = self.out.send(cmd);
+        }
+    }
+}
+
+impl JobHandler for StreamToAvatar {
+    fn delta(&mut self, job: &LlmJob, text: &str) {
+        self.streamed = true;
+        let ev = self.stream.push(text);
+        self.emit(ev, job.level);
+    }
+
+    fn done(&mut self, job: LlmJob, text: String) {
+        let mut ev = if self.streamed { Vec::new() } else { self.stream.push(&text) };
+        ev.extend(self.stream.finish());
+        self.emit(ev, job.level);
+        if let Some(tx) = &self.replies {
+            let _ = tx.send(Reply {
+                user: job.situation.user_query.clone(),
+                zena: self.stream.spoken().to_string(),
             });
         }
-        return cmds;
+        self.stream = ToolCallStream::new();
+        self.streamed = false;
     }
-    for call in parsed.calls {
-        match call {
-            ToolCall::ControlZenaAvatar(args) => {
-                let text = args.speech_text.clone().unwrap_or_default();
-                let ms = speech_ms(&text);
-                cmds.push(AvatarCmd::Act {
-                    visemes: viseme_timeline(&text, ms),
-                    speech_ms: ms,
-                    args,
-                    level,
-                });
-            }
-            ToolCall::ManageZenaSystem(s) => cmds.push(AvatarCmd::System(s.command, s.window_layer_mode)),
-        }
-    }
-    cmds
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{LlmBackend, OnDone, TemplateBackend};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    use zena_core::tools::{AssetAction, AvatarTrack, BodyMotion, EmotionState};
 
     #[test]
     fn plain_text_completion_is_spoken_and_tool_calls_are_mapped() {
         let c = completion_to_cmds("인벤토리 한번 같이 찾아볼까?", ReactionLevel::Lv3Coaching);
-        assert!(matches!(&c[..], [AvatarCmd::Act { args, .. }] if args.speech_text.as_deref() == Some("인벤토리 한번 같이 찾아볼까?")));
+        assert!(matches!(&c[0], AvatarCmd::Expression { args, .. } if args.body_motion == BodyMotion::Nod));
+        assert!(matches!(&c[1], AvatarCmd::Speak { text, .. } if text == "인벤토리 한번 같이 찾아볼까?"));
         let c = completion_to_cmds(
             "<tool_call>\n<function=manage_zena_system>\n<parameter=command>\nEXIT_APP\n</parameter>\n</function>\n</tool_call>",
             ReactionLevel::Lv3Coaching,
         );
         assert!(matches!(&c[..], [AvatarCmd::System(SystemCommand::ExitApp, None)]));
+        let c = completion_to_cmds(
+            "<tool_call>\n<function=manage_avatar_asset>\n<parameter=action>\nSWITCH_TRACK\n</parameter>\n<parameter=track>\nSOLIDCRAFT\n</parameter>\n</function>\n</tool_call>",
+            ReactionLevel::Lv3Coaching,
+        );
+        assert!(matches!(&c[..], [AvatarCmd::Asset(a)] if a.track == Some(AvatarTrack::Solidcraft)));
+    }
+
+    #[test]
+    fn streamed_generation_shows_the_expression_before_the_line_and_reports_the_reply() {
+        let (otx, orx) = channel();
+        let (rtx, rrx) = channel();
+        let w = LlmWorker::spawn(Box::new(TemplateBackend), StreamToAvatar::new(otx, Some(rtx)));
+        let sit = Situation {
+            user_query: Some("보스 패턴 어떻게 피해?".into()),
+            ..Default::default()
+        };
+        let job = || LlmJob {
+            prompt: String::new(),
+            situation: sit.clone(),
+            level: ReactionLevel::Lv3Coaching,
+        };
+        while !w.try_submit(job()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let reply = rrx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(reply.user.as_deref(), Some("보스 패턴 어떻게 피해?"));
+        assert!(reply.zena.contains("반격"), "{reply:?}");
+        let cmds: Vec<AvatarCmd> = orx.try_iter().collect();
+        let first_expr = cmds.iter().position(|c| matches!(c, AvatarCmd::Expression { .. })).unwrap();
+        let first_speak = cmds.iter().position(|c| matches!(c, AvatarCmd::Speak { .. })).unwrap();
+        assert!(first_expr < first_speak, "{cmds:?}");
+        let spoken: Vec<&str> = cmds.iter().filter_map(AvatarCmd::speech).collect();
+        assert_eq!(spoken.join(" "), reply.zena);
     }
 
     #[test]
@@ -481,6 +731,18 @@ mod tests {
             line(p.play("react.combat", &silent, None, 0, 1500)),
             (None, ReactionLevel::Lv1Silent)
         );
+        match p.play(
+            "emotion.praise",
+            lex.node("emotion.praise").unwrap().action.express().unwrap(),
+            None,
+            0,
+            0,
+        ) {
+            Some(AvatarCmd::Act { args, .. }) => {
+                assert_eq!(args.character_emote, Some(zena_core::tools::CharacterEmote::ChibiHeart))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -510,23 +772,51 @@ mod tests {
         assert!(g.admit(&obs("vision.game_victory", VisionKind::Event, 20), 31_000));
     }
 
-    #[test]
-    fn utterances_and_screen_observations_become_dictionary_expressions() {
-        use std::sync::mpsc::channel;
-        use std::time::Duration;
+    /// A screen that never changes: the capture never has a new frame.
+    struct StaticScreen;
+    impl FrameSource for StaticScreen {
+        fn next_frame(&mut self) -> anyhow::Result<Option<crate::capture::Frame>> {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(None)
+        }
+        fn size(&self) -> (usize, usize) {
+            (160, 90)
+        }
+    }
+
+    /// Records every Lv3 situation it is asked about and answers with the template.
+    struct Recorder(Sender<Situation>);
+    impl LlmBackend for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+        fn generate(&mut self, p: &str, s: &Situation, on_text: &mut dyn FnMut(&str)) -> String {
+            let _ = self.0.send(s.clone());
+            TemplateBackend.generate(p, s, on_text)
+        }
+    }
+
+    fn links(llm: LlmWorker) -> (Links, Sender<String>, Receiver<AvatarCmd>, Sender<ScreenObservation>) {
         let (utx, urx) = channel();
         let (otx, orx) = channel();
         let (_ltx, lrx) = channel();
         let (stx, srx) = channel();
         let links = Links {
-            llm: LlmWorker::spawn(Box::new(crate::llm::TemplateBackend), |_, _| {}),
+            llm,
             utterances: urx,
             out: otx,
             lexicon: lrx,
             learn: None,
             screen_frames: None,
             screen: Some(srx),
+            replies: None,
         };
+        (links, utx, orx, stx)
+    }
+
+    #[test]
+    fn utterances_and_screen_observations_become_dictionary_expressions() {
+        let (links, utx, orx, stx) = links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
         let src = Box::new(crate::capture::SyntheticSource::new(160, 90));
         std::thread::spawn(move || run(src, links, Lexicon::bundled(), PipelineConfig::default()));
         utx.send("와 보스 잡았다! 이겼어!".to_string()).unwrap();
@@ -557,5 +847,73 @@ mod tests {
         }
         assert!(cheered, "the user's win is played from the dictionary");
         assert!(chart, "the chart on screen is played from react.market, looking at its peak");
+    }
+
+    #[test]
+    fn chat_works_on_a_static_screen_and_remembers_the_previous_exchange() {
+        let (stx, srx) = channel();
+        let (otx, _orx) = channel::<AvatarCmd>();
+        let (rtx, rrx) = channel();
+        let llm = LlmWorker::spawn(Box::new(Recorder(stx)), StreamToAvatar::new(otx, Some(rtx)));
+        let (mut links, utx, orx, _screen) = links(llm);
+        links.replies = Some(rrx);
+        std::thread::spawn(move || run(Box::new(StaticScreen), links, Lexicon::bundled(), PipelineConfig::default()));
+        utx.send("제나야 보스 패턴 어떻게 피해?".into()).unwrap();
+        let first = srx.recv_timeout(Duration::from_secs(5)).expect("handled without any frame");
+        assert!(first.history.is_empty());
+        assert!(first.session.is_some());
+        std::thread::sleep(Duration::from_millis(300));
+        utx.send("제나야 인벤토리 어디 있어?".into()).unwrap();
+        let second = srx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(second.history.len(), 1, "{:?}", second.history);
+        assert!(second.history[0].user.as_deref().unwrap().contains("보스 패턴"));
+        assert!(!second.history[0].zena.is_empty());
+        let prompt = build_fast_path_prompt(&second);
+        assert!(prompt.contains("[최근 대화]"));
+        drop(orx);
+    }
+
+    #[test]
+    fn zena_speaks_up_after_a_silence_and_switches_assets_on_request() {
+        let (links, utx, orx, stx) = links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
+        let cfg = PipelineConfig {
+            proactive_silence_ms: 400,
+            ..Default::default()
+        };
+        std::thread::spawn(move || run(Box::new(StaticScreen), links, Lexicon::bundled(), cfg));
+        stx.send(ScreenObservation {
+            key: "vision.coding".into(),
+            kind: VisionKind::Scene,
+            link: "react.coding".into(),
+            score: 0.8,
+            cos: 0.14,
+            peak: None,
+            cooldown_s: 600,
+            encode_ms: 0.0,
+            tokens: 0,
+            cells: 0,
+        })
+        .unwrap();
+        let lex = Lexicon::bundled();
+        let coding_lines = &lex.node("proactive.coding").unwrap().action.express().unwrap().lines;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut proactive_line = None;
+        while std::time::Instant::now() < deadline && proactive_line.is_none() {
+            if let Ok(AvatarCmd::Act { args, .. }) = orx.recv_timeout(Duration::from_millis(100)) {
+                if let Some(s) = args.speech_text.filter(|s| coding_lines.contains(s)) {
+                    proactive_line = Some(s);
+                }
+            }
+        }
+        assert!(proactive_line.is_some(), "a proactive.coding line after the silence");
+        utx.send("제나야 로봇 모드로 변신해 줘".into()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut switched = false;
+        while std::time::Instant::now() < deadline && !switched {
+            if let Ok(AvatarCmd::Asset(a)) = orx.recv_timeout(Duration::from_millis(100)) {
+                switched = a.action == AssetAction::SwitchTrack && a.track == Some(AvatarTrack::Solidcraft);
+            }
+        }
+        assert!(switched);
     }
 }

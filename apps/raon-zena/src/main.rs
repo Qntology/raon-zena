@@ -11,15 +11,27 @@
 //!           [--screen-pass auto|full|checker|fovea|checker-x|fovea-x] [--screen-format f32|f16|bf16|q8]
 //!           [--screen-device auto|cpu|cuda|rocm|vulkan|metal]
 //!           [--vision out/raon-ve-vision.pyramid.gguf]   (residency report only)
+//!           [--proactive SECS]                      quiet time before Zena speaks up on her own (0: never; default 90)
+//!           [--history N]                           exchanges remembered for Lv3 prompts (default 4)
+//!           [--track procedural|solidcraft|subculture-2d|subculture-3d]   the avatar body to start with
+//!           [--vrm model.vrm] [--chibi-kit DIR]     Track B assets (3D VRM body, layered 2D SD parts)
+//!           [--solidcraft PATH | --no-solidcraft]   SolidCraft CLI for Track A (default: found on PATH / Program Files)
+//!           [--no-subculture-mcp]                   build Track B assets in-process instead of over MCP
+//!           [--asset-cache DIR] [--font FONT.ttf]
+//!           [--snapshot DIR]                        render scripted moments headless to PNGs and exit
 //! ```
 //! Build with `--features cuda` / `rocm` / `vulkan` / `metal` (+ `flash-attn`) to accelerate the LLM and the screen
-//! encoder. Type a line on stdin to talk to Zena while it runs (voice input is not wired yet).
+//! encoder. Talk to Zena in the overlay's chat box (`Ctrl+Shift+T`, Enter to send, Esc to close) or type a line on
+//! stdin (voice input is not wired yet).
 
+mod assets;
 mod capture;
 mod lexicon;
 mod llm;
 mod overlay;
 mod pipeline;
+mod renderers;
+mod snapshot;
 mod watcher;
 #[cfg(windows)]
 mod win32;
@@ -54,6 +66,26 @@ struct Args {
     screen_pass: String,
     screen_format: Option<raon_vision::WeightFormat>,
     screen_device: raon_infer::device::Backend,
+    proactive_s: u64,
+    history: usize,
+    track: zena_core::tools::AvatarTrack,
+    vrm: Option<PathBuf>,
+    chibi_kit: Option<PathBuf>,
+    solidcraft: Option<PathBuf>,
+    subculture_mcp: bool,
+    asset_cache: PathBuf,
+    font: Option<PathBuf>,
+    snapshot: Option<PathBuf>,
+}
+
+fn parse_track(s: &str) -> zena_core::tools::AvatarTrack {
+    use zena_core::tools::AvatarTrack as T;
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "solidcraft" | "robot" | "a" => T::Solidcraft,
+        "subculture-2d" | "2d" | "b1" => T::Subculture2d,
+        "subculture-3d" | "3d" | "vrm" | "b2" => T::Subculture3d,
+        _ => T::Procedural,
+    }
 }
 
 fn args() -> Args {
@@ -77,6 +109,16 @@ fn args() -> Args {
         screen_pass: "auto".into(),
         screen_format: None,
         screen_device: raon_infer::device::Backend::Auto,
+        proactive_s: 90,
+        history: 4,
+        track: zena_core::tools::AvatarTrack::Procedural,
+        vrm: None,
+        chibi_kit: None,
+        solidcraft: zena_avatar_mcp::solidcraft::find_solidcraft(),
+        subculture_mcp: true,
+        asset_cache: assets::default_cache(),
+        font: None,
+        snapshot: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -107,6 +149,17 @@ fn args() -> Args {
             "--screen-pass" => a.screen_pass = it.next().unwrap_or_else(|| "auto".into()),
             "--screen-format" => a.screen_format = it.next().and_then(|v| v.parse().ok()),
             "--screen-device" => a.screen_device = it.next().unwrap_or_default().parse().unwrap_or(raon_infer::device::Backend::Auto),
+            "--proactive" => a.proactive_s = it.next().and_then(|v| v.parse().ok()).unwrap_or(90),
+            "--history" => a.history = it.next().and_then(|v| v.parse().ok()).unwrap_or(4),
+            "--track" => a.track = parse_track(&it.next().unwrap_or_default()),
+            "--vrm" => a.vrm = it.next().map(PathBuf::from),
+            "--chibi-kit" => a.chibi_kit = it.next().map(PathBuf::from),
+            "--solidcraft" => a.solidcraft = it.next().map(PathBuf::from),
+            "--no-solidcraft" => a.solidcraft = None,
+            "--no-subculture-mcp" => a.subculture_mcp = false,
+            "--asset-cache" => a.asset_cache = it.next().map(PathBuf::from).unwrap_or_else(assets::default_cache),
+            "--font" => a.font = it.next().map(PathBuf::from),
+            "--snapshot" => a.snapshot = it.next().map(PathBuf::from),
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -155,6 +208,9 @@ mod serde_json_lite {
 
 fn main() -> Result<()> {
     let a = args();
+    if let Some(dir) = &a.snapshot {
+        return snapshot::run(dir, a.font.as_deref());
+    }
     // PRD §3.5: verify the fused kernels before enabling them.
     let checks = raon_quant::kernels::verify_kernels(1e-3);
     if checks.iter().any(|c| !c.ok) {
@@ -192,13 +248,16 @@ fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
 
     let (utx, urx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-            if utx.send(line).is_err() {
-                break;
+    {
+        let utx = utx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                if utx.send(line).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
     let (ctx, crx) = mpsc::channel::<pipeline::AvatarCmd>();
 
     // The word dictionary: LanceDB (seeded from the JSON on first run) or the JSON itself.
@@ -255,14 +314,10 @@ fn main() -> Result<()> {
     // Lv3 backend: Raon-1-nano when a model is given (CPU / CUDA / ROCm / Vulkan / Metal through the
     // candle-rocm-vulkan fork, chosen by --llm-device), loaded on demand and dropped when idle; otherwise the
     // template stub.
-    let on_done = {
-        let ctx = ctx.clone();
-        move |job: llm::LlmJob, text: String| {
-            for cmd in pipeline::completion_to_cmds(&text, job.level) {
-                let _ = ctx.send(cmd);
-            }
-        }
-    };
+    // The completion is parsed while it streams: the expression is shown as soon as its parameters close and the
+    // line is spoken sentence by sentence; the answer goes back to the pipeline's dialogue memory.
+    let (reply_tx, reply_rx) = mpsc::channel::<pipeline::Reply>();
+    let on_done = pipeline::StreamToAvatar::new(ctx.clone(), Some(reply_tx));
     let worker = match &a.model {
         Some(model) => {
             let tok = a.tokenizer.clone().unwrap_or_else(|| {
@@ -309,10 +364,13 @@ fn main() -> Result<()> {
             learn: if a.learn { learn_tx } else { None },
             screen_frames: screen_on.then_some(frame_tx),
             screen: screen_on.then_some(obs_rx),
+            replies: Some(reply_rx),
         };
         let cfg = pipeline::PipelineConfig {
             screen_interval_ms: (a.screen_every * 1000.0) as u64,
             learn_min: a.learn.then_some(0.75),
+            proactive_silence_ms: a.proactive_s * 1000,
+            history_turns: a.history,
             ..Default::default()
         };
         let lexicon = loaded.lexicon;
@@ -342,7 +400,31 @@ fn main() -> Result<()> {
             let _ = proxy.send_event(overlay::UserEvent::Hotkey(h));
         });
     }
-    let mut app = overlay::Overlay::new(running, screen);
+    // Dual-track assets: SolidCraft (Track A) and zena-subculture-mcp (Track B) over MCP in the background, built
+    // in-process when they are not available.
+    let assets = assets::Assets::spawn(
+        zena_avatar_mcp::service::ServiceConfig {
+            cache_dir: a.asset_cache.clone(),
+            solidcraft: a.solidcraft.clone(),
+            subculture_mcp: if a.subculture_mcp { assets::sibling_server() } else { None },
+            vrm_path: a.vrm.clone(),
+            chibi_kit: a.chibi_kit.clone(),
+            stamp_frames: 8,
+        },
+        overlay::OverlayAssets(proxy.clone()),
+    );
+    eprintln!(
+        "[assets] track {:?}; SolidCraft {}; cache {}",
+        a.track,
+        a.solidcraft
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found (built-in forge)".into()),
+        a.asset_cache.display()
+    );
+    let mut app = overlay::Overlay::new(running, screen, utx)
+        .with_assets(assets, a.track)
+        .with_font(a.font.clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }

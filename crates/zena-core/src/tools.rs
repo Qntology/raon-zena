@@ -1,5 +1,9 @@
 //! Tool-call schema shared by Raon-1-nano, the avatar adapter and the window controller.
 //!
+//! Three tools: `control_zena_avatar` (gaze, emotion, motion, a character emote and a short line),
+//! `manage_zena_system` (window/app state) and `manage_avatar_asset` (which avatar track is shown and which
+//! accessory parts it wears — the dual-track SolidCraft / subculture pipeline of `zena-avatar-mcp`).
+//!
 //! Two wire formats are accepted:
 //! * the JSON envelope of PRD §4.1 (`{"tool_calls":[{"name":…,"arguments":{…}}]}`), and
 //! * Raon-1-nano's native chat-template format:
@@ -66,6 +70,205 @@ pub enum WindowLayerMode {
     InteractivePet,
 }
 
+/// How a [`CharacterEmote`] is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmoteForm {
+    /// A 2D SD (chibi) stamp of Zena herself, composed from her parts (Track B-1).
+    Stamp,
+    /// A 3D comic prop on the head socket — parametric mesh from SolidCraft or the built-in forge (Track A).
+    Prop,
+    /// A comic face morph (VRM expression) with a stamp fallback on the other tracks (Track B-2).
+    Morph,
+}
+
+/// Character-specific emotes: not Unicode emoji but Zena's own SD stamps, 3D comic props and comic face morphs,
+/// tied to her [`EmotionState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CharacterEmote {
+    /// SD Zena jumping with both arms up.
+    ChibiCheer,
+    /// SD Zena hugging a heart.
+    ChibiHeart,
+    /// 3D anger cross-popping vein mark.
+    #[serde(rename = "COMIC_ANGER_3D")]
+    ComicAnger3d,
+    /// Sweat drops (panic).
+    SweatPanic,
+    /// A 3D light bulb with sparkles (an idea / a tip).
+    SparkleIdea,
+    /// A 3D exclamation mark.
+    #[serde(rename = "EXCLAIM_3D")]
+    Exclaim3d,
+    /// A question mark (thinking, confused).
+    Question,
+    /// A 3D coaching arrow pointing along the gaze target's angle.
+    #[serde(rename = "THREAT_ARROW_3D")]
+    ThreatArrow3d,
+    /// Streaming tears.
+    Tears,
+    /// Star-shaped eyes.
+    StarEyes,
+    /// Heart-shaped eyes.
+    HeartEyes,
+    /// Spiral eyes (dizzy, defeated).
+    DizzySpiral,
+    /// A puff of relief.
+    ReliefSigh,
+    /// Floating music notes (humming, idle mood).
+    MusicNote,
+}
+
+impl CharacterEmote {
+    pub const ALL: [CharacterEmote; 14] = [
+        CharacterEmote::ChibiCheer,
+        CharacterEmote::ChibiHeart,
+        CharacterEmote::ComicAnger3d,
+        CharacterEmote::SweatPanic,
+        CharacterEmote::SparkleIdea,
+        CharacterEmote::Exclaim3d,
+        CharacterEmote::Question,
+        CharacterEmote::ThreatArrow3d,
+        CharacterEmote::Tears,
+        CharacterEmote::StarEyes,
+        CharacterEmote::HeartEyes,
+        CharacterEmote::DizzySpiral,
+        CharacterEmote::ReliefSigh,
+        CharacterEmote::MusicNote,
+    ];
+
+    /// The wire name (`CHIBI_CHEER`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            CharacterEmote::ChibiCheer => "CHIBI_CHEER",
+            CharacterEmote::ChibiHeart => "CHIBI_HEART",
+            CharacterEmote::ComicAnger3d => "COMIC_ANGER_3D",
+            CharacterEmote::SweatPanic => "SWEAT_PANIC",
+            CharacterEmote::SparkleIdea => "SPARKLE_IDEA",
+            CharacterEmote::Exclaim3d => "EXCLAIM_3D",
+            CharacterEmote::Question => "QUESTION",
+            CharacterEmote::ThreatArrow3d => "THREAT_ARROW_3D",
+            CharacterEmote::Tears => "TEARS",
+            CharacterEmote::StarEyes => "STAR_EYES",
+            CharacterEmote::HeartEyes => "HEART_EYES",
+            CharacterEmote::DizzySpiral => "DIZZY_SPIRAL",
+            CharacterEmote::ReliefSigh => "RELIEF_SIGH",
+            CharacterEmote::MusicNote => "MUSIC_NOTE",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<CharacterEmote> {
+        let s = s.trim();
+        CharacterEmote::ALL.into_iter().find(|e| e.name().eq_ignore_ascii_case(s))
+    }
+
+    /// Stable index (shader slot, atlas row).
+    pub fn index(self) -> usize {
+        CharacterEmote::ALL.iter().position(|e| *e == self).expect("in ALL")
+    }
+
+    pub fn form(self) -> EmoteForm {
+        match self {
+            CharacterEmote::ComicAnger3d | CharacterEmote::SparkleIdea | CharacterEmote::Exclaim3d | CharacterEmote::ThreatArrow3d => {
+                EmoteForm::Prop
+            }
+            CharacterEmote::StarEyes | CharacterEmote::HeartEyes | CharacterEmote::DizzySpiral | CharacterEmote::Tears => EmoteForm::Morph,
+            _ => EmoteForm::Stamp,
+        }
+    }
+
+    /// The comic VRM expression this emote drives on a 3D subculture body (custom expressions by convention).
+    pub fn comic_morph(self) -> Option<&'static str> {
+        Some(match self {
+            CharacterEmote::StarEyes => "star_eyes",
+            CharacterEmote::HeartEyes => "heart_eyes",
+            CharacterEmote::DizzySpiral => "dizzy_spiral",
+            CharacterEmote::Tears => "tears",
+            CharacterEmote::ComicAnger3d => "angry_mark",
+            CharacterEmote::SweatPanic => "sweat",
+            _ => return None,
+        })
+    }
+
+    /// The emote Zena shows for an expression when none was chosen explicitly.
+    pub fn for_expression(e: EmotionState, m: BodyMotion) -> Option<CharacterEmote> {
+        use BodyMotion as M;
+        use EmotionState as E;
+        match (e, m) {
+            (E::SurprisedUrgent | E::Focused, M::LeanForwardPoint) => Some(CharacterEmote::ThreatArrow3d),
+            (_, M::Think) => Some(CharacterEmote::Question),
+            (E::Joy, M::Clap) => Some(CharacterEmote::ChibiHeart),
+            (E::Joy | E::Excited, M::Cheer | M::Clap) => Some(CharacterEmote::ChibiCheer),
+            (E::Excited, _) => Some(CharacterEmote::StarEyes),
+            (E::Joy, _) => Some(CharacterEmote::MusicNote),
+            (E::Surprised, _) => Some(CharacterEmote::Exclaim3d),
+            (E::SurprisedUrgent | E::Worried, _) => Some(CharacterEmote::SweatPanic),
+            (E::Angry, _) => Some(CharacterEmote::ComicAnger3d),
+            (E::Sorrow, _) => Some(CharacterEmote::Tears),
+            (E::Focused, _) => Some(CharacterEmote::SparkleIdea),
+            (E::Relieved, _) => Some(CharacterEmote::ReliefSigh),
+            (E::Neutral, _) => None,
+        }
+    }
+}
+
+/// Which avatar body is shown (dual-track asset pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AvatarTrack {
+    /// The built-in procedural face (no assets).
+    Procedural,
+    /// Track A: a parametric hard-surface (robot / toy) Zena from SolidCraft (`.glb`).
+    Solidcraft,
+    /// Track B-1: 2D subculture Zena from layered PNG parts.
+    #[serde(rename = "SUBCULTURE_2D")]
+    Subculture2d,
+    /// Track B-2: 3D subculture Zena (`.vrm`).
+    #[serde(rename = "SUBCULTURE_3D")]
+    Subculture3d,
+}
+
+/// Accessory parts the asset tracks can attach to the head socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AvatarPart {
+    Headset,
+    Glasses,
+    CatEars,
+    Ribbon,
+}
+
+impl AvatarPart {
+    pub const ALL: [AvatarPart; 4] = [AvatarPart::Headset, AvatarPart::Glasses, AvatarPart::CatEars, AvatarPart::Ribbon];
+    pub fn name(self) -> &'static str {
+        match self {
+            AvatarPart::Headset => "HEADSET",
+            AvatarPart::Glasses => "GLASSES",
+            AvatarPart::CatEars => "CAT_EARS",
+            AvatarPart::Ribbon => "RIBBON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssetAction {
+    SwitchTrack,
+    EquipPart,
+    RemovePart,
+    ResetParts,
+}
+
+/// `manage_avatar_asset` arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZenaAssetArgs {
+    pub action: AssetAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<AvatarTrack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<AvatarPart>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZenaAvatarArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,8 +277,36 @@ pub struct ZenaAvatarArgs {
     pub emotion_state: EmotionState,
     #[serde(default = "idle")]
     pub body_motion: BodyMotion,
+    /// Zena's own emote; unknown names are dropped (the expression's default emote is shown instead).
+    #[serde(default, deserialize_with = "lenient_emote", skip_serializing_if = "Option::is_none")]
+    pub character_emote: Option<CharacterEmote>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech_text: Option<String>,
+}
+
+impl Default for ZenaAvatarArgs {
+    fn default() -> Self {
+        Self {
+            gaze_target: None,
+            emotion_state: EmotionState::Neutral,
+            body_motion: BodyMotion::Idle,
+            character_emote: None,
+            speech_text: None,
+        }
+    }
+}
+
+impl ZenaAvatarArgs {
+    /// The emote to show: the chosen one, else the expression's default.
+    pub fn emote(&self) -> Option<CharacterEmote> {
+        self.character_emote
+            .or_else(|| CharacterEmote::for_expression(self.emotion_state, self.body_motion))
+    }
+}
+
+fn lenient_emote<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<CharacterEmote>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(v.as_ref().and_then(Value::as_str).and_then(CharacterEmote::parse))
 }
 
 fn neutral() -> EmotionState {
@@ -97,6 +328,7 @@ pub struct ZenaSystemArgs {
 pub enum ToolCall {
     ControlZenaAvatar(ZenaAvatarArgs),
     ManageZenaSystem(ZenaSystemArgs),
+    ManageAvatarAsset(ZenaAssetArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -135,7 +367,7 @@ impl ToolCall {
     }
 }
 
-fn truncate_speech(s: &str, max: usize) -> String {
+pub(crate) fn truncate_speech(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -211,19 +443,35 @@ pub fn parse_model_output(text: &str) -> ParsedOutput {
     }
 }
 
-fn strip_think(text: &str) -> &str {
+pub(crate) fn strip_think(text: &str) -> &str {
     match text.find("</think>") {
         Some(i) => &text[i + "</think>".len()..],
         None => text,
     }
 }
 
-fn push_call(name: &str, args: Value, calls: &mut Vec<ToolCall>, rejected: &mut Vec<(String, String)>) {
+/// Validate a named call against the schema.
+pub fn to_call(name: &str, args: Value) -> Result<ToolCall, String> {
     let v = json!({ "name": name, "arguments": args });
-    match serde_json::from_value::<ToolCall>(v) {
-        Ok(c) => calls.push(c.sanitized()),
-        Err(e) => rejected.push((name.to_string(), e.to_string())),
+    serde_json::from_value::<ToolCall>(v)
+        .map(ToolCall::sanitized)
+        .map_err(|e| e.to_string())
+}
+
+fn push_call(name: &str, args: Value, calls: &mut Vec<ToolCall>, rejected: &mut Vec<(String, String)>) {
+    match to_call(name, args) {
+        Ok(c) => calls.push(c),
+        Err(e) => rejected.push((name.to_string(), e)),
     }
+}
+
+/// One `<parameter=…>` value as the native format writes it: JSON objects/arrays/numbers/booleans, else a string.
+pub(crate) fn param_value(raw: &str) -> Value {
+    let raw = raw.trim_matches(|c| c == '\n' || c == '\r');
+    serde_json::from_str::<Value>(raw.trim())
+        .ok()
+        .filter(|x| x.is_object() || x.is_array() || x.is_number() || x.is_boolean())
+        .unwrap_or_else(|| Value::String(raw.trim().to_string()))
 }
 
 fn parse_xml_call(body: &str) -> Result<(String, Value), String> {
@@ -239,12 +487,7 @@ fn parse_xml_call(body: &str) -> Result<(String, Value), String> {
         let key = a[..gt].trim().to_string();
         let v = &a[gt + 1..];
         let end = v.find("</parameter>").unwrap_or(v.len());
-        let raw = v[..end].trim_matches(|c| c == '\n' || c == '\r');
-        let val = serde_json::from_str::<Value>(raw.trim())
-            .ok()
-            .filter(|x| x.is_object() || x.is_array() || x.is_number() || x.is_boolean())
-            .unwrap_or_else(|| Value::String(raw.trim().to_string()));
-        args.insert(key, val);
+        args.insert(key, param_value(&v[..end]));
         rest = if end < v.len() { &v[end + "</parameter>".len()..] } else { "" };
     }
     Ok((name, Value::Object(args)))
@@ -289,6 +532,7 @@ pub fn first_json_object(text: &str) -> Option<Value> {
 
 /// Tool definitions injected into the system prompt (`tools` of the chat template).
 pub fn tool_definitions() -> Value {
+    let emotes: Vec<&str> = CharacterEmote::ALL.iter().map(|e| e.name()).collect();
     json!([
       {
         "type": "function",
@@ -309,6 +553,7 @@ pub fn tool_definitions() -> Value {
               },
               "emotion_state": {"type": "string", "enum": ["NEUTRAL","JOY","EXCITED","SURPRISED","SURPRISED_URGENT","ANGRY","SORROW","WORRIED","FOCUSED","RELIEVED"]},
               "body_motion": {"type": "string", "enum": ["IDLE","NOD","LEAN_FORWARD_POINT","CHEER","CLAP","FLINCH","THINK","HIDE_CROUCH","WAVE_GOODBYE"]},
+              "character_emote": {"type": "string", "description": "Optional emote of Zena above her head (default: one matching the emotion).", "enum": emotes},
               "speech_text": {"type": "string", "description": "One short coaching sentence (<= 90 chars)."}
             },
             "required": ["emotion_state", "body_motion"]
@@ -327,6 +572,22 @@ pub fn tool_definitions() -> Value {
               "window_layer_mode": {"type": "string", "enum": ["GHOST_CLICK_THROUGH","INTERACTIVE_PET"]}
             },
             "required": ["command"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "manage_avatar_asset",
+          "description": "Change Zena's look, only when the player asks: switch the body track or put on / take off an accessory.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "action": {"type": "string", "enum": ["SWITCH_TRACK","EQUIP_PART","REMOVE_PART","RESET_PARTS"]},
+              "track": {"type": "string", "description": "PROCEDURAL=default face, SOLIDCRAFT=robot/toy Zena, SUBCULTURE_2D, SUBCULTURE_3D", "enum": ["PROCEDURAL","SOLIDCRAFT","SUBCULTURE_2D","SUBCULTURE_3D"]},
+              "part": {"type": "string", "enum": ["HEADSET","GLASSES","CAT_EARS","RIBBON"]}
+            },
+            "required": ["action"]
           }
         }
       }
@@ -413,6 +674,63 @@ mod tests {
         let v = serde_json::to_value(&env).unwrap();
         assert_eq!(v["tool_calls"][0]["name"], "control_zena_avatar");
         assert_eq!(v["tool_calls"][1]["arguments"]["window_layer_mode"], "GHOST_CLICK_THROUGH");
-        assert!(tool_definitions().as_array().unwrap().len() == 2);
+        assert!(tool_definitions().as_array().unwrap().len() == 3);
+    }
+
+    #[test]
+    fn emotes_parse_leniently_and_default_from_the_expression() {
+        let out = "<tool_call>\n<function=control_zena_avatar>\n<parameter=emotion_state>\nANGRY\n</parameter>\n<parameter=body_motion>\nNOD\n</parameter>\n<parameter=character_emote>\nCOMIC_ANGER_3D\n</parameter>\n</function>\n</tool_call>";
+        let p = parse_model_output(out);
+        let ToolCall::ControlZenaAvatar(a) = &p.calls[0] else {
+            panic!("{p:?}")
+        };
+        assert_eq!(a.character_emote, Some(CharacterEmote::ComicAnger3d));
+        let p = parse_model_output(&out.replace("COMIC_ANGER_3D", "PARTY_PARROT"));
+        let ToolCall::ControlZenaAvatar(a) = &p.calls[0] else {
+            panic!("{p:?}")
+        };
+        assert_eq!(a.character_emote, None, "an unknown emote is dropped, not the whole call");
+        assert_eq!(
+            a.emote(),
+            Some(CharacterEmote::ComicAnger3d),
+            "ANGRY shows the anger mark by default"
+        );
+        for e in CharacterEmote::ALL {
+            assert_eq!(CharacterEmote::parse(e.name()), Some(e));
+            assert_eq!(serde_json::to_value(e).unwrap(), json!(e.name()));
+            assert_eq!(CharacterEmote::ALL[e.index()], e);
+        }
+        let point = ZenaAvatarArgs {
+            emotion_state: EmotionState::SurprisedUrgent,
+            body_motion: BodyMotion::LeanForwardPoint,
+            ..Default::default()
+        };
+        assert_eq!(point.emote(), Some(CharacterEmote::ThreatArrow3d));
+        assert_eq!(ZenaAvatarArgs::default().emote(), None);
+    }
+
+    #[test]
+    fn asset_calls_parse() {
+        let out = "<tool_call>\n<function=manage_avatar_asset>\n<parameter=action>\nEQUIP_PART\n</parameter>\n<parameter=part>\nGLASSES\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(
+            parse_model_output(out).calls,
+            vec![ToolCall::ManageAvatarAsset(ZenaAssetArgs {
+                action: AssetAction::EquipPart,
+                track: None,
+                part: Some(AvatarPart::Glasses)
+            })]
+        );
+        let v = serde_json::to_value(AvatarTrack::Subculture3d).unwrap();
+        assert_eq!(v, json!("SUBCULTURE_3D"));
+        for p in AvatarPart::ALL {
+            assert_eq!(serde_json::to_value(p).unwrap(), json!(p.name()));
+        }
+        let names: Vec<String> = tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["control_zena_avatar", "manage_zena_system", "manage_avatar_asset"]);
     }
 }

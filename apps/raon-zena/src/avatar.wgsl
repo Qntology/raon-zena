@@ -11,7 +11,8 @@ struct U {
     eye_open: f32,        // 0..1.4 (surprise widens)
     alpha: f32,           // window hover fade
     time: f32,
-    _pad: vec2<f32>,
+    aspect: f32,          // viewport height / width
+    _pad: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -22,7 +23,7 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
     var o: VOut;
     o.pos = vec4(p[i], 0.0, 1.0);
-    o.uv = vec2(p[i].x, p[i].y * (450.0 / 350.0));
+    o.uv = vec2(p[i].x, p[i].y * u.aspect);
     return o;
 }
 

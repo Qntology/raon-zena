@@ -12,7 +12,7 @@ use crate::span::span_nms;
 use crate::spatial::{select_target, BoxCand};
 use std::collections::HashMap;
 use zena_core::geometry::Polar;
-use zena_core::tools::{SystemCommand, WindowLayerMode};
+use zena_core::tools::{AssetAction, SystemCommand, WindowLayerMode, ZenaAssetArgs};
 use zena_lexicon::{Action, Lexicon};
 
 /// The dictionary node an utterance is answered with when Zena is addressed but no domain is caught.
@@ -49,6 +49,8 @@ pub struct Caught {
 #[derive(Debug, Clone, Default)]
 pub struct RouterOutput {
     pub system: Vec<(SystemCommand, Option<WindowLayerMode>)>,
+    /// Avatar asset commands (track switches, accessories), in the order they were said.
+    pub assets: Vec<ZenaAssetArgs>,
     /// Dictionary expressions Zena plays without the LLM, best first (a command's own expression included).
     pub expressions: Vec<Caught>,
     /// Requests for Raon-1-nano (Lv3), best first.
@@ -165,6 +167,8 @@ impl NlpNmsRouter {
         }
         let decisions = self.nms.process(items, now_ms);
         let mut out = RouterOutput::default();
+        // Utterances that gave a command: they are not also a question unless one was caught exactly.
+        let mut commanding: Vec<String> = Vec::new();
         for d in decisions.iter().filter(|d| d.kept) {
             match d.item.source {
                 Source::Game => out.events.push((d.item.key.clone(), d.item.polar.unwrap(), d.item.score)),
@@ -173,6 +177,16 @@ impl NlpNmsRouter {
                     match &c.action {
                         Action::System { command, mode, express } => {
                             out.system.push((*command, *mode));
+                            commanding.push(c.utterance.clone());
+                            if express.is_some() {
+                                out.expressions.push(c);
+                            }
+                        }
+                        Action::Asset { asset, express } => {
+                            if !out.assets.contains(asset) {
+                                out.assets.push(asset.clone());
+                            }
+                            commanding.push(c.utterance.clone());
                             if express.is_some() {
                                 out.expressions.push(c);
                             }
@@ -183,6 +197,14 @@ impl NlpNmsRouter {
                     }
                 }
             }
+        }
+        out.queries.retain(|q| !(q.hit == Hit::Vector && commanding.contains(&q.utterance)));
+        // "안경 벗어" names the part and the removal: taking off wins over putting on.
+        let removing = |a: &ZenaAssetArgs| matches!(a.action, AssetAction::RemovePart | AssetAction::ResetParts);
+        if out.assets.iter().any(removing) {
+            out.assets.retain(|a| a.action != AssetAction::EquipPart);
+            out.expressions
+                .retain(|c| !matches!(&c.action, Action::Asset { asset, .. } if asset.action == AssetAction::EquipPart));
         }
         out.expressions.sort_by(|a, b| b.score.total_cmp(&a.score));
         out.queries.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -273,6 +295,68 @@ mod tests {
             900,
         );
         assert_eq!(out.system, vec![(SystemCommand::HideAvatar, None)]);
+    }
+
+    #[test]
+    fn avatar_asset_requests_route_to_assets() {
+        use zena_core::tools::{AvatarPart, AvatarTrack};
+        let say = |r: &mut NlpNmsRouter, text: &str, t: u64| {
+            r.route(
+                vec![RouterInput::Utterance {
+                    text: text.into(),
+                    t_ms: t,
+                }],
+                t,
+            )
+        };
+        let mut r = NlpNmsRouter::default();
+        let out = say(&mut r, "제나야, 로봇 모드로 변신해 줘", 0);
+        assert_eq!(out.assets.len(), 1, "{:?}", out.decisions);
+        assert_eq!(
+            (out.assets[0].action, out.assets[0].track),
+            (AssetAction::SwitchTrack, Some(AvatarTrack::Solidcraft))
+        );
+        assert!(out.expressions.iter().any(|c| c.key == "avatar.robot_mode"), "plays its line too");
+        let out = say(&mut r, "안경이랑 헤드셋 써 봐", 5_000);
+        let mut parts: Vec<_> = out.assets.iter().filter_map(|a| a.part).collect();
+        parts.sort();
+        assert_eq!(parts, vec![AvatarPart::Headset, AvatarPart::Glasses], "{:?}", out.assets);
+        assert!(
+            out.queries.is_empty(),
+            "a command is not also a question for the LLM: {:?}",
+            out.queries.iter().map(|q| (&q.key, &q.span, q.score, q.hit)).collect::<Vec<_>>()
+        );
+        // The same command amid game alerts (as in the live pipeline) is still no question.
+        let out = r.route(
+            vec![
+                RouterInput::GameEvent {
+                    label: "근접 위협".into(),
+                    score: 0.9,
+                    polar: Polar { r: 0.1, theta_deg: 30.0 },
+                    t_ms: 7_000,
+                },
+                RouterInput::Utterance {
+                    text: "제나야 리본 달아 봐".into(),
+                    t_ms: 7_000,
+                },
+            ],
+            7_000,
+        );
+        assert_eq!(
+            out.assets.iter().filter_map(|a| a.part).collect::<Vec<_>>(),
+            vec![AvatarPart::Ribbon]
+        );
+        assert!(
+            out.queries.is_empty(),
+            "{:?}",
+            out.queries.iter().map(|q| &q.key).collect::<Vec<_>>()
+        );
+        let out = say(&mut r, "안경 벗어", 10_000);
+        assert_eq!(
+            out.assets.iter().map(|a| a.action).collect::<Vec<_>>(),
+            vec![AssetAction::ResetParts],
+            "taking off wins"
+        );
     }
 
     #[test]

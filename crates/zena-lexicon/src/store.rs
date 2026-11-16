@@ -323,7 +323,7 @@ fn node_rows(n: &Node, sources: &HashMap<(String, String, String), String>) -> V
 fn express_mut(a: &mut Action) -> Option<&mut Express> {
     match a {
         Action::Express(e) => Some(e),
-        Action::System { express, .. } | Action::Ask { express, .. } => express.as_mut(),
+        Action::System { express, .. } | Action::Asset { express, .. } | Action::Ask { express, .. } => express.as_mut(),
         Action::None => None,
     }
 }

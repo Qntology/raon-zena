@@ -8,6 +8,7 @@ members = [
     "crates/raon-infer",
     "crates/zena-lexicon",
     "crates/raon-vision",
+    "crates/zena-avatar-mcp",
     "apps/raon-zena",
     "apps/zena-lexicon",
 ]
