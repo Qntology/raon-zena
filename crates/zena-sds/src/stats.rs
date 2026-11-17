@@ -4,11 +4,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use premium_discount_sds::Moments;
 use serde::{Deserialize, Serialize};
 
 use crate::{TIE_SPECIFICITY_SLACK, TIE_WIN_RATE};
 
-/// Running mean / variance (Welford) plus a ring of the latest values for drift.
+/// Running mean / variance (Welford) plus a ring of the latest values for drift. The arithmetic (push, Chan merge,
+/// variance) is premium-discount's `premium_discount_sds::Moments`, shared with premium-discount-nav's friction
+/// baselines; this type keeps its own fields and serialised shape (stored ledgers read as before) and adds the ring.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Welford {
     pub n: u64,
@@ -19,15 +22,27 @@ pub struct Welford {
 }
 
 impl Welford {
+    /// The count, mean and m2 without the ring.
+    pub fn moments(&self) -> Moments {
+        Moments {
+            n: self.n,
+            mean: self.mean,
+            m2: self.m2,
+        }
+    }
+
+    fn set(&mut self, m: Moments) {
+        (self.n, self.mean, self.m2) = (m.n, m.mean, m.m2);
+    }
+
     /// Adds one value; non-finite values are ignored.
     pub fn push(&mut self, x: f64, ring_len: usize) {
         if !x.is_finite() {
             return;
         }
-        self.n += 1;
-        let d = x - self.mean;
-        self.mean += d / (self.n as f64);
-        self.m2 += d * (x - self.mean);
+        let mut m = self.moments();
+        m.push(x);
+        self.set(m);
         self.ring.push(x);
         self.trim_ring(ring_len);
     }
@@ -37,19 +52,13 @@ impl Welford {
         if other.n == 0 {
             return;
         }
-        if self.n == 0 {
-            self.n = other.n;
-            self.mean = other.mean;
-            self.m2 = other.m2;
+        let was_empty = self.n == 0;
+        let mut m = self.moments();
+        m.merge(&other.moments());
+        self.set(m);
+        if was_empty {
             self.ring = other.ring.clone();
         } else {
-            let na = self.n as f64;
-            let nb = other.n as f64;
-            let n = na + nb;
-            let delta = other.mean - self.mean;
-            self.mean += delta * (nb / n);
-            self.m2 += other.m2 + delta * delta * (na * nb / n);
-            self.n += other.n;
             self.ring.extend(other.ring.iter().copied());
         }
         self.trim_ring(ring_len);
@@ -65,11 +74,7 @@ impl Welford {
 
     /// Sample variance (n − 1); 0 below two samples.
     pub fn variance(&self) -> f64 {
-        if self.n < 2 {
-            0.0
-        } else {
-            self.m2 / ((self.n - 1) as f64)
-        }
+        self.moments().sample_variance()
     }
 
     pub fn sd(&self) -> f64 {

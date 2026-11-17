@@ -1,5 +1,7 @@
 # Raon Zena × premium-discount 5대 과업 반영 (2026-11-17)
 
+> 같은 날 뒤이은 작업에서 `pd-*` crate 는 `premium-discount-*` 로 이름이 바뀌었고, `premium-discount-mcp` 는 premium-discount 저장소로 옮겨 갔습니다([`MASTER_PLAN_CRATES_UNIFICATION.md`](MASTER_PLAN_CRATES_UNIFICATION.md)). 아래는 그 전의 기록입니다.
+
 "KRAFTON Raon Zena × premium-discount — 5대 핵심 과업 통합 마스터 기획서"를 두 저장소(raon-zena · premium-discount, 브랜치 `claude/master-plan-5`)에 반영한 기록입니다. 각 절은 한 일, 기획서와 코드가 달랐던 점, 검증 순서로 적습니다.
 
 ## 1. 공유 라이브러리 단일화

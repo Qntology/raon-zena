@@ -9,7 +9,6 @@ members = [
     "crates/zena-lexicon",
     "crates/raon-vision",
     "crates/zena-avatar-mcp",
-    "crates/premium-discount-mcp",
     "crates/zena-sds",
     "crates/zena-verdict",
     "crates/zena-nlp",
@@ -32,15 +31,22 @@ memmap2 = "0.9"
 half = "2"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
-# premium-discount's library crates (`crates/` of github.com/Qntology/premium-discount): the PD-Verdict judge,
-# the hashId / wallet identity and the accessibility-navigation core. They depend on no LanceDB, HTTP, Tauri or
-# model runtime, so they link into this workspace (LanceDB 0.41) as they do into premium-discount-app (0.31).
-# Pinned by revision; to build against a checkout next to this one, add
-# `[patch."https://github.com/Qntology/premium-discount"]` with `pd-verdict = { path = "../premium-discount/crates/pd-verdict" }`
-# (and the same for pd-identity, pd-nav).
-pd-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
-pd-identity = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
-pd-nav = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
+# premium-discount's library crates (`crates/` of github.com/Qntology/premium-discount, all named
+# premium-discount-*): identity (hashId, wallet), verdict (PD-Verdict), nav (accessibility numbering), schema (cc, to / bcc,
+# the app's command contract), filter (dictionary profanity filter), mcp-protocol (the stdio MCP framing, re-exported as
+# zena_avatar_mcp::protocol), mcp (premium-discount-mcp: the MCP server and PdSyncClient / SyncLoop), sds (Welford and scope
+# backoff), manifest (pinned-download checks). None depends on LanceDB, Tauri, tokio or a model runtime, so they link into
+# this workspace (LanceDB 0.41) as they do into premium-discount-app (0.31).
+# Pinned by revision; to build against a checkout next to this one, uncomment the [patch] section at the end.
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-nav = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-schema = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-filter = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-mcp-protocol = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-mcp = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
 
 [profile.release]
 opt-level = 3
@@ -74,3 +80,15 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.zena-sensor]
 opt-level = 3
+
+# Local parallel development with ../premium-discount:
+# [patch."https://github.com/Qntology/premium-discount"]
+# premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
+# premium-discount-verdict = { path = "../premium-discount/crates/premium-discount-verdict" }
+# premium-discount-nav = { path = "../premium-discount/crates/premium-discount-nav" }
+# premium-discount-schema = { path = "../premium-discount/crates/premium-discount-schema" }
+# premium-discount-filter = { path = "../premium-discount/crates/premium-discount-filter" }
+# premium-discount-mcp-protocol = { path = "../premium-discount/crates/premium-discount-mcp-protocol" }
+# premium-discount-mcp = { path = "../premium-discount/crates/premium-discount-mcp" }
+# premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
+# premium-discount-manifest = { path = "../premium-discount/crates/premium-discount-manifest" }

@@ -3,7 +3,8 @@
 //! Headless dual-track avatar asset pipeline for Raon Zena — no CAD or editor UI, everything is driven
 //! through MCP (JSON-RPC 2.0 over stdio) or called in-process:
 //!
-//! * [`protocol`]   – a minimal MCP client ([`protocol::McpClient`]) and server loop ([`protocol::serve`]).
+//! * [`protocol`]   – a minimal MCP client ([`protocol::McpClient`]) and server loop ([`protocol::serve`]): premium-discount's
+//!   `premium-discount-mcp-protocol`, re-exported (it moved there so premium-discount-mcp no longer depends on this crate).
 //! * [`mesh`]       – [`mesh::MeshData`] (what the overlay uploads to wgpu), a glTF 2.0 binary writer, a
 //!   `.glb` / `.vrm` reader and skinning math.
 //! * [`forge`]      – Track A built-in parametric generator: 3D comic emote props, accessory parts and the
@@ -21,7 +22,7 @@ pub mod chibi;
 pub mod forge;
 mod math;
 pub mod mesh;
-pub mod protocol;
+pub use premium_discount_mcp_protocol as protocol;
 pub mod service;
 pub mod solidcraft;
 pub mod vrm;
