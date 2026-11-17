@@ -7,19 +7,14 @@
 //! * [`kquant`]      – importance-weighted LS block encoders (vendored from Qntology/logis-center).
 //! * [`kernels`]     – block decoders, fused dequant-dot kernels, start-up self-verify.
 //! * [`pyramid`]     – tier policy for Raon-1-nano and Raon-VisionEncoder + streaming converter.
-//! * [`vocab`]       – `kept_ids` construction from the byte-level BPE tokenizer.
+//! * [`vocab`]       – `kept_ids` construction from the byte-level BPE tokenizer; [`trim`] the per-language rule.
 //! * [`lmhead`]      – exact arg-max over a sliced head (cold-row cluster bounds).
 //! * [`gguf`], [`safetensors`], [`imatrix`] – file formats.
 
+// The model-independent parts (formats, encoders, kernels, vocabulary slicing) are premium-discount's
+// `premium-discount-quant` (moved there from this crate); re-exported under their old paths. What stays here is
+// Raon-specific: the pyramid tier plans for Raon-1-nano / Raon-VisionEncoder and the Raon-1-nano block cache.
+pub use premium_discount_quant::{gguf, imatrix, kernels, kquant, lmhead, safetensors, trim, vocab};
+
 pub mod cache;
-pub mod gguf;
-pub mod imatrix;
-pub mod kernels;
-// Vendored verbatim; keep upstream style.
-#[allow(clippy::manual_is_multiple_of)]
-#[rustfmt::skip]
-pub mod kquant;
-pub mod lmhead;
 pub mod pyramid;
-pub mod safetensors;
-pub mod vocab;

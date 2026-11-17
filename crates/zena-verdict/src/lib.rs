@@ -1,7 +1,7 @@
 //! PD-Verdict: premium (추천) / discount (비추천) of one evaluation relative to its scope.
 //!
-//! premium-discount owns the rule and its implementation: the judge itself is `pd_verdict` (premium-discount
-//! `crates/pd-verdict`, pinned by git revision in the workspace `Cargo.toml`), re-exported here unchanged so the
+//! premium-discount owns the rule and its implementation: the judge itself is `premium_discount_verdict` (premium-discount
+//! `crates/premium-discount-verdict`, pinned by git revision in the workspace `Cargo.toml`), re-exported here unchanged so the
 //! server's cron, premium-discount-app and Raon Zena run one implementation. This crate keeps only what is
 //! Zena's own: turning spoken feedback into observations ([`feedback`]) and how Zena talks about a local verdict
 //! next to the global one ([`speak`]).
@@ -9,7 +9,7 @@
 //! `contracts/verdict_v1.json` here is a byte copy of premium-discount's contract. The tests run every case
 //! against the re-exported judge, so moving the pinned revision onto a rule change fails here first.
 
-pub use pd_verdict::*;
+pub use premium_discount_verdict::*;
 
 pub mod feedback;
 pub mod speak;
@@ -18,7 +18,7 @@ pub use feedback::{feedback_obs, manual_obs, FeedbackIntent};
 pub use speak::{stance, Stance};
 
 /// `pd-verdict/1`, under the name this crate has always used (premium-discount calls it `RECIPE_V1`).
-pub const RECIPE: &str = pd_verdict::RECIPE_V1;
+pub const RECIPE: &str = premium_discount_verdict::RECIPE_V1;
 
 #[cfg(test)]
 mod tests {

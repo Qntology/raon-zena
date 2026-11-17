@@ -7,13 +7,13 @@
 //! A screen the dictionary marks `privacy` (login, banking, payment, personal chat) gets no comment, and the watcher
 //! stops looking for a while.
 
-use raon_vision::{Acceptance, AnchorBank, ScreenConfig, ScreenEncoder, WeightFormat};
+use raon_vision::{Acceptance, AnchorBank, LexiconAnchors, ScreenConfig, ScreenEncoder, WeightFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 use zena_lexicon::{Lexicon, VisionKind};
-use zena_sensor::naflex::patchify_frame_with;
+use premium_discount_sensor::naflex::patchify_frame_with;
 
 /// One frame for the watcher (RGB8). Zeroed when dropped.
 pub struct ScreenFrame {

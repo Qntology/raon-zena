@@ -556,7 +556,7 @@ mod tests {
         let kit = br#"{"size": [160, 160], "layers": {"body": {"default": {"png": "body.png", "offset": [0, 0]}}}}"#.to_vec();
         let base = serve_files(vec![("/model.vrm", model.clone()), ("/kit.json", kit.clone()), ("/body.png", body.clone())]);
         let sha = |b: &[u8]| -> String {
-            use sha2::{Digest, Sha256};
+            use premium_discount_manifest::{Digest, Sha256};
             Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
         };
         let file = |path: &str, b: &[u8]| CatalogFile {

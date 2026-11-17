@@ -1,5 +1,7 @@
 //! Window/app control that does not need Win32 to be *computed*: extended-style bit math,
-//! system-command effects, graceful shutdown sequencing, hotkeys and FPS throttling.
+//! system-command effects, graceful shutdown sequencing, hotkeys and FPS throttling. The style bits, the micro
+//! viewport, the hover alpha and the frame budget are premium-discount's `premium-discount-window` (shared with
+//! premium-discount-app's overlay); this module maps Zena's modes and reaction levels onto them.
 //! The Windows client (`apps/raon-zena`) applies the results with `SetWindowLongPtrW`,
 //! `SetWindowPos` and `ShowWindow`.
 
@@ -7,20 +9,12 @@ use crate::reaction::ReactionLevel;
 use crate::tools::{SystemCommand, WindowLayerMode};
 use std::time::Duration;
 
-// Win32 extended window styles (winuser.h).
-pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
-pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
-pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
-pub const WS_EX_LAYERED: u32 = 0x0008_0000;
-pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-
-/// Micro-viewport: the swap chain only covers the character, not the monitor.
-pub const VIEWPORT_W: u32 = 350;
-pub const VIEWPORT_H: u32 = 450;
-
-/// Opacity (0..=255, for `SetLayeredWindowAttributes`) when the cursor hovers the avatar in
-/// ghost mode, so the game underneath stays visible.
-pub const HOVER_ALPHA: u8 = (255.0 * 0.30) as u8;
+// Win32 extended window styles (winuser.h), the micro-viewport (the swap chain only covers the character) and the
+// hover opacity (ghost mode, so the game underneath stays visible).
+pub use premium_discount_window::{
+    Activity, LayerFlags, HOVER_ALPHA, VIEWPORT_H, VIEWPORT_W, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowState {
@@ -43,28 +37,23 @@ impl Default for WindowState {
 }
 
 impl WindowState {
+    /// The layer flags of this state (ghost mode = click-through).
+    pub fn flags(&self) -> LayerFlags {
+        LayerFlags {
+            click_through: self.mode == WindowLayerMode::GhostClickThrough,
+            topmost: self.topmost,
+            typing: self.typing,
+        }
+    }
+
     /// The extended style to apply for the current state.
     pub fn ex_style(&self) -> u32 {
-        let mut s = WS_EX_LAYERED | WS_EX_TOOLWINDOW;
-        if !self.typing {
-            s |= WS_EX_NOACTIVATE;
-        }
-        if self.topmost {
-            s |= WS_EX_TOPMOST;
-        }
-        if self.mode == WindowLayerMode::GhostClickThrough && !self.typing {
-            s |= WS_EX_TRANSPARENT;
-        }
-        s
+        self.flags().ex_style()
     }
 
     /// Opacity for the current cursor position.
     pub fn alpha(&self, cursor_over_avatar: bool) -> u8 {
-        if self.mode == WindowLayerMode::GhostClickThrough && cursor_over_avatar && !self.typing {
-            HOVER_ALPHA
-        } else {
-            255
-        }
+        self.flags().alpha(cursor_over_avatar)
     }
 }
 
@@ -183,17 +172,14 @@ impl ShutdownPhase {
 /// Dynamic frame pacing (`ControlFlow::WaitUntil`): 60 FPS while speaking/moving (Lv3),
 /// 24 FPS for Lv2 cues, 15 FPS idle; hidden windows only wake for input.
 pub fn frame_interval(level: ReactionLevel, speaking: bool, visible: bool) -> Option<Duration> {
-    if !visible {
-        return None;
-    }
-    let fps = if speaking || level == ReactionLevel::Lv3Coaching {
-        60
+    let activity = if speaking || level == ReactionLevel::Lv3Coaching {
+        Activity::Busy
     } else if level == ReactionLevel::Lv2Cached {
-        24
+        Activity::Light
     } else {
-        15
+        Activity::Idle
     };
-    Some(Duration::from_micros(1_000_000 / fps))
+    premium_discount_window::frame_interval(activity, visible)
 }
 
 #[cfg(test)]

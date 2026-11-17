@@ -2,8 +2,10 @@
 //! that puts them in the asset cache (`%LOCALAPPDATA%\RaonZena\assets\catalog\<id>\`).
 //!
 //! Every built-in entry is pinned: a fixed URL (a commit on GitHub, an Arweave transaction) with its byte size and
-//! SHA-256, checked after the download, so a changed or truncated file never lands in the cache. Downloads go to
-//! `<file>.part` and are renamed only when the hash matches; a cached file is re-hashed before it is trusted.
+//! SHA-256, checked after the download, so a changed or truncated file never lands in the cache. The rules are
+//! premium-discount-app's model downloader's, shared through `premium-discount-manifest`: downloads go to
+//! `<file>.part` and are renamed only when size and hash match ([`premium_discount_manifest::promote`]); a cached file
+//! is re-hashed before it is trusted; listed paths stay inside the entry's folder.
 //!
 //! The built-in list holds what could be verified on 2026-11-17 (file, license in the model's own VRM meta):
 //!
@@ -23,9 +25,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use premium_discount_manifest::{is_sha256_hex, part_path, promote, safe_relative};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// The per-user asset cache: `%LOCALAPPDATA%\RaonZena\assets` (else `$XDG_CACHE_HOME`, else the temp dir).
 pub fn default_cache_root() -> PathBuf {
@@ -230,25 +232,13 @@ fn check_entry(e: &Entry) -> Result<()> {
         bail!("a chibi_kit entry needs kit.json");
     }
     for f in &e.files {
-        safe_relative(&f.path)?;
-        if f.sha256.len() != 64 || !f.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        safe_relative(&f.path).map_err(|m| anyhow!(m))?;
+        if !is_sha256_hex(&f.sha256) {
             bail!("{}: sha256 must be 64 hex digits", f.path);
         }
         if !(f.url.starts_with("https://") || f.url.starts_with("http://127.0.0.1") || f.url.starts_with("http://localhost")) {
             bail!("{}: only https URLs (or a local test server)", f.path);
         }
-    }
-    Ok(())
-}
-
-/// A relative path with no `..`, root or drive: files stay inside the entry's folder.
-fn safe_relative(p: &str) -> Result<()> {
-    let path = Path::new(p);
-    if p.is_empty() || path.is_absolute() || p.contains(':') || p.contains('\\') {
-        bail!("{p}: not a relative path");
-    }
-    if path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-        bail!("{p}: not a plain relative path");
     }
     Ok(())
 }
@@ -266,23 +256,8 @@ pub fn find<'a>(entries: &'a [Entry], id: &str) -> Option<&'a Entry> {
     entries.iter().find(|e| e.id == id)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
-
 fn verified(path: &Path, f: &CatalogFile) -> bool {
-    std::fs::metadata(path).map(|m| m.len() == f.size).unwrap_or(false)
-        && sha256_file(path).map(|h| h.eq_ignore_ascii_case(&f.sha256)).unwrap_or(false)
+    premium_discount_manifest::verified(path, f.size, &f.sha256)
 }
 
 /// Whether every file of the entry is in the cache with the pinned size and hash.
@@ -311,17 +286,13 @@ pub fn fetch(root: &Path, e: &Entry, progress: Progress<'_>) -> Result<PathBuf> 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let part = dest.with_extension(format!(
-            "{}part",
-            dest.extension().map(|x| format!("{}.", x.to_string_lossy())).unwrap_or_default()
-        ));
-        let result = download(&agent, f, &part, progress);
+        let part = part_path(&dest);
+        let result = download(&agent, f, &part, progress)
+            .and_then(|()| promote(&part, &dest, f.size, &f.sha256).map_err(anyhow::Error::from));
         if let Err(err) = result {
             let _ = std::fs::remove_file(&part);
             return Err(err.context(format!("{} ({})", f.path, f.url)));
         }
-        let _ = std::fs::remove_file(&dest);
-        std::fs::rename(&part, &dest).with_context(|| format!("moving {} into place", dest.display()))?;
     }
     Ok(e.main_path(root))
 }
@@ -333,7 +304,6 @@ fn download(agent: &ureq::Agent, f: &CatalogFile, part: &Path, progress: Progres
     })?;
     let mut reader = resp.into_reader().take(f.size + 1);
     let mut out = std::fs::File::create(part).with_context(|| format!("creating {}", part.display()))?;
-    let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     let mut got = 0u64;
     loop {
@@ -345,17 +315,12 @@ fn download(agent: &ureq::Agent, f: &CatalogFile, part: &Path, progress: Progres
         if got > f.size {
             bail!("larger than the pinned {} bytes", f.size);
         }
-        h.update(&buf[..n]);
         out.write_all(&buf[..n])?;
         progress(&f.path, got, f.size);
     }
     out.flush()?;
     if got != f.size {
         bail!("got {got} of {} bytes", f.size);
-    }
-    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if !digest.eq_ignore_ascii_case(&f.sha256) {
-        bail!("SHA-256 {digest} does not match the pinned {}", f.sha256);
     }
     Ok(())
 }
@@ -408,7 +373,8 @@ mod tests {
     }
 
     fn hex_sha(b: &[u8]) -> String {
-        Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+        use premium_discount_manifest::{hex, Digest, Sha256};
+        hex(&Sha256::digest(b))
     }
 
     fn entry(id: &str, url: &str, body: &[u8], kind: Kind) -> Entry {

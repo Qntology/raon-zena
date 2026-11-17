@@ -5,7 +5,7 @@
 //! request for Raon-1-nano.
 
 use crate::analyze::{Analyzer, NoAnalyzer, RuleAnalyzer};
-use crate::domain::{DomainBank, Hit};
+use crate::domain::{DomainBank, Hit, LexiconBank};
 use crate::embed::{HashedNgramEmbedder, SharedEmbedder, TextEmbedder};
 use crate::normalize::{normalize, Normalized};
 use crate::semantic::{Decision, Item, SemanticNms, Source};
@@ -134,7 +134,7 @@ impl Models {
     fn stanza_analyzer(ui_language: &str) -> Arc<dyn Analyzer> {
         #[cfg(feature = "stanza")]
         {
-            let lang = zena_nlp::stanza::lang_code(ui_language).unwrap_or("ko");
+            let lang = premium_discount_nlp::stanza::lang_code(ui_language).unwrap_or("ko");
             match crate::analyze::StanzaAnalyzer::warm(lang) {
                 Ok(()) => {
                     return Arc::new(crate::analyze::StanzaAnalyzer {
@@ -318,7 +318,7 @@ impl NlpNmsRouter {
                         let id = self.id();
                         let e = self.bank.entry(index);
                         // Commands and expressions dedupe on their own words; questions on the whole utterance.
-                        let ask = matches!(e.action, Action::Ask { .. });
+                        let ask = matches!(e.payload, Action::Ask { .. });
                         let (t, v) = if ask {
                             (text.clone(), full_vec.clone())
                         } else {
@@ -328,7 +328,7 @@ impl NlpNmsRouter {
                             id,
                             Caught {
                                 key: e.key.clone(),
-                                action: e.action.clone(),
+                                action: e.payload.clone(),
                                 span,
                                 utterance: text.clone(),
                                 score,
@@ -339,7 +339,7 @@ impl NlpNmsRouter {
                             id,
                             source: Source::User,
                             key: e.key.clone(),
-                            is_command: e.action.is_command(),
+                            is_command: e.payload.is_command(),
                             text: t,
                             vec: v,
                             score,

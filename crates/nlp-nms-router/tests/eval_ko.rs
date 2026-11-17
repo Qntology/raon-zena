@@ -91,7 +91,7 @@ fn evaluate(label: &str, router: &NlpNmsRouter) -> Report {
         k.1 += 1;
         let false_cmd = got.hits.iter().any(|h| {
             let e = router.bank.entry(h.0);
-            e.action.is_command() && !c.expect.contains(&e.key)
+            e.payload.is_command() && !c.expect.contains(&e.key)
         });
         r.false_commands += false_cmd as usize;
         if !ok {
