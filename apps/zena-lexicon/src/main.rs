@@ -209,7 +209,7 @@ fn main() -> Result<()> {
             let anchors = store.anchors()?;
             let dev = raon_infer::device::select_device(device, 0)?;
             let (tower, scale, bias) = raon_vision::load_vision(&model, &dev, format)?;
-            let bank = raon_vision::AnchorBank::build(&lex, &anchors.vectors, scale, bias);
+            let bank = <raon_vision::AnchorBank as raon_vision::LexiconAnchors>::build(&lex, &anchors.vectors, scale, bias);
             if bank.is_empty() {
                 bail!("no screen domain is anchored yet: run `zena-lexicon anchors` first");
             }
@@ -223,7 +223,7 @@ fn main() -> Result<()> {
                 perforation,
                 seed_labels: 3,
             };
-            let grid = zena_sensor::naflex::patchify_frame_with(&rgb, w, h, patches, &raon_vision::preprocess_for(&model));
+            let grid = premium_discount_sensor::naflex::patchify_frame_with(&rgb, w, h, patches, &raon_vision::preprocess_for(&model));
             let r = raon_vision::screen::read_pass(&tower, &cfg, &grid, &bank)?;
             println!(
                 "{w}x{h} → {}x{} grid, {} of {} tokens through the encoder, {:.0} ms",

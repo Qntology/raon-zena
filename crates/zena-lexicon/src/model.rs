@@ -100,41 +100,8 @@ pub struct Node {
     pub action: Action,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum VisionKind {
-    /// What the screen is (game fight, chart, code...): reacted to when it changes, then rarely.
-    Scene,
-    /// A moment (victory, game over, loading): reacted to each time, with a short cooldown.
-    Event,
-    /// A private screen: no reaction, no comment, and the watcher backs off.
-    Privacy,
-}
-
-impl VisionKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VisionKind::Scene => "scene",
-            VisionKind::Event => "event",
-            VisionKind::Privacy => "privacy",
-        }
-    }
-    pub fn parse(s: &str) -> Result<VisionKind> {
-        Ok(match s {
-            "scene" => VisionKind::Scene,
-            "event" => VisionKind::Event,
-            "privacy" => VisionKind::Privacy,
-            _ => bail!("unknown vision kind '{s}' (scene, event, privacy)"),
-        })
-    }
-    /// Seconds before the same domain may be reacted to again, unless the node sets `cooldown_s`.
-    pub fn default_cooldown_s(self) -> u32 {
-        match self {
-            VisionKind::Scene => 600,
-            VisionKind::Event => 20,
-            VisionKind::Privacy => 60,
-        }
-    }
-}
+/// The screen kinds (scene · event · privacy): premium-discount-sensor's, shared with the vision anchor bank.
+pub use premium_discount_sensor::VisionKind;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionNode {
@@ -360,7 +327,7 @@ pub(crate) fn vision_of(name: &str, v: &Value) -> Result<VisionNode> {
     Ok(VisionNode {
         key: format!("vision.{name}"),
         name: name.to_string(),
-        kind: VisionKind::parse(o.get("kind").and_then(Value::as_str).unwrap_or("scene"))?,
+        kind: VisionKind::parse(o.get("kind").and_then(Value::as_str).unwrap_or("scene")).map_err(anyhow::Error::msg)?,
         link: o.get("link").and_then(Value::as_str).unwrap_or("").to_string(),
         semantic: o.get("semantic").and_then(Value::as_str).unwrap_or("").to_string(),
         bias: phrases_of(o.get("bias"))?,

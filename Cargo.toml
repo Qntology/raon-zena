@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/zena-core",
-    "crates/zena-sensor",
     "crates/raon-quant",
     "crates/nlp-nms-router",
     "crates/raon-infer",
@@ -11,9 +10,6 @@ members = [
     "crates/zena-avatar-mcp",
     "crates/zena-sds",
     "crates/zena-verdict",
-    "crates/zena-nlp",
-    "crates/onnxruntime",
-    "crates/onnxruntime-sys",
     "apps/raon-zena",
     "apps/zena-lexicon",
 ]
@@ -38,15 +34,23 @@ candle-nn = "0.11.0"
 # backoff), manifest (pinned-download checks). None depends on LanceDB, Tauri, tokio or a model runtime, so they link into
 # this workspace (LanceDB 0.41) as they do into premium-discount-app (0.31).
 # Pinned by revision; to build against a checkout next to this one, uncomment the [patch] section at the end.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-nav = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-schema = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-filter = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-mcp-protocol = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-mcp = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "8f2a7960bc2f1c32485c464f2fdb7e0aa151ffe3" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-nav = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-schema = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-filter = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-mcp-protocol = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-mcp = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-sensor = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77", default-features = false }
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+# Window math is used without its Win32 lookup (feature `win32`); turn it on where an app needs it
+premium-discount-window = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77", default-features = false }
+premium-discount-relay = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-vision = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
 
 [profile.release]
 opt-level = 3
@@ -61,12 +65,12 @@ debug = false
 
 # LLM acceleration: the candle-rocm-vulkan fork (CUDA / ROCm-HIP / Vulkan / Metal backends, fused
 # attention, TurboQuant), wired exactly like Qntology/logis-center. The fork tracks candle 0.11.0 and
-# replaces the crates.io candle-core / candle-nn; Cargo.lock pins the commit (`cargo update -p candle-core`
-# to move it). To build against a local checkout, swap the git lines for
+# replaces the crates.io candle-core / candle-nn. Pinned to the same commit as premium-discount (crates/ and app/),
+# so both workspaces build one candle. To build against a local checkout, swap the git lines for
 # `path = "../candle-rocm-vulkan/candle-core"` etc.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
 
 [profile.dev.package.candle-core]
 opt-level = 3
@@ -78,7 +82,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.raon-vision]
 opt-level = 3
-[profile.dev.package.zena-sensor]
+[profile.dev.package.premium-discount-sensor]
 opt-level = 3
 
 # Local parallel development with ../premium-discount:
@@ -92,3 +96,10 @@ opt-level = 3
 # premium-discount-mcp = { path = "../premium-discount/crates/premium-discount-mcp" }
 # premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
 # premium-discount-manifest = { path = "../premium-discount/crates/premium-discount-manifest" }
+# premium-discount-sensor = { path = "../premium-discount/crates/premium-discount-sensor" }
+# premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
+# premium-discount-nms = { path = "../premium-discount/crates/premium-discount-nms" }
+# premium-discount-window = { path = "../premium-discount/crates/premium-discount-window" }
+# premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
+# premium-discount-vision = { path = "../premium-discount/crates/premium-discount-vision" }
+# premium-discount-relay = { path = "../premium-discount/crates/premium-discount-relay" }

@@ -11,14 +11,14 @@ zena-lexicon = { path = "../zena-lexicon" }
 zena-sds = { path = "../zena-sds" }
 serde.workspace = true
 anyhow = "1"
-# NLP-NMS v2 models (feature `neural`: granite embeddings; `stanza`: + Stanza roles on ONNX Runtime).
-zena-nlp = { path = "../zena-nlp", default-features = false, optional = true }
-candle-core = { workspace = true, optional = true }
+# The domain-neutral NLP-NMS core (premium-discount); `neural`: granite embeddings, `stanza`: + Stanza roles.
+premium-discount-nms.workspace = true
+premium-discount-nlp = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
 
 [features]
 default = []
-neural = ["dep:zena-nlp", "dep:candle-core"]
-stanza = ["neural", "zena-nlp/stanza"]
+neural = ["premium-discount-nms/neural", "dep:premium-discount-nlp"]
+stanza = ["neural", "premium-discount-nms/stanza", "premium-discount-nlp/stanza"]

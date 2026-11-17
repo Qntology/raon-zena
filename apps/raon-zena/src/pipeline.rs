@@ -30,8 +30,8 @@ use zena_core::session::{Proactive, ProactiveTimer, SessionTracker};
 use zena_core::stream::{StreamEvent, ToolCallStream};
 use zena_core::tools::{GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAssetArgs, ZenaAvatarArgs};
 use zena_lexicon::{Action, Express, ExpressLevel, Lexicon, VisionKind};
-use zena_sensor::naflex::bgra_to_rgb;
-use zena_sensor::{extract_rois, LogLumSensor, RoiTracker};
+use premium_discount_sensor::naflex::bgra_to_rgb;
+use premium_discount_sensor::{extract_rois, LogLumSensor, RoiTracker};
 
 /// What the UI thread is asked to do.
 #[derive(Debug, Clone)]

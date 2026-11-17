@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Formats, encoders, kernels, vocabulary slicing (moved to premium-discount)
+premium-discount-quant.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 half.workspace = true

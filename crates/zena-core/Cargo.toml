@@ -6,5 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Screen geometry (BBox, Polar, flow) lives in premium-discount-sensor
+premium-discount-sensor.workspace = true
+# Window style bits, viewport, hover alpha, frame budget (shared with premium-discount-app's overlay)
+premium-discount-window.workspace = true
 serde.workspace = true
 serde_json.workspace = true

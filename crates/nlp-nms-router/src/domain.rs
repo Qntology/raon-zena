@@ -1,258 +1,58 @@
-//! Expression-domain scoring from the word dictionary (`zena-lexicon`).
+//! Zena's expression domains: the word dictionary (`zena-lexicon`) as premium-discount-nms's generic domain bank.
 //!
-//! Every text node of the dictionary becomes one bank entry. A span of the user's words is scored the way
-//! Qntology/logis-center scores fields against `bias.json`:
-//!
-//! 1. **exact match before vectors** — the span equals an `exact_match` entry (surface, josa-peeled lemma or
-//!    request-stripped stem, spaces ignored) → 0.95; or, for Hangul, an entry is a prefix of the span's last word
-//!    with at most two syllables left over (logis-center's agglutinative prefix match: "클리어했다" → "클리어")
-//!    → 0.90. The longest entry wins; two domains tied on the same length → no exact verdict.
-//! 2. **bias / prejudice vectors** — `bias` = max-pool cosine against the node's bias phrases (times the phrase
-//!    weight), `prej` = max-pool cosine against its prejudice phrases (look-alikes that mean something else),
-//!    `score = max(bias − prej·w, 0)` with `w = 0.3` for ≤ 2-word spans and `0.7` otherwise.
-//!
-//! The dictionary's `function` group (request endings, fillers) explains words away: a span made only of them
-//! never names a domain.
+//! Every text node of the dictionary becomes one bank entry carrying its [`Action`]; the scoring itself (exact /
+//! agglutinative-prefix match before vectors, bias / prejudice max-pool cosine with the prejudice penalty) is
+//! premium-discount-nms's. The dictionary's `function` group (request endings, fillers) explains words away.
 
-use crate::analyze::Analyzer;
-use crate::embed::{cosine, TextEmbedder};
-use crate::korean::is_hangul;
-use crate::normalize::{normalize, Word};
-use serde::Serialize;
-use std::collections::HashSet;
-use zena_lexicon::model::compact;
+pub use premium_discount_nms::domain::{DomainEntry, DomainScore, DomainSpec, Hit, EXACT_SCORE, PREFIX_SCORE};
+use premium_discount_nms::embed::TextEmbedder;
 use zena_lexicon::{Action, Lexicon};
 
-/// How a domain was caught.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum Hit {
-    Exact,
-    Prefix,
-    Vector,
+/// Zena's domain bank: entries carry the dictionary node's [`Action`].
+pub type DomainBank<E> = premium_discount_nms::domain::DomainBank<Action, E>;
+
+/// What an utterance may start with to address Zena; removed before matching (`Normalized::addressed`).
+pub const WAKE_WORDS: &[&str] = &["제나야", "제나", "라온 제나", "라온제나", "hey zena", "zena", "raon zena"];
+
+/// Makes Zena's [`WAKE_WORDS`] the NMS core's wake words (process-wide; the router and the banks call it).
+pub fn install_wake_words() {
+    premium_discount_nms::normalize::set_wake_words(WAKE_WORDS);
 }
 
-pub const EXACT_SCORE: f32 = 0.95;
-pub const PREFIX_SCORE: f32 = 0.90;
-
-#[derive(Debug, Clone)]
-pub struct DomainEntry {
-    pub key: String,
-    pub action: Action,
-    bias: Vec<(Vec<f32>, f32)>,
-    prej: Vec<Vec<f32>>,
-    /// `(compact form, word count)` of each exact-match entry.
-    exact: Vec<(String, usize)>,
+/// The dictionary's text nodes as bank specs, and its function phrases.
+pub fn specs(lex: &Lexicon) -> (Vec<DomainSpec<Action>>, Vec<String>) {
+    let specs = lex
+        .text_nodes()
+        .map(|n| DomainSpec {
+            key: n.key.clone(),
+            payload: n.action.clone(),
+            bias: n.bias.iter().map(|p| (p.text.clone(), p.weight)).collect(),
+            prejudice: n.prejudice.iter().map(|p| p.text.clone()).collect(),
+            exact: n.exact_match.clone(),
+        })
+        .collect();
+    (specs, lex.function_phrases().to_vec())
 }
 
-pub struct DomainBank<E: TextEmbedder> {
-    entries: Vec<DomainEntry>,
-    function: HashSet<String>,
-    pub embedder: E,
+/// Building a [`DomainBank`] from the word dictionary.
+pub trait LexiconBank<E: TextEmbedder>: Sized {
+    fn from_lexicon(lex: &Lexicon, embedder: E) -> Self;
+    /// Each phrase embedded by its content words (the rule analyzer strips request endings and auxiliaries), the
+    /// way spans are embedded when an analyzer runs.
+    fn from_lexicon_content(lex: &Lexicon, embedder: E) -> Self;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct DomainScore {
-    /// Index into the bank (`DomainBank::entry`).
-    pub index: usize,
-    pub score: f32,
-    pub bias: f32,
-    pub prej: f32,
-    pub hit: Hit,
-}
-
-impl<E: TextEmbedder> DomainBank<E> {
-    pub fn from_lexicon(lex: &Lexicon, embedder: E) -> Self {
-        Self::build(lex, embedder, false)
+impl<E: TextEmbedder> LexiconBank<E> for DomainBank<E> {
+    fn from_lexicon(lex: &Lexicon, embedder: E) -> Self {
+        install_wake_words();
+        let (specs, function) = specs(lex);
+        premium_discount_nms::domain::DomainBank::from_specs(specs, &function, embedder)
     }
 
-    /// Like [`Self::from_lexicon`], embedding each phrase by its content words (the rule analyzer strips request
-    /// endings and auxiliaries: "리본 달아 봐" → "리본 달아"), the way spans are embedded when an analyzer runs.
-    /// Otherwise the shared endings dominate the phrases of a group and their domains look alike.
-    pub fn from_lexicon_content(lex: &Lexicon, embedder: E) -> Self {
-        Self::build(lex, embedder, true)
-    }
-
-    fn build(lex: &Lexicon, embedder: E, content_only: bool) -> Self {
-        // Every bias / prejudice phrase in one batch (one forward pass for a neural embedder).
-        let nodes: Vec<_> = lex.text_nodes().collect();
-        let phrases: Vec<String> = nodes
-            .iter()
-            .flat_map(|n| n.bias.iter().chain(&n.prejudice).map(|p| p.text.clone()))
-            .map(|p| {
-                if content_only {
-                    let mut n = normalize(&p);
-                    crate::analyze::RuleAnalyzer.analyze(&mut n);
-                    Self::span_text(&n.words)
-                } else {
-                    p
-                }
-            })
-            .collect();
-        let refs: Vec<&str> = phrases.iter().map(String::as_str).collect();
-        let mut vecs = embedder.embed_batch(&refs).into_iter();
-        let entries = nodes
-            .iter()
-            .map(|n| DomainEntry {
-                key: n.key.clone(),
-                action: n.action.clone(),
-                bias: n.bias.iter().map(|p| (vecs.next().unwrap_or_default(), p.weight)).collect(),
-                prej: n.prejudice.iter().map(|_| vecs.next().unwrap_or_default()).collect(),
-                exact: n
-                    .exact_match
-                    .iter()
-                    .map(|e| (compact(&normalize(e).text), normalize(e).words.len().max(1)))
-                    .filter(|(c, _)| !c.is_empty())
-                    .collect(),
-            })
-            .collect();
-        let function = lex
-            .function_phrases()
-            .iter()
-            .flat_map(|p| {
-                let n = normalize(p);
-                let whole = compact(&n.text);
-                n.words.into_iter().map(|w| compact(&w.surface)).chain(std::iter::once(whole))
-            })
-            .filter(|w| !w.is_empty())
-            .collect();
-        Self {
-            entries,
-            function,
-            embedder,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-    pub fn entry(&self, i: usize) -> &DomainEntry {
-        &self.entries[i]
-    }
-    pub fn index_of(&self, key: &str) -> Option<usize> {
-        self.entries.iter().position(|e| e.key == key)
-    }
-
-    /// A word the function bank explains away (request ending, filler).
-    pub fn is_function_word(&self, w: &Word) -> bool {
-        [&w.surface, &w.lemma, &w.stem].iter().any(|f| self.function.contains(&compact(f)))
-    }
-
-    /// Whether a span can name a domain: at least one content word (analyzer role) that the function bank does
-    /// not explain away.
-    pub fn eligible(&self, words: &[Word]) -> bool {
-        words.iter().any(|w| w.is_content() && !self.is_function_word(w))
-    }
-
-    /// The text a span is embedded as: its content words (all words when it has none).
-    pub fn span_text(words: &[Word]) -> String {
-        let content: Vec<&str> = words.iter().filter(|w| w.is_content()).map(|w| w.surface.as_str()).collect();
-        if content.is_empty() {
-            words.iter().map(|w| w.surface.as_str()).collect::<Vec<_>>().join(" ")
-        } else {
-            content.join(" ")
-        }
-    }
-
-    /// STEP 1 (logis-center): exact or agglutinative-prefix match of a span against every `exact_match` entry.
-    pub fn exact(&self, words: &[Word]) -> Option<(usize, Hit)> {
-        if words.is_empty() {
-            return None;
-        }
-        let n = words.len();
-        let head: String = words[..n - 1].iter().map(|w| compact(&w.surface)).collect();
-        let last = &words[n - 1];
-        // The span with its last word as written, josa-peeled, request-stripped, or as the analyzer's lemma.
-        let forms: Vec<String> = [Some(&last.surface), Some(&last.lemma), Some(&last.stem), last.alt.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|f| format!("{head}{}", compact(f)))
-            .collect();
-        let surface = &forms[0];
-        // (entry, matched length, exact beats prefix)
-        let mut hits: Vec<(usize, usize, Hit)> = Vec::new();
-        for (i, e) in self.entries.iter().enumerate() {
-            for (ec, ew) in &e.exact {
-                let len = ec.chars().count();
-                // Spacing does not matter for an exact hit ("종료해 줘" = "종료해줘"); a prefix only extends the
-                // span's last word, so the entry must have as many words as the span.
-                if forms.iter().any(|f| f == ec) {
-                    hits.push((i, len, Hit::Exact));
-                } else if *ew == n && len >= 2 && surface.starts_with(ec.as_str()) && ec.chars().last().is_some_and(is_hangul) {
-                    let rest: Vec<char> = surface[ec.len()..].chars().collect();
-                    if !rest.is_empty() && rest.len() <= 2 && rest.iter().all(|c| is_hangul(*c)) {
-                        hits.push((i, len, Hit::Prefix));
-                    }
-                }
-            }
-        }
-        let rank = |h: &(usize, usize, Hit)| (h.1, h.2 == Hit::Exact);
-        let top = hits.iter().map(rank).max()?;
-        let mut winners: Vec<&(usize, usize, Hit)> = hits.iter().filter(|h| rank(h) == top).collect();
-        winners.dedup_by_key(|h| h.0);
-        // The longest entry wins; two domains tied on it give no exact verdict (logis-center).
-        (winners.len() == 1).then(|| (winners[0].0, winners[0].2))
-    }
-
-    /// Every domain scored for each span, in bank order (`out[span][domain]`): the spans' content texts are
-    /// embedded in one batch, exact / prefix hits override their domain's vector score.
-    pub fn raw_scores(&self, spans: &[&[Word]]) -> Vec<Vec<DomainScore>> {
-        let texts: Vec<String> = spans.iter().map(|s| Self::span_text(s)).collect();
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let vecs = self.embedder.embed_batch(&refs);
-        spans.iter().zip(&vecs).map(|(s, v)| self.scores_for(s, v)).collect()
-    }
-
-    /// Every domain scored for `words` (a span), best first.
-    pub fn score_words(&self, words: &[Word]) -> Vec<DomainScore> {
-        let v = self.embedder.embed(&Self::span_text(words));
-        let mut out = self.scores_for(words, &v);
-        out.sort_by(|a, b| b.score.total_cmp(&a.score));
-        out
-    }
-
-    fn scores_for(&self, words: &[Word], v: &[f32]) -> Vec<DomainScore> {
-        let pw = if words.len() <= 2 { 0.3 } else { 0.7 };
-        let exact = self.exact(words);
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let bias = e.bias.iter().map(|(b, w)| cosine(v, b) * w).fold(0f32, f32::max);
-                let prej = e.prej.iter().map(|p| cosine(v, p)).fold(0f32, f32::max);
-                let mut s = DomainScore {
-                    index: i,
-                    score: (bias - prej * pw).max(0.0),
-                    bias,
-                    prej,
-                    hit: Hit::Vector,
-                };
-                if let Some((j, h)) = exact {
-                    if j == i {
-                        // An exact / prefix match confirms the domain whatever the vectors say.
-                        let x = if h == Hit::Exact { EXACT_SCORE } else { PREFIX_SCORE };
-                        s.score = s.score.max(x);
-                        s.hit = h;
-                    }
-                }
-                s
-            })
-            .collect()
-    }
-
-    /// Every domain scored for free text, best first.
-    pub fn score(&self, text: &str) -> Vec<DomainScore> {
-        self.score_words(&normalize(text).words)
-    }
-
-    /// The best domain of a span, unless the span has no content word.
-    pub fn best(&self, words: &[Word]) -> Option<DomainScore> {
-        if !self.eligible(words) {
-            return None;
-        }
-        self.score_words(words).into_iter().next()
+    fn from_lexicon_content(lex: &Lexicon, embedder: E) -> Self {
+        install_wake_words();
+        let (specs, function) = specs(lex);
+        premium_discount_nms::domain::DomainBank::from_specs_content(specs, &function, embedder)
     }
 }
 
@@ -260,9 +60,25 @@ impl<E: TextEmbedder> DomainBank<E> {
 mod tests {
     use super::*;
     use crate::embed::HashedNgramEmbedder;
+    use crate::normalize::normalize;
 
     pub(crate) fn bank() -> DomainBank<HashedNgramEmbedder> {
         DomainBank::from_lexicon(&Lexicon::bundled(), HashedNgramEmbedder::default())
+    }
+
+    /// The span test that used to live in the NMS core: it needs this dictionary.
+    #[test]
+    fn one_utterance_two_domains() {
+        let bank = bank();
+        let n = normalize("제나야 화면 맨 앞으로 나와서 보스 패턴 어떻게 피해");
+        let hits = crate::span::span_nms(&n.words, &bank, 5, 0.6);
+        let keys: Vec<_> = hits.iter().map(|h| bank.entry(h.index).key.as_str()).collect();
+        assert_eq!(keys, vec!["system.topmost_on", "coach.game_tip"], "{hits:?}");
+        assert!(hits.windows(2).all(|w| w[0].end <= w[1].start));
+        let n = normalize("와 보스 잡았다 이겼어 고마워 제나");
+        let hits = crate::span::span_nms(&n.words, &bank, 5, 0.6);
+        let keys: Vec<_> = hits.iter().map(|h| bank.entry(h.index).key.as_str()).collect();
+        assert!(keys.contains(&"emotion.celebrate") && keys.contains(&"emotion.thanks"), "{keys:?}");
     }
 
     #[test]

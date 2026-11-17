@@ -1,100 +1,87 @@
 //! # raon-vision
 //!
-//! KRAFTON **Raon-VisionEncoder** (LocCa ViT-SO400M-16-SigLIP2, NaFlex) on candle, for Zena's periodic screen watcher —
-//! or, with the same code, **`google/siglip2-so400m-patch16-naflex`** (the identical network in the Hugging Face
-//! layout; [`layout`] maps its names, [`preprocess_for`] its pixel processing).
-//!
-//! * [`layout`]    – the two checkpoint layouts read under one set of names.
-//! * [`tower`]     – the vision tower and MAP head, dense pass plus noto-sandbox's sparse passes
-//!   (`forward_sparse` / `extend_sparse` / `merge_sparse`).
-//! * [`perforate`] – checkerboard / fovea first passes and the minesweeper opening (port of noto-sandbox).
-//! * [`text`]      – the text tower and SigLIP2 tokenizer, used when the dictionary changes to compute anchors.
-//! * [`bank`]      – zero-shot screen domains from the dictionary's `vision` nodes and their anchors.
-//! * [`screen`]    – one screen reading: encode, score, locate.
+//! Raon Zena's screen encoder: premium-discount's `premium-discount-vision` (the SigLIP2 encoder that started here),
+//! re-exported, plus the glue to the word dictionary (`zena-lexicon`): the vision nodes as anchor-bank domains and the
+//! dictionary's prompt templates for the anchors.
 
-pub mod bank;
-pub mod layout;
-pub mod perforate;
-pub mod screen;
-pub mod text;
-pub mod tower;
+pub use premium_discount_vision::*;
 
-use anyhow::{Context, Result};
-use candle_core::Device;
-use raon_quant::safetensors::SafeTensors;
-use std::path::{Path, PathBuf};
+/// The text tower and tokenizer, and [`text::compute_anchors`] over the dictionary's prompt templates.
+pub mod text {
+    pub use premium_discount_vision::text::*;
 
-pub use bank::{Acceptance, AnchorBank, VisionScore};
-pub use layout::Layout;
-pub use zena_sensor::naflex::{Preprocess, Resample};
-pub use perforate::{ExpandCfg, PerfPattern, PerfReport, PerforatedCfg};
-pub use screen::{ScreenConfig, ScreenEncoder, ScreenReading};
-pub use tower::{VisionTower, WeightFormat};
+    use anyhow::Result;
 
-/// The checkpoint file of a Raon-VisionEncoder directory (or the file itself).
-pub fn checkpoint(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join("model.safetensors")
-    } else {
-        path.to_path_buf()
+    /// The prompt-ensembled anchor of every phrase under the dictionary's templates (`VisionPrompting::forms`).
+    pub fn compute_anchors(
+        text: &TextTower,
+        tok: &SiglipTokenizer,
+        prompting: &zena_lexicon::VisionPrompting,
+        phrases: &[String],
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        premium_discount_vision::text::compute_anchors(text, tok, |p| prompting.forms(p), phrases)
     }
 }
 
-/// The layout of a checkpoint (reads only the safetensors header); Raon-VE when the file cannot be read.
-pub fn layout_of(path: &Path) -> Layout {
-    let f = checkpoint(path);
-    SafeTensors::open(std::slice::from_ref(&f)).map(|st| Layout::detect(&st)).unwrap_or(Layout::RaonVe)
+/// The dictionary's `vision` nodes as anchor-bank domains.
+pub fn vision_specs(lex: &zena_lexicon::Lexicon) -> Vec<VisionDomainSpec> {
+    lex.vision
+        .iter()
+        .map(|v| VisionDomainSpec {
+            key: v.key.clone(),
+            kind: v.kind,
+            link: v.link.clone(),
+            cooldown_s: v.cooldown_s(),
+            bias: v.bias.iter().map(|p| (p.text.clone(), p.weight)).collect(),
+            prejudice: v.prejudice.iter().map(|p| p.text.clone()).collect(),
+        })
+        .collect()
 }
 
-/// A name for the checkpoint that changes when the weights change (anchors computed by another checkpoint are
-/// stale): the layout's family and the file size (`raon-ve:<bytes>`, `siglip2-hf:<bytes>`). Swapping Raon-VE for
-/// google's SigLIP2 always changes it, even if a size ever matched.
-pub fn fingerprint(path: &Path) -> String {
-    let f = checkpoint(path);
-    let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
-    format!("{}:{size}", layout_of(path).tag())
+/// Building the [`AnchorBank`] from the word dictionary.
+pub trait LexiconAnchors: Sized {
+    /// The vision nodes whose bias prompts all have anchors (background prejudice prompts compete separately).
+    fn build(lex: &zena_lexicon::Lexicon, anchors: &std::collections::HashMap<String, Vec<f32>>, scale: f32, bias: f32) -> Self;
 }
 
-/// How the checkpoint's processor treats pixels. `preprocessor_config.json` next to the checkpoint wins
-/// (`image_mean`, `image_std`, `resample`); without one, the layout decides: google's SigLIP2 → mean = std = 0.5,
-/// bilinear; Raon-VE → CLIP mean / std, bicubic.
-pub fn preprocess_for(path: &Path) -> Preprocess {
-    let layout_default = match layout_of(path) {
-        Layout::Siglip2Hf => Preprocess::SIGLIP2,
-        Layout::RaonVe => Preprocess::RAON_VE,
-    };
-    let dir = if path.is_dir() { path.to_path_buf() } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
-    let Ok(text) = std::fs::read_to_string(dir.join("preprocessor_config.json")) else {
-        return layout_default;
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return layout_default;
-    };
-    let triple = |key: &str| -> Option<[f32; 3]> {
-        let a = cfg.get(key)?.as_array()?;
-        if a.len() != 3 {
-            return None;
+impl LexiconAnchors for AnchorBank {
+    fn build(lex: &zena_lexicon::Lexicon, anchors: &std::collections::HashMap<String, Vec<f32>>, scale: f32, bias: f32) -> Self {
+        AnchorBank::from_specs(&vision_specs(lex), &lex.prompting.background, |t| lex.prompting.is_background(t), anchors, scale, bias)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use zena_lexicon::Lexicon;
+
+    fn unit(seed: f32) -> Vec<f32> {
+        let v: Vec<f32> = (0..32).map(|i| ((i as f32 + 1.0) * seed).sin()).collect();
+        premium_discount_vision::tower::unit(v)
+    }
+
+    #[test]
+    fn the_nearest_anchor_wins_and_prejudice_lowers_a_look_alike() {
+        let lex = Lexicon::bundled();
+        let mut anchors = HashMap::new();
+        for (i, p) in lex.vision_phrases().iter().enumerate() {
+            anchors.insert(p.clone(), unit(0.1 + i as f32 * 0.37));
         }
-        Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32, a[2].as_f64()? as f32])
-    };
-    Preprocess {
-        mean: triple("image_mean").unwrap_or(layout_default.mean),
-        std: triple("image_std").unwrap_or(layout_default.std),
-        resample: cfg
-            .get("resample")
-            .and_then(|r| r.as_u64())
-            .and_then(Resample::from_pil)
-            .unwrap_or(layout_default.resample),
+        let bank = <AnchorBank as LexiconAnchors>::build(&lex, &anchors, 10.0, -2.0);
+        assert_eq!(bank.domains.len(), lex.vision.len());
+        let over = &anchors["a game over screen"];
+        let s = bank.score(over);
+        assert_eq!(s[0].key, "vision.game_defeat");
+        assert!(s[0].bias > 0.99);
+        // "a game over screen" is the victory node's prejudice: its score is pulled down.
+        let win = s.iter().find(|x| x.key == "vision.game_victory").unwrap();
+        assert!(win.prejudice > 0.99 && win.score < win.bias);
+        // Nodes without anchors are left out until the anchors exist.
+        anchors.remove("a game over screen");
+        assert!(<AnchorBank as LexiconAnchors>::build(&lex, &anchors, 10.0, -2.0)
+            .index_of("vision.game_defeat")
+            .is_none());
     }
-}
 
-/// The vision tower and SigLIP's calibration `(exp(logit_scale), logit_bias)`.
-pub fn load_vision(path: &Path, device: &Device, format: WeightFormat) -> Result<(VisionTower, f32, f32)> {
-    let f = checkpoint(path);
-    let st = SafeTensors::open(std::slice::from_ref(&f)).with_context(|| f.display().to_string())?;
-    let tower = VisionTower::load(&st, device, format)?;
-    let w = layout::Weights::new(&st);
-    let scale = w.all_f32("logit_scale")?[0].exp();
-    let bias = w.all_f32("logit_bias")?[0];
-    Ok((tower, scale, bias))
 }

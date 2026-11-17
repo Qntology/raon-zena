@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 zena-core = { path = "../../crates/zena-core" }
-zena-sensor = { path = "../../crates/zena-sensor" }
+premium-discount-sensor.workspace = true
 nlp-nms-router = { path = "../../crates/nlp-nms-router" }
 raon-quant = { path = "../../crates/raon-quant" }
 raon-infer = { path = "../../crates/raon-infer" }

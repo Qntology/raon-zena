@@ -1,13 +1,9 @@
 [package]
 name = "zena-sds"
-description = "Score Dynamics (SDS) for Raon Zena: per-scope adaptive baselines (Welford + recent ring) with hierarchical backoff, decay shapes, confusion ledger, transition priors, double centering and adaptive exclusive assignment — ported from Qntology/logis-center"
+description = "Score Dynamics (SDS) for Raon Zena: premium-discount-sds re-exported (Welford + ring, scope backoff ledger, confusion, transition priors, double centering, adaptive exclusive assignment)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow = "1"
-# Welford arithmetic shared with premium-discount-nav
 premium-discount-sds.workspace = true
-serde.workspace = true
-serde_json.workspace = true
