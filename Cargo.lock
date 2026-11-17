@@ -2200,6 +2200,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
+ "const-oid 0.9.6",
  "crypto-common 0.1.7",
  "subtle",
 ]
@@ -2316,6 +2317,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
+name = "ecdsa"
+version = "0.16.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
+dependencies = [
+ "der",
+ "digest 0.10.7",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,6 +2343,7 @@ checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
 dependencies = [
  "base16ct",
  "crypto-bigint",
+ "digest 0.10.7",
  "ff",
  "generic-array",
  "group",
@@ -3242,6 +3257,15 @@ version = "0.2.0"
 source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#ebaf93db065f22be67a9a4a250eec5a212e143fe"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3805,7 +3829,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
 dependencies = [
  "cfg-if",
+ "ecdsa",
  "elliptic-curve",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5794,6 +5820,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
+name = "pd-identity"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=540311b8efdd6ee9e62baaf164b1db21241f60db#540311b8efdd6ee9e62baaf164b1db21241f60db"
+dependencies = [
+ "getrandom 0.3.4",
+ "hmac",
+ "k256",
+ "pbkdf2",
+ "sha2 0.10.9",
+ "tiny-keccak",
+ "zeroize",
+]
+
+[[package]]
+name = "pd-nav"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=540311b8efdd6ee9e62baaf164b1db21241f60db#540311b8efdd6ee9e62baaf164b1db21241f60db"
+dependencies = [
+ "pd-identity",
+ "pd-verdict",
+ "serde",
+]
+
+[[package]]
+name = "pd-verdict"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=540311b8efdd6ee9e62baaf164b1db21241f60db#540311b8efdd6ee9e62baaf164b1db21241f60db"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "peeking_take_while"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6006,11 +6074,12 @@ name = "premium-discount-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "k256",
+ "pd-identity",
+ "pd-nav",
+ "pd-verdict",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tiny-keccak",
  "unicode-normalization",
  "ureq",
  "zena-avatar-mcp",
@@ -6661,6 +6730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfc6979"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+dependencies = [
+ "hmac",
+ "subtle",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7139,6 +7218,16 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "digest 0.10.7",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -9157,6 +9246,8 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "ureq",
  "zena-core",
 ]
 
@@ -9232,6 +9323,7 @@ dependencies = [
 name = "zena-verdict"
 version = "0.1.0"
 dependencies = [
+ "pd-verdict",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -11,9 +11,11 @@ anyhow = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
-# ethers-compatible hashId: keccak256 + secp256k1 public key (ethers.computeAddress(ethers.hashMessage(text)))
-tiny-keccak = { version = "2", features = ["keccak"] }
-k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+# ethers-compatible hashId (ethers.computeAddress(ethers.hashMessage(text))): premium-discount's own implementation
+pd-identity.workspace = true
+# Accessibility navigation (candidate merge, numbering, sensitive screens) and the verdict tiers it orders by
+pd-nav.workspace = true
+pd-verdict.workspace = true
 unicode-normalization = "0.1"
 # GET /graph* (premium-discount-app has no graph command); the same ureq 2 the onnxruntime build already uses
 ureq = "2"

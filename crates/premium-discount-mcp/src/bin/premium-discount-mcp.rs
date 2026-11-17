@@ -6,14 +6,15 @@
 //! `pd_graph_inspect`, `pd_auth_session`, `pd_model_manage`. premium-discount-app is started on the first tool
 //! that needs it and stopped after `--idle-secs` (default 300, 0 = never) without calls.
 //!
-//! Defaults: `--pd-app` from `$PD_APP`, next to this executable or on `PATH`; `--home` is
+//! Defaults: `--pd-app` from `$PD_APP`, next to this executable, `<home>/pd-app.json`, the premium.discount desktop
+//! install folder or `PATH` ([`premium_discount_mcp::find_pd_app`]); `--home` is
 //! `%LOCALAPPDATA%\RaonZena\premium-discount` (`model/`, `data/`); `--model-dir` / `--data-dir` /
 //! `--server-url` also read `PD_MODEL_DIR` / `PD_DATA_DIR` / `PD_SERVER_URL`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use premium_discount_mcp::{default_home, find_pd_app, AppConfig, PdSyncServer, ProcessBackend, DEFAULT_SERVER_URL, SERVER_NAME};
+use premium_discount_mcp::{default_home, find_pd_app_with, AppConfig, PdSyncServer, ProcessBackend, DEFAULT_SERVER_URL, SERVER_NAME};
 use zena_avatar_mcp::protocol::serve;
 
 const USAGE: &str = "usage: premium-discount-mcp [--pd-app PATH] [--home DIR] [--model-dir DIR] [--data-dir DIR] \
@@ -68,7 +69,10 @@ fn main() {
     }
     let home = home.unwrap_or_else(default_home);
     let config = AppConfig {
-        program: pd_app.unwrap_or_else(find_pd_app),
+        program: pd_app.unwrap_or_else(|| {
+            let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+            find_pd_app_with(&env, std::env::current_exe().ok().as_deref(), &home)
+        }),
         model_dir: model_dir.unwrap_or_else(|| home.join("model")),
         data_dir: data_dir.unwrap_or_else(|| home.join("data")),
         server_url: server_url.unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),

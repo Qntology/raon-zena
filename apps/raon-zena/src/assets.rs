@@ -172,6 +172,7 @@ mod tests {
             subculture_mcp: None,
             vrm_path: None,
             chibi_kit: None,
+            catalog: None,
             stamp_frames: 4,
         };
         let a = Assets::spawn(cfg, Collect(Mutex::new(tx)));

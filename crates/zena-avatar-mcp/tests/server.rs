@@ -27,7 +27,12 @@ fn server_exe() -> &'static Path {
 #[test]
 fn client_drives_the_subculture_server() {
     let allow = temp("server");
-    let mut c = McpClient::spawn(server_exe(), &["--allow-path".into(), allow.display().to_string()]).unwrap();
+    let cache = temp("server-cache");
+    let mut c = McpClient::spawn(
+        server_exe(),
+        &["--allow-path".into(), allow.display().to_string(), "--cache-dir".into(), cache.display().to_string()],
+    )
+    .unwrap();
     assert_eq!(c.server_name(), "zena-subculture-mcp");
     let tools = c.list_tools().unwrap();
     assert_eq!(
@@ -38,9 +43,23 @@ fn client_drives_the_subculture_server() {
             "forge_prop",
             "robot_body",
             "vrm_expressions",
-            "emote_morphs"
+            "emote_morphs",
+            "list_avatar_models",
+            "fetch_avatar_model"
         ]
     );
+
+    // The catalog: pinned models, nothing cached yet; the built-in kit needs no download.
+    let models = result_json(&c.call_tool("list_avatar_models", json!({}), T).unwrap());
+    let list = models["models"].as_array().unwrap();
+    let default_vrm = list.iter().find(|m| m["kind"] == "vrm" && m["default"] == true).unwrap();
+    assert_eq!(default_vrm["id"], "vrm1-twist-sample");
+    assert_eq!(default_vrm["cached"], false);
+    assert_eq!(default_vrm["files"][0]["sha256"].as_str().unwrap().len(), 64);
+    let kits = result_json(&c.call_tool("list_avatar_models", json!({"kind": "chibi_kit"}), T).unwrap());
+    assert!(kits["models"].as_array().unwrap().iter().all(|m| m["kind"] == "chibi_kit"));
+    assert!(c.call_tool("fetch_avatar_model", json!({"id": "builtin-chibi"}), T).is_err());
+    assert!(c.call_tool("fetch_avatar_model", json!({"id": "nope"}), T).is_err());
 
     let emotes = result_json(&c.call_tool("list_emotes", json!({}), T).unwrap());
     let list = emotes["emotes"].as_array().unwrap();

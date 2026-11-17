@@ -32,6 +32,15 @@ memmap2 = "0.9"
 half = "2"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
+# premium-discount's library crates (`crates/` of github.com/Qntology/premium-discount): the PD-Verdict judge,
+# the hashId / wallet identity and the accessibility-navigation core. They depend on no LanceDB, HTTP, Tauri or
+# model runtime, so they link into this workspace (LanceDB 0.41) as they do into premium-discount-app (0.31).
+# Pinned by revision; to build against a checkout next to this one, add
+# `[patch."https://github.com/Qntology/premium-discount"]` with `pd-verdict = { path = "../premium-discount/crates/pd-verdict" }`
+# (and the same for pd-identity, pd-nav).
+pd-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
+pd-identity = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
+pd-nav = { git = "https://github.com/Qntology/premium-discount", rev = "540311b8efdd6ee9e62baaf164b1db21241f60db" }
 
 [profile.release]
 opt-level = 3

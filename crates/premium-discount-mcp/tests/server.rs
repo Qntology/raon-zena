@@ -316,6 +316,64 @@ fn the_binary_speaks_mcp_without_premium_discount_app() {
     assert_eq!(g["summary"]["tiers"]["premium"], 1);
     assert_eq!(g["summary"]["threads"][0]["root"], ID);
     assert!(http.join().unwrap().starts_with("GET /graph?cc=code.exe "));
+
+    // Neither does numbering (pd-nav in process).
+    let n = result_json(&c.call_tool("pd_nav_number", nav_screen(false), Duration::from_secs(30)).unwrap());
+    assert_eq!(n["regions"][0]["number"], 1);
     drop(c);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+fn region(anchor: &str, role: &str, rect: [f32; 4], source: &str, sensitive: bool) -> Value {
+    json!({"anchor": anchor, "role": role, "name": anchor, "rect": {"x": rect[0], "y": rect[1], "w": rect[2], "h": rect[3]},
+           "source": source, "score": 0.9, "sensitive": sensitive})
+}
+
+/// A login form: a tree button, a vision box over the same button, a link, a vision-only icon, an event over the
+/// link, and a box entirely outside the window.
+fn nav_screen(sensitive: bool) -> Value {
+    json!({
+        "regions": [
+            region("text:intro", "text", [0.1, 0.05, 0.8, 0.1], "tree", false),
+            region("btn:login", "button", [0.6, 0.5, 0.2, 0.08], "tree", false),
+            region("vis:btn", "button", [0.61, 0.5, 0.2, 0.08], "vision", false),
+            region("link:help", "link", [0.1, 0.8, 0.2, 0.05], "tree", false),
+            region("evt:help", "other", [0.1, 0.8, 0.2, 0.05], "event", false),
+            region("vis:icon", "image", [0.9, 0.9, 0.05, 0.05], "vision", false),
+            region("pw", "input", [0.1, 0.5, 0.3, 0.08], "tree", sensitive),
+            region("gone", "button", [1.5, 1.5, 0.1, 0.1], "tree", false),
+        ],
+        "tiers": {"link:help": "premium", "btn:login": "discount"},
+    })
+}
+
+#[test]
+fn nav_number_uses_premium_discounts_rules() {
+    let n = premium_discount_mcp::server::nav_number(&nav_screen(false)).unwrap();
+    assert_eq!(n["sensitive"], false);
+    assert_eq!(n["record"], true);
+    assert_eq!(n["dropped"], 1, "the box outside the window");
+    let order: Vec<(&str, i64)> = n["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["region"]["anchor"].as_str().unwrap(), r["number"].as_i64().unwrap()))
+        .collect();
+    // The vision box over the button and the event over the link merge into the tree regions; the link is
+    // premium (first, marked changed), the button discount (last); in between: input, text, image by role.
+    assert_eq!(order, vec![("link:help", 1), ("pw", 2), ("text:intro", 3), ("vis:icon", 4), ("btn:login", 5)]);
+    assert_eq!(n["regions"][0]["tier"], "premium");
+    assert_eq!(n["regions"][0]["region"]["changed"], true);
+    assert_eq!(n["regions"][4]["tier"], "discount");
+
+    // A password field makes the screen sensitive: tree candidates only, and nothing is recorded.
+    let n = premium_discount_mcp::server::nav_number(&nav_screen(true)).unwrap();
+    assert_eq!((n["sensitive"].as_bool(), n["record"].as_bool()), (Some(true), Some(false)));
+    let anchors: Vec<&str> = n["regions"].as_array().unwrap().iter().map(|r| r["region"]["anchor"].as_str().unwrap()).collect();
+    assert!(!anchors.contains(&"vis:icon"), "{anchors:?}");
+    assert_eq!(anchors.len(), 4);
+
+    let bad = premium_discount_mcp::server::nav_number(&json!({"regions": [], "tiers": {"a": "great"}}));
+    assert!(bad.is_err());
+    assert!(premium_discount_mcp::server::nav_number(&json!({"regions": [], "iou": 2})).is_err());
 }

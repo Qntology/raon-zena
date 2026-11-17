@@ -17,7 +17,62 @@ use zena_lexicon::Lexicon;
 pub struct Loaded {
     pub lexicon: Lexicon,
     pub anchors: HashMap<String, Vec<f32>>,
+    /// The vision checkpoint the anchors were computed with (`raon_vision::fingerprint`), empty if none.
+    pub anchors_model: String,
     pub source: String,
+}
+
+/// What the dictionary service needs to recompute anchors itself when the screen model changes.
+#[derive(Clone, Debug)]
+pub struct Reanchor {
+    /// The screen watcher's vision checkpoint (`--screen`).
+    pub model: PathBuf,
+    /// Its SigLIP2 tokenizer: `--screen-tokenizer`, else `tokenizer.json` next to the checkpoint.
+    pub tokenizer: PathBuf,
+}
+
+impl Reanchor {
+    /// `tokenizer` or the checkpoint folder's `tokenizer.json` (google's SigLIP2 ships one there); `None` when
+    /// neither exists.
+    pub fn find(model: &Path, tokenizer: Option<&Path>) -> Option<Reanchor> {
+        let dir = if model.is_dir() { model.to_path_buf() } else { model.parent()?.to_path_buf() };
+        let tok = tokenizer.map(Path::to_path_buf).unwrap_or_else(|| dir.join("tokenizer.json"));
+        tok.is_file().then(|| Reanchor {
+            model: model.to_path_buf(),
+            tokenizer: tok,
+        })
+    }
+}
+
+/// When the stored anchors were computed by another checkpoint than `r.model` (Raon-VE swapped for google's
+/// SigLIP2, or a new download), every screen prompt is embedded again with `r.model`'s text tower (CPU, Q8_0: it is
+/// loaded for this only and dropped) and stored under the new fingerprint. `Ok(None)` when they already match.
+#[cfg(feature = "lexicon-db")]
+pub fn reanchor_if_stale(store: &zena_lexicon::LexiconStore, r: &Reanchor) -> Result<Option<usize>> {
+    let want = raon_vision::fingerprint(&r.model);
+    let have = store.anchors()?;
+    let lex = store.load()?;
+    let phrases = lex.anchor_phrases();
+    if phrases.is_empty() || (have.model == want && phrases.iter().all(|p| have.vectors.contains_key(p))) {
+        return Ok(None);
+    }
+    eprintln!(
+        "[lexicon] screen anchors were computed by '{}', the screen model is '{want}': embedding {} prompts again",
+        if have.model.is_empty() { "nothing" } else { &have.model },
+        phrases.len()
+    );
+    let t = std::time::Instant::now();
+    let text = raon_vision::text::TextTower::load(
+        &raon_vision::checkpoint(&r.model),
+        &raon_infer::device::select_device(raon_infer::device::Backend::Cpu, 0)?,
+        raon_vision::WeightFormat::Q8,
+    )?;
+    let tok = raon_vision::text::SiglipTokenizer::load(&r.tokenizer)?;
+    let anchors = raon_vision::text::compute_anchors(&text, &tok, &lex.prompting, &phrases)?;
+    drop(text);
+    let n = store.set_anchors(&want, &anchors)?;
+    eprintln!("[lexicon] {n} anchors recomputed in {:.1}s", t.elapsed().as_secs_f32());
+    Ok(Some(n))
 }
 
 /// Something the pipeline asks the dictionary service to do.
@@ -70,6 +125,7 @@ pub fn open(db: &Path, seed: Option<&Path>) -> Result<Loaded> {
         source: format!("LanceDB {} (revision {})", db.display(), lexicon.version),
         lexicon,
         anchors: anchors.vectors,
+        anchors_model: anchors.model,
     })
 }
 
@@ -78,6 +134,7 @@ pub fn open(_db: &Path, seed: Option<&Path>) -> Result<Loaded> {
     Ok(Loaded {
         lexicon: read_json(seed)?,
         anchors: HashMap::new(),
+        anchors_model: String::new(),
         source: "JSON (built without the LanceDB store)".into(),
     })
 }
@@ -90,6 +147,7 @@ pub fn spawn_service(
     promote_at: u32,
     to_router: Sender<Lexicon>,
     to_watcher: Option<Sender<AnchorsUpdate>>,
+    reanchor: Option<Reanchor>,
 ) -> Sender<LexiconMsg> {
     use std::sync::mpsc::{channel, RecvTimeoutError};
     use zena_lexicon::store::Learned;
@@ -102,6 +160,12 @@ pub fn spawn_service(
                 Err(e) => return eprintln!("[lexicon] service not started: {e:#}"),
             };
             let mut last = store.revision().unwrap_or(0);
+            // Once per service: a failed recompute is reported, not retried every poll.
+            if let Some(r) = &reanchor {
+                if let Err(e) = reanchor_if_stale(&store, r) {
+                    eprintln!("[lexicon] anchors not recomputed for {}: {e:#}", r.model.display());
+                }
+            }
             loop {
                 match rx.recv_timeout(poll) {
                     Ok(LexiconMsg::Learn { key, span }) => match store.learn(&key, &span, promote_at) {
@@ -127,6 +191,7 @@ pub fn spawn_service(
                             let _ = w.send(AnchorsUpdate {
                                 lexicon: lex.clone(),
                                 anchors: anchors.vectors,
+                                model: anchors.model,
                             });
                         }
                         if to_router.send(lex).is_err() {
@@ -148,6 +213,7 @@ pub fn spawn_service(
     _promote_at: u32,
     _to_router: Sender<Lexicon>,
     _to_watcher: Option<Sender<AnchorsUpdate>>,
+    _reanchor: Option<Reanchor>,
 ) -> Sender<LexiconMsg> {
     std::sync::mpsc::channel().0
 }

@@ -167,7 +167,7 @@ fn main() -> Result<()> {
             println!("restored revision {rev} as revision {}", store.rollback(rev)?);
         }
         "anchors" | "nearest" => {
-            let model = model.ok_or_else(|| anyhow!("--model <Raon-VisionEncoder dir> is required"))?;
+            let model = model.ok_or_else(|| anyhow!("--model <Raon-VisionEncoder or google/siglip2-so400m-patch16-naflex dir> is required"))?;
             let tokenizer = tokenizer.ok_or_else(|| anyhow!("--tokenizer <timm/ViT-SO400M-16-SigLIP2-256 tokenizer.json> is required"))?;
             let dev = raon_infer::device::select_device(device, 0)?;
             let t = std::time::Instant::now();
@@ -223,7 +223,7 @@ fn main() -> Result<()> {
                 perforation,
                 seed_labels: 3,
             };
-            let grid = zena_sensor::naflex::patchify_frame(&rgb, w, h, patches);
+            let grid = zena_sensor::naflex::patchify_frame_with(&rgb, w, h, patches, &raon_vision::preprocess_for(&model));
             let r = raon_vision::screen::read_pass(&tower, &cfg, &grid, &bank)?;
             println!(
                 "{w}x{h} → {}x{} grid, {} of {} tokens through the encoder, {:.0} ms",

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 use zena_lexicon::{Lexicon, VisionKind};
-use zena_sensor::naflex::patchify_frame;
+use zena_sensor::naflex::patchify_frame_with;
 
 /// One frame for the watcher (RGB8). Zeroed when dropped.
 pub struct ScreenFrame {
@@ -60,6 +60,9 @@ pub struct ScreenObservation {
 pub struct AnchorsUpdate {
     pub lexicon: Lexicon,
     pub anchors: HashMap<String, Vec<f32>>,
+    /// `raon_vision::fingerprint` of the checkpoint that computed `anchors`. Anchors from another checkpoint are
+    /// never used (google's SigLIP2 and Raon-VE share the 1152-dimensional shape but not the space).
+    pub model: String,
 }
 
 pub struct WatcherConfig {
@@ -142,14 +145,25 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                 screen.perforation.map(|p| p.tag()).unwrap_or_else(|| "full".into())
             );
             let enc = ScreenEncoder::new(tower, screen);
+            let fingerprint = raon_vision::fingerprint(&cfg.model);
+            // Raon-VE: CLIP mean / std, bicubic; google's SigLIP2: 0.5 / 0.5, bilinear (preprocessor_config.json).
+            let preprocess = raon_vision::preprocess_for(&cfg.model);
             let mut bank = AnchorBank::empty(scale, bias);
             let mut last_thumb: Option<Vec<f32>> = None;
             let mut paused_until: Option<Instant> = None;
             let mut warned = false;
             loop {
                 for u in updates.try_iter() {
-                    bank = AnchorBank::build(&u.lexicon, &u.anchors, scale, bias);
                     last_thumb = None;
+                    if !u.anchors.is_empty() && u.model != fingerprint {
+                        bank = AnchorBank::empty(scale, bias);
+                        eprintln!(
+                            "[screen] the anchors were computed by '{}', this model is '{fingerprint}': not used until they are recomputed",
+                            u.model
+                        );
+                        continue;
+                    }
+                    bank = AnchorBank::build(&u.lexicon, &u.anchors, scale, bias);
                     eprintln!("[screen] {} screen domains anchored", bank.domains.len());
                 }
                 let frame = match frames.recv_timeout(Duration::from_millis(500)) {
@@ -171,7 +185,7 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                 if last_thumb.as_ref().is_some_and(|l| changed(l, &thumb) < cfg.change_min) {
                     continue;
                 }
-                let grid = patchify_frame(&frame.rgb, frame.w, frame.h, enc.cfg.max_patches);
+                let grid = patchify_frame_with(&frame.rgb, frame.w, frame.h, enc.cfg.max_patches, &preprocess);
                 drop(frame);
                 let reading = match enc.read(&grid, &bank) {
                     Ok(r) => r,

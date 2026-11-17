@@ -46,8 +46,13 @@ pub struct ServiceConfig {
     pub subculture_mcp: Option<PathBuf>,
     /// The Track B-2 `.vrm` model.
     pub vrm_path: Option<PathBuf>,
-    /// A `kit.json` directory for Track B-1 (else the built-in kit).
+    /// A `kit.json` directory for Track B-1 (else the catalog's default kit, else the built-in kit).
     pub chibi_kit: Option<PathBuf>,
+    /// The avatar catalog's root ([`crate::catalog`], normally the asset cache). When set, Track B-2 without
+    /// [`Self::vrm_path`] downloads the catalog's default `.vrm` (pinned, SHA-256 checked) instead of failing back
+    /// to the procedural face, and Track B-1 without [`Self::chibi_kit`] uses the catalog's default kit when it
+    /// is a downloadable one. `None`: no downloads.
+    pub catalog: Option<PathBuf>,
     /// Frames per stamp atlas (8).
     pub stamp_frames: usize,
 }
@@ -61,6 +66,7 @@ impl ServiceConfig {
             subculture_mcp: None,
             vrm_path: None,
             chibi_kit: None,
+            catalog: None,
             stamp_frames: 8,
         }
     }
@@ -150,6 +156,7 @@ struct Worker {
     subculture: Option<McpClient>,
     subculture_tried: bool,
     kit: Option<ChibiKit>,
+    kit_resolved: bool,
 }
 
 const VIA_SOLIDCRAFT: &str = "solidcraft";
@@ -167,6 +174,7 @@ impl Worker {
             subculture: None,
             subculture_tried: false,
             kit: None,
+            kit_resolved: false,
         }
     }
 
@@ -178,7 +186,10 @@ impl Worker {
                 self.mesh_asset("robot_zena.glb", |sc, out| sc.forge_robot(out), crate::forge::robot_zena)
             }
             AssetRequest::Body(AvatarTrack::Subculture3d) => {
-                let path = self.cfg.vrm_path.clone().context("no VRM model configured (vrm_path)")?;
+                let path = match self.cfg.vrm_path.clone() {
+                    Some(p) => p,
+                    None => self.catalog_vrm()?,
+                };
                 let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
                 let mesh = load_glb(&bytes).with_context(|| format!("loading {}", path.display()))?;
                 if mesh.positions.is_empty() {
@@ -190,7 +201,8 @@ impl Worker {
                 Ok((path, VIA_IN_PROCESS))
             }
             AssetRequest::Body(AvatarTrack::Subculture2d) => {
-                let path = self.cfg.cache_dir.join("body_2d.png");
+                self.resolve_kit();
+                let path = self.cfg.cache_dir.join(format!("body_2d{}.png", self.kit_tag()));
                 if cached(&path) {
                     return Ok((path, VIA_CACHE));
                 }
@@ -220,7 +232,60 @@ impl Worker {
         }
     }
 
+    /// The catalog's default `.vrm`, downloaded into the catalog root when it is not there yet.
+    fn catalog_vrm(&mut self) -> Result<PathBuf> {
+        let root = self.cfg.catalog.clone().context("no VRM model configured (vrm_path) and no avatar catalog")?;
+        let entries = crate::catalog::load(&root)?;
+        let entry = crate::catalog::default_of(&entries, crate::catalog::Kind::Vrm).context("the avatar catalog has no default .vrm")?;
+        if !crate::catalog::is_cached(&root, entry) {
+            eprintln!(
+                "[asset-service] no VRM configured: downloading {} ({} bytes, {})",
+                entry.id,
+                entry.download_size(),
+                entry.license
+            );
+        }
+        let path = crate::catalog::fetch(&root, entry, &mut |_, _, _| {})?;
+        self.cfg.vrm_path = Some(path.clone());
+        Ok(path)
+    }
+
+    /// Once: without a configured kit, the catalog's default kit if it is a downloadable one (fetched now).
+    fn resolve_kit(&mut self) {
+        if self.kit_resolved {
+            return;
+        }
+        self.kit_resolved = true;
+        let (None, Some(root)) = (&self.cfg.chibi_kit, self.cfg.catalog.clone()) else {
+            return;
+        };
+        let picked = crate::catalog::load(&root).and_then(|entries| {
+            match crate::catalog::default_of(&entries, crate::catalog::Kind::ChibiKit) {
+                Some(e) if !e.files.is_empty() => crate::catalog::fetch(&root, e, &mut |_, _, _| {}).map(Some),
+                _ => Ok(None),
+            }
+        });
+        match picked {
+            Ok(Some(dir)) => self.cfg.chibi_kit = Some(dir),
+            Ok(None) => {}
+            Err(e) => eprintln!("[asset-service] catalog kit: {e:#}; using the built-in kit"),
+        }
+    }
+
+    /// Cache-name suffix of the kit in use (empty for the built-in kit), so a new kit never shows old images.
+    fn kit_tag(&self) -> String {
+        match &self.cfg.chibi_kit {
+            None => String::new(),
+            Some(dir) => {
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let clean: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(40).collect();
+                format!("_{}", if clean.is_empty() { "kit".into() } else { clean })
+            }
+        }
+    }
+
     fn kit(&mut self) -> &ChibiKit {
+        self.resolve_kit();
         if self.kit.is_none() {
             let kit = match &self.cfg.chibi_kit {
                 Some(dir) => ChibiKit::load(dir).unwrap_or_else(|e| {
@@ -287,6 +352,7 @@ impl Worker {
     }
 
     fn subculture(&mut self) -> Option<&mut McpClient> {
+        self.resolve_kit();
         if !self.subculture_tried {
             self.subculture_tried = true;
             if let Some(exe) = self.cfg.subculture_mcp.clone() {
@@ -306,7 +372,8 @@ impl Worker {
 
     fn stamp(&mut self, emote: CharacterEmote) -> Result<(PathBuf, &'static str)> {
         let frames = self.cfg.stamp_frames.max(1);
-        let dir = self.cfg.cache_dir.join(format!("stamps_{frames}f"));
+        self.resolve_kit();
+        let dir = self.cfg.cache_dir.join(format!("stamps_{frames}f{}", self.kit_tag()));
         let path = dir.join(format!("chibi_{}.png", emote.name()));
         if cached(&path) {
             return Ok((path, VIA_CACHE));
@@ -438,6 +505,107 @@ mod tests {
         assert_eq!(again.via, "cache");
         assert_eq!(again.path, arrow.path);
         assert!(t.elapsed() < Duration::from_secs(5));
+        drop(svc);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Serves `files` (path → bytes) over HTTP on 127.0.0.1 until the process ends.
+    fn serve_files(files: Vec<(&'static str, Vec<u8>)>) -> String {
+        use std::io::{BufRead, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut line = String::new();
+                while r.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                match files.iter().find(|(p, _)| *p == path) {
+                    Some((_, body)) => {
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = s.write_all(head.as_bytes());
+                        let _ = s.write_all(body);
+                    }
+                    None => {
+                        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn the_catalog_fills_in_a_missing_vrm_and_kit() {
+        use crate::catalog::{CatalogFile, Entry, Kind};
+        use image::{Rgba, RgbaImage};
+        let dir = std::env::temp_dir().join(format!("zena-mcp-test-{}-catalog-service", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let model = write_glb(&crate::forge::robot_zena());
+        let mut body = Vec::new();
+        RgbaImage::from_pixel(160, 160, Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut body), image::ImageFormat::Png)
+            .unwrap();
+        let kit = br#"{"size": [160, 160], "layers": {"body": {"default": {"png": "body.png", "offset": [0, 0]}}}}"#.to_vec();
+        let base = serve_files(vec![("/model.vrm", model.clone()), ("/kit.json", kit.clone()), ("/body.png", body.clone())]);
+        let sha = |b: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+        };
+        let file = |path: &str, b: &[u8]| CatalogFile {
+            path: path.into(),
+            url: format!("{base}/{path}"),
+            sha256: sha(b),
+            size: b.len() as u64,
+        };
+        let entry = |id: &str, kind: Kind, files: Vec<CatalogFile>| Entry {
+            id: id.into(),
+            kind,
+            name: id.into(),
+            author: "test".into(),
+            license: "CC0-1.0".into(),
+            license_url: String::new(),
+            credit: String::new(),
+            note: String::new(),
+            default: true,
+            files,
+        };
+        let user = vec![
+            entry("test-model", Kind::Vrm, vec![file("model.vrm", &model)]),
+            entry("test-kit", Kind::ChibiKit, vec![file("kit.json", &kit), file("body.png", &body)]),
+        ];
+        std::fs::write(dir.join(crate::catalog::USER_CATALOG), serde_json::to_string(&user).unwrap()).unwrap();
+
+        let (tx, rx) = mpsc::channel::<std::result::Result<AssetReady, (AssetRequest, String)>>();
+        let tx2 = tx.clone();
+        let mut cfg = ServiceConfig::new(&dir);
+        cfg.catalog = Some(dir.clone());
+        let svc = AssetService::spawn(
+            cfg,
+            move |r| {
+                let _ = tx.send(Ok(r));
+            },
+            move |q, e| {
+                let _ = tx2.send(Err((q, e)));
+            },
+        );
+        svc.request(AssetRequest::Body(AvatarTrack::Subculture3d));
+        svc.request(AssetRequest::Body(AvatarTrack::Subculture2d));
+        let a = rx.recv_timeout(Duration::from_secs(60)).unwrap().expect("3D body from the catalog");
+        let b = rx.recv_timeout(Duration::from_secs(60)).unwrap().expect("2D body from the catalog kit");
+        assert_eq!(a.path, crate::catalog::entry_dir(&dir, "test-model").join("model.vrm"));
+        assert_eq!(std::fs::read(&a.path).unwrap(), model);
+        assert!(b.path.ends_with("body_2d_test-kit.png"), "{:?}", b.path);
+        let img = image::open(&b.path).unwrap().to_rgba8();
+        let red = img.pixels().filter(|p| p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200).count();
+        assert!(red > 5000, "the kit's body layer is drawn ({red} red pixels)");
         drop(svc);
         let _ = std::fs::remove_dir_all(dir);
     }

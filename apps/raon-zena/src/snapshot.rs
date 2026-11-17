@@ -2,6 +2,7 @@
 //! same kind of wgpu device — for a few scripted moments (each avatar track, 2D stamps and 3D props, accessories,
 //! the streamed bubble and the chat box) and write one PNG per moment plus a contact sheet. Assets come from the
 //! real asset service (MCP servers when present, otherwise in-process), so this checks the whole asset path too.
+//! With `--vrm model.vrm` two Track B-2 moments render that model (the VRM body under the toon shader).
 
 use crate::assets::{decode, default_cache, sibling_server};
 use crate::renderers::scene::{EmoteShow, Loaded, Scene, Stage};
@@ -29,7 +30,7 @@ struct Moment {
     input: Option<(&'static str, &'static str)>,
 }
 
-fn moments() -> Vec<Moment> {
+fn moments(vrm: bool) -> Vec<Moment> {
     let base = |name| Moment {
         name,
         track: AvatarTrack::Procedural,
@@ -43,7 +44,7 @@ fn moments() -> Vec<Moment> {
         bubble: None,
         input: None,
     };
-    vec![
+    let mut list = vec![
         Moment {
             emotion: EmotionState::Excited,
             motion: BodyMotion::Cheer,
@@ -88,7 +89,30 @@ fn moments() -> Vec<Moment> {
             input: Some(("제나야 보스 패턴 ", "알")),
             ..base("5_trackB1_2d_chat")
         },
-    ]
+    ];
+    if vrm {
+        list.push(Moment {
+            track: AvatarTrack::Subculture3d,
+            emotion: EmotionState::Joy,
+            viseme: Viseme::A,
+            mouth: 0.4,
+            look: LookAt {
+                yaw_deg: 18.0,
+                pitch_deg: 6.0,
+            },
+            ..base("6_trackB2_vrm_joy")
+        });
+        list.push(Moment {
+            track: AvatarTrack::Subculture3d,
+            emotion: EmotionState::Neutral,
+            look: LookAt {
+                yaw_deg: -30.0,
+                pitch_deg: -4.0,
+            },
+            ..base("7_trackB2_vrm_side")
+        });
+    }
+    list
 }
 
 /// Over a dark/light checker so transparency is visible.
@@ -105,7 +129,7 @@ fn over_checker(w: u32, h: u32, premul: &[u8]) -> image::RgbaImage {
     img
 }
 
-pub fn run(dir: &Path, font: Option<&Path>) -> Result<()> {
+pub fn run(dir: &Path, font: Option<&Path>, vrm: Option<&Path>) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     #[allow(unused_mut)]
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
@@ -152,7 +176,10 @@ pub fn run(dir: &Path, font: Option<&Path>) -> Result<()> {
         AssetRequest::Body(AvatarTrack::Solidcraft),
         AssetRequest::Body(AvatarTrack::Subculture2d),
     ];
-    for m in moments() {
+    if vrm.is_some() {
+        requests.push(AssetRequest::Body(AvatarTrack::Subculture3d));
+    }
+    for m in moments(vrm.is_some()) {
         for p in &m.parts {
             requests.push(AssetRequest::Part(*p));
         }
@@ -184,8 +211,9 @@ pub fn run(dir: &Path, font: Option<&Path>) -> Result<()> {
             cache_dir: default_cache(),
             solidcraft: zena_avatar_mcp::solidcraft::find_solidcraft(),
             subculture_mcp: sibling_server(),
-            vrm_path: None,
+            vrm_path: vrm.map(Path::to_path_buf),
             chibi_kit: None,
+            catalog: None,
             stamp_frames: 8,
         },
         move |r| {
@@ -213,8 +241,9 @@ pub fn run(dir: &Path, font: Option<&Path>) -> Result<()> {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut sheet = image::RgbaImage::new(w * moments().len() as u32, h);
-    for (i, m) in moments().iter().enumerate() {
+    let moments = moments(vrm.is_some());
+    let mut sheet = image::RgbaImage::new(w * moments.len() as u32, h);
+    for (i, m) in moments.iter().enumerate() {
         let params = FrameParams {
             emotion: m.emotion,
             motion: m.motion,
