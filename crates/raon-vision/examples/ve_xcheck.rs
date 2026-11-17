@@ -13,7 +13,7 @@ use raon_vision::text::{SiglipTokenizer, TextTower};
 use raon_vision::tower::{cosine, WeightFormat};
 use std::path::PathBuf;
 use std::time::Instant;
-use zena_sensor::naflex::{patchify_frame, PatchGrid};
+use zena_sensor::naflex::{patchify_frame_with, PatchGrid};
 
 fn read_f32(p: &PathBuf) -> Result<Vec<f32>> {
     let b = std::fs::read(p).with_context(|| p.display().to_string())?;
@@ -31,6 +31,9 @@ fn main() -> Result<()> {
     let dev = raon_infer::device::select_device(raon_infer::device::Backend::Auto, 0)?;
     let t = Instant::now();
     let (tower, scale, bias) = raon_vision::load_vision(&model, &dev, format)?;
+    // The checkpoint's own processor: Raon-VE (CLIP, bicubic) or google's SigLIP2 (0.5 / 0.5, bilinear).
+    let preprocess = raon_vision::preprocess_for(&model);
+    eprintln!("checkpoint {} ({:?}), preprocessing {preprocess:?}", raon_vision::fingerprint(&model), tower.layout);
     eprintln!(
         "vision tower ({format:?}) loaded in {:.1}s on {}",
         t.elapsed().as_secs_f32(),
@@ -114,7 +117,7 @@ fn main() -> Result<()> {
             let full = tower.forward_full(&official)?;
             let ms = t.elapsed().as_secs_f32() * 1000.0;
             let e = tower.pooled(&full)?;
-            let mine = patchify_frame(&rgb, w, h, budget);
+            let mine = patchify_frame_with(&rgb, w, h, budget, &preprocess);
             let pd = mine
                 .patches
                 .iter()

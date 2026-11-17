@@ -1,14 +1,16 @@
-//! `zena-subculture-mcp --allow-path DIR [--chibi-kit DIR]` — Raon Zena's subculture (Track B) assets and the
-//! built-in Track A forge as MCP tools over stdio (newline-delimited JSON-RPC 2.0).
+//! `zena-subculture-mcp --allow-path DIR [--chibi-kit DIR] [--cache-dir DIR]` — Raon Zena's subculture (Track B)
+//! assets and the built-in Track A forge as MCP tools over stdio (newline-delimited JSON-RPC 2.0).
 //!
-//! Tools: `list_emotes`, `compose_chibi_emote`, `forge_prop`, `robot_body`, `vrm_expressions`, `emote_morphs`.
-//! Every `out_dir` must resolve (after canonicalisation, relative paths against the allow dir) inside
-//! `--allow-path`; anything else is refused.
+//! Tools: `list_emotes`, `compose_chibi_emote`, `forge_prop`, `robot_body`, `vrm_expressions`, `emote_morphs`,
+//! `list_avatar_models`, `fetch_avatar_model`. Every `out_dir` must resolve (after canonicalisation, relative
+//! paths against the allow dir) inside `--allow-path`; anything else is refused. Catalog downloads go to
+//! `<cache-dir>/catalog/<id>/` only (default `%LOCALAPPDATA%\RaonZena\assets`, see `zena_avatar_mcp::catalog`).
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use zena_avatar_mcp::catalog::{self, Kind};
 use zena_avatar_mcp::chibi::ChibiKit;
 use zena_avatar_mcp::mesh::{write_glb, MeshData};
 use zena_avatar_mcp::protocol::{serve, ToolHandler};
@@ -19,6 +21,7 @@ struct Server {
     allow: PathBuf,
     kit_dir: Option<PathBuf>,
     kit: Option<ChibiKit>,
+    cache_root: PathBuf,
 }
 
 fn display(p: &Path) -> String {
@@ -158,6 +161,20 @@ impl ToolHandler for Server {
                     "path": {"type": "string"},
                 }, "required": ["emote", "path"]},
             }),
+            json!({
+                "name": "list_avatar_models",
+                "description": "Avatars Zena can wear: openly licensed 3D .vrm models (pinned URL, size and SHA-256; license, author and the credit line it requires) and 2D layered kits (kit.json), with whether each is already in the asset cache and its path. The default of each kind is what the overlay fetches when no model is configured. More entries come from <cache-dir>/catalog.json.",
+                "inputSchema": {"type": "object", "properties": {
+                    "kind": {"type": "string", "enum": ["vrm", "chibi_kit"], "description": "Only this kind (default: both)"},
+                }},
+            }),
+            json!({
+                "name": "fetch_avatar_model",
+                "description": "Download a catalog avatar into the asset cache (<cache-dir>/catalog/<id>/), checking size and SHA-256 (a mismatch keeps nothing), and return its local path: the .vrm file, or the kit folder for a 2D kit. Already cached files are re-hashed, not downloaded again. Without id: the default .vrm.",
+                "inputSchema": {"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Catalog id from list_avatar_models"},
+                }},
+            }),
         ]
     }
 
@@ -221,6 +238,38 @@ impl ToolHandler for Server {
                     "expression": emote_expression(&info, emote),
                 }))
             }
+            "list_avatar_models" => {
+                let kind = match args.get("kind").and_then(Value::as_str) {
+                    None => None,
+                    Some("vrm") => Some(Kind::Vrm),
+                    Some("chibi_kit") => Some(Kind::ChibiKit),
+                    Some(other) => bail!("kind must be vrm or chibi_kit (got {other})"),
+                };
+                let entries = catalog::load(&self.cache_root)?;
+                let models: Vec<Value> = entries
+                    .iter()
+                    .filter(|e| kind.map_or(true, |k| e.kind == k))
+                    .map(|e| catalog::describe(&self.cache_root, e))
+                    .collect();
+                Ok(json!({"cache": display(&self.cache_root), "models": models}))
+            }
+            "fetch_avatar_model" => {
+                let entries = catalog::load(&self.cache_root)?;
+                let entry = match args.get("id").and_then(Value::as_str) {
+                    Some(id) => catalog::find(&entries, id).with_context(|| format!("no catalog entry {id}"))?,
+                    None => catalog::default_of(&entries, Kind::Vrm).context("the catalog has no default .vrm")?,
+                };
+                if entry.files.is_empty() {
+                    bail!("{} is built in: nothing to download", entry.id);
+                }
+                let cached = catalog::is_cached(&self.cache_root, entry);
+                let path = catalog::fetch(&self.cache_root, entry, &mut |_, _, _| {})?;
+                Ok(json!({
+                    "id": entry.id, "kind": entry.kind, "path": display(&path), "downloaded": !cached,
+                    "bytes": entry.download_size(), "license": entry.license, "license_url": entry.license_url,
+                    "credit": entry.credit,
+                }))
+            }
             other => bail!("unknown tool {other}"),
         }
     }
@@ -229,20 +278,22 @@ impl ToolHandler for Server {
 fn main() {
     let mut allow: Option<PathBuf> = None;
     let mut kit_dir: Option<PathBuf> = None;
+    let mut cache_root = catalog::default_cache_root();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--allow-path" => allow = args.next().map(PathBuf::from),
             "--chibi-kit" => kit_dir = args.next().map(PathBuf::from),
+            "--cache-dir" => cache_root = args.next().map(PathBuf::from).unwrap_or(cache_root),
             "-h" | "--help" => {
-                eprintln!("usage: zena-subculture-mcp --allow-path DIR [--chibi-kit DIR]");
+                eprintln!("usage: zena-subculture-mcp --allow-path DIR [--chibi-kit DIR] [--cache-dir DIR]");
                 return;
             }
             other => eprintln!("zena-subculture-mcp: ignoring unknown argument {other}"),
         }
     }
     let Some(allow) = allow else {
-        eprintln!("usage: zena-subculture-mcp --allow-path DIR [--chibi-kit DIR]");
+        eprintln!("usage: zena-subculture-mcp --allow-path DIR [--chibi-kit DIR] [--cache-dir DIR]");
         std::process::exit(2);
     };
     let allow = match std::fs::create_dir_all(&allow).and_then(|_| allow.canonicalize()) {
@@ -252,7 +303,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut server = Server { allow, kit_dir, kit: None };
+    let mut server = Server {
+        allow,
+        kit_dir,
+        kit: None,
+        cache_root,
+    };
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();
     if let Err(e) = serve(&mut server, stdin, stdout, "zena-subculture-mcp") {

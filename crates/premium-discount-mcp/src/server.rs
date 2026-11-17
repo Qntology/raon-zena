@@ -10,6 +10,7 @@
 //! | `pd_graph_inspect` | none: `GET /graph`, `/graph/local`, `/graph/similar` on the server |
 //! | `pd_auth_session` | `cmd_session`, `cmd_login_start`, `cmd_login_status`, `cmd_logout` |
 //! | `pd_model_manage` | `cmd_model_status`, `cmd_model_download`, `cmd_model_download_cancel` |
+//! | `pd_nav_number` | none: premium-discount's `pd-nav` in process (candidate merge, 1 ~ 9 numbering, sensitive screens) |
 //!
 //! The schema is premium-discount's: argument and result field names are its own, and recommendations
 //! (`premium` / `discount`) are the server's verdicts (rule: premium-discount `contracts/verdict_v1.json`).
@@ -30,7 +31,7 @@ use crate::lines::CallError;
 
 pub const SERVER_NAME: &str = "premium-discount-mcp";
 
-pub const TOOLS: [&str; 8] = [
+pub const TOOLS: [&str; 9] = [
     "pd_enqueue_node",
     "pd_flush_and_sync",
     "pd_search_merged",
@@ -38,6 +39,7 @@ pub const TOOLS: [&str; 8] = [
     "pd_verdicts",
     "pd_graph_inspect",
     "pd_auth_session",
+    "pd_nav_number",
     "pd_model_manage",
 ];
 
@@ -290,6 +292,61 @@ impl<B: Backend> PdSyncServer<B> {
             other => bail!("action must be status, download or cancel (got {other})"),
         }
     }
+
+    fn nav_number(&mut self, args: &Value) -> Result<Value> {
+        nav_number(args)
+    }
+}
+
+/// `pd_nav_number`: premium-discount's accessibility-navigation rules, so Raon Zena numbers a screen exactly as
+/// premium-discount-app does. Candidates come from the accessibility tree, vision or events; rectangles are
+/// clipped to the window (`Rect::new`, 0 ~ 1) and empty ones are dropped. On a sensitive screen (any candidate
+/// marked `sensitive`: password, payment) only tree candidates survive the merge and the screen must not be
+/// recorded (`record: false`). No app process, no model: pure functions.
+pub fn nav_number(args: &Value) -> Result<Value> {
+    use std::collections::HashMap;
+    let raw = args.get("regions").and_then(Value::as_array).context("regions must be an array")?;
+    let mut regions = Vec::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    for (i, r) in raw.iter().enumerate() {
+        let mut region: pd_nav::Region =
+            serde_json::from_value(r.clone()).with_context(|| format!("regions[{i}] is not a pd-nav region"))?;
+        match pd_nav::Rect::new(region.rect.x, region.rect.y, region.rect.w, region.rect.h) {
+            Some(rect) => {
+                region.rect = rect;
+                regions.push(region);
+            }
+            None => dropped += 1,
+        }
+    }
+    let mut tiers: HashMap<String, pd_verdict::Tier> = HashMap::new();
+    if let Some(map) = args.get("tiers").and_then(Value::as_object) {
+        for (anchor, tier) in map {
+            let tier: pd_verdict::Tier = serde_json::from_value(tier.clone())
+                .with_context(|| format!("tiers.{anchor} must be premium, neutral, discount or unrated"))?;
+            tiers.insert(anchor.clone(), tier);
+        }
+    }
+    let iou = match args.get("iou") {
+        None | Some(Value::Null) => pd_nav::MERGE_IOU,
+        Some(v) => {
+            let iou = v.as_f64().context("iou must be a number")? as f32;
+            if !(0.0..=1.0).contains(&iou) {
+                bail!("iou must be between 0 and 1 (got {iou})");
+            }
+            iou
+        }
+    };
+    let sensitive = pd_nav::sensitive_screen(&regions);
+    let merged = pd_nav::merge(regions, iou);
+    let numbered = pd_nav::number(merged, &tiers);
+    Ok(json!({
+        "sensitive": sensitive,
+        "record": !sensitive,
+        "dropped": dropped,
+        "max_numbered": pd_nav::MAX_NUMBERED,
+        "regions": numbered,
+    }))
 }
 
 fn s(desc: &str) -> Value {
@@ -374,6 +431,24 @@ impl<B: Backend> ToolHandler for PdSyncServer<B> {
                 }, "required": ["action"]},
             }),
             json!({
+                "name": "pd_nav_number",
+                "description": "Number a screen for keyboard / voice navigation with premium-discount's rules (pd-nav): merge candidate regions (IoU, tree > vision > event; events mark a region changed), then order premium regions first and discount last, then by role (input, button, link, menu, text, image, other) and reading order; the first 9 get numbers 1-9. A screen with any sensitive candidate keeps tree candidates only and must not be recorded (record false). Runs in process: no app, no model.",
+                "inputSchema": {"type": "object", "properties": {
+                    "regions": {"type": "array", "items": {"type": "object", "properties": {
+                        "anchor": s("Position key of the region (stable across visits; tiers are keyed by it)"),
+                        "role": {"type": "string", "enum": ["input", "button", "link", "menu", "text", "image", "other"]},
+                        "name": s("Accessible name or label (may be empty)"),
+                        "rect": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}}, "required": ["x", "y", "w", "h"], "description": "Window-relative 0..1"},
+                        "source": {"type": "string", "enum": ["tree", "vision", "event"]},
+                        "score": {"type": "number"},
+                        "changed": {"type": "boolean", "default": false},
+                        "sensitive": {"type": "boolean", "default": false, "description": "Password, payment or other personal field"},
+                    }, "required": ["anchor", "role", "name", "rect", "source", "score"]}},
+                    "tiers": {"type": "object", "additionalProperties": {"type": "string", "enum": ["premium", "neutral", "discount", "unrated"]}, "description": "anchor -> verdict tier (local or the server's)"},
+                    "iou": {"type": "number", "minimum": 0, "maximum": 1, "description": "Merge threshold (default 0.4)"},
+                }, "required": ["regions"]},
+            }),
+            json!({
                 "name": "pd_model_manage",
                 "description": "embeddinggemma-2 for premium-discount-app: status (installed variant, download progress, whether the app process is running), download (text: 574 MB text-only; full: 1.52 GB; resumable, SHA-256 checked) or cancel.",
                 "inputSchema": {"type": "object", "properties": {
@@ -394,6 +469,7 @@ impl<B: Backend> ToolHandler for PdSyncServer<B> {
             "pd_graph_inspect" => self.graph(args),
             "pd_auth_session" => self.auth(args),
             "pd_model_manage" => self.model(args),
+            "pd_nav_number" => self.nav_number(args),
             other => bail!("unknown_command: unknown tool {other}"),
         };
         // Arguments this layer refused carry no kind yet.

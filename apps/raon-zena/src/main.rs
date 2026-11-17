@@ -7,7 +7,9 @@
 //!           [--llm-idle SECS]                       unload Raon-1-nano after SECS without a request (0: keep it)
 //!           [--lexicon data/zena_lexicon.json]      dictionary seed (default: the bundled one)
 //!           [--lexicon-db DIR | --no-lexicon-db]    the LanceDB dictionary (default: the per-user one) [--learn]
-//!           [--screen models/KRAFTON/Raon-VisionEncoder] [--screen-every SECS] [--screen-patches N]
+//!           [--screen models/KRAFTON/Raon-VisionEncoder | models/google/siglip2-so400m-patch16-naflex]
+//!           [--screen-tokenizer tokenizer.json]     to recompute stale anchors (default: next to the checkpoint)
+//!           [--screen-every SECS] [--screen-patches N]
 //!           [--screen-pass auto|full|checker|fovea|checker-x|fovea-x] [--screen-format f32|f16|bf16|q8]
 //!           [--screen-device auto|cpu|cuda|rocm|vulkan|metal]
 //!           [--vision out/raon-ve-vision.pyramid.gguf]   (residency report only)
@@ -17,6 +19,8 @@
 //!                                                   granite + SDS), v1 + rule analyzer, or v1 (default auto)
 //!           [--track procedural|solidcraft|subculture-2d|subculture-3d]   the avatar body to start with
 //!           [--vrm model.vrm] [--chibi-kit DIR]     Track B assets (3D VRM body, layered 2D SD parts)
+//!           [--no-avatar-download]                  without --vrm / --chibi-kit, do not fetch the avatar catalog's
+//!                                                   default model (zena_avatar_mcp::catalog) into the asset cache
 //!           [--solidcraft PATH | --no-solidcraft]   SolidCraft CLI for Track A (default: found on PATH / Program Files)
 //!           [--no-subculture-mcp]                   build Track B assets in-process instead of over MCP
 //!           [--asset-cache DIR] [--font FONT.ttf]
@@ -63,6 +67,7 @@ struct Args {
     lexicon_db: Option<PathBuf>,
     learn: bool,
     screen: Option<PathBuf>,
+    screen_tokenizer: Option<PathBuf>,
     screen_every: f32,
     screen_patches: usize,
     screen_pass: String,
@@ -74,6 +79,7 @@ struct Args {
     track: zena_core::tools::AvatarTrack,
     vrm: Option<PathBuf>,
     chibi_kit: Option<PathBuf>,
+    avatar_download: bool,
     solidcraft: Option<PathBuf>,
     subculture_mcp: bool,
     asset_cache: PathBuf,
@@ -107,6 +113,7 @@ fn args() -> Args {
         lexicon_db: Some(lexicon::default_db()),
         learn: false,
         screen: None,
+        screen_tokenizer: None,
         screen_every: 3.0,
         screen_patches: 256,
         screen_pass: "auto".into(),
@@ -118,6 +125,7 @@ fn args() -> Args {
         track: zena_core::tools::AvatarTrack::Procedural,
         vrm: None,
         chibi_kit: None,
+        avatar_download: true,
         solidcraft: zena_avatar_mcp::solidcraft::find_solidcraft(),
         subculture_mcp: true,
         asset_cache: assets::default_cache(),
@@ -148,6 +156,7 @@ fn args() -> Args {
             "--no-lexicon-db" => a.lexicon_db = None,
             "--learn" => a.learn = true,
             "--screen" => a.screen = it.next().map(PathBuf::from),
+            "--screen-tokenizer" => a.screen_tokenizer = it.next().map(PathBuf::from),
             "--screen-every" => a.screen_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(3.0),
             "--screen-patches" => a.screen_patches = it.next().and_then(|v| v.parse().ok()).unwrap_or(256),
             "--screen-pass" => a.screen_pass = it.next().unwrap_or_else(|| "auto".into()),
@@ -162,6 +171,7 @@ fn args() -> Args {
             "--track" => a.track = parse_track(&it.next().unwrap_or_default()),
             "--vrm" => a.vrm = it.next().map(PathBuf::from),
             "--chibi-kit" => a.chibi_kit = it.next().map(PathBuf::from),
+            "--no-avatar-download" => a.avatar_download = false,
             "--solidcraft" => a.solidcraft = it.next().map(PathBuf::from),
             "--no-solidcraft" => a.solidcraft = None,
             "--no-subculture-mcp" => a.subculture_mcp = false,
@@ -217,7 +227,7 @@ mod serde_json_lite {
 fn main() -> Result<()> {
     let a = args();
     if let Some(dir) = &a.snapshot {
-        return snapshot::run(dir, a.font.as_deref());
+        return snapshot::run(dir, a.font.as_deref(), a.vrm.as_deref());
     }
     // PRD §3.5: verify the fused kernels before enabling them.
     let checks = raon_quant::kernels::verify_kernels(1e-3);
@@ -274,6 +284,7 @@ fn main() -> Result<()> {
         None => lexicon::Loaded {
             lexicon: lexicon::read_json(a.lexicon.as_deref())?,
             anchors: Default::default(),
+            anchors_model: String::new(),
             source: "JSON".into(),
         },
     };
@@ -310,6 +321,7 @@ fn main() -> Result<()> {
         anchor_tx.send(watcher::AnchorsUpdate {
             lexicon: loaded.lexicon.clone(),
             anchors: loaded.anchors.clone(),
+            model: loaded.anchors_model.clone(),
         })?;
         watcher::spawn(cfg, frame_rx, anchor_rx, obs_tx);
     }
@@ -317,7 +329,12 @@ fn main() -> Result<()> {
     let learn_tx = a
         .lexicon_db
         .clone()
-        .map(|db| lexicon::spawn_service(db, Duration::from_secs(3), 3, lex_tx, screen_on.then_some(anchor_tx)));
+        .map(|db| {
+            // A screen model whose anchors are missing or were computed by another checkpoint gets them recomputed
+            // by the dictionary service (needs the model's tokenizer.json).
+            let reanchor = a.screen.as_deref().and_then(|m| lexicon::Reanchor::find(m, a.screen_tokenizer.as_deref()));
+            lexicon::spawn_service(db, Duration::from_secs(3), 3, lex_tx, screen_on.then_some(anchor_tx), reanchor)
+        });
 
     // Lv3 backend: Raon-1-nano when a model is given (CPU / CUDA / ROCm / Vulkan / Metal through the
     // candle-rocm-vulkan fork, chosen by --llm-device), loaded on demand and dropped when idle; otherwise the
@@ -418,6 +435,9 @@ fn main() -> Result<()> {
             subculture_mcp: if a.subculture_mcp { assets::sibling_server() } else { None },
             vrm_path: a.vrm.clone(),
             chibi_kit: a.chibi_kit.clone(),
+            // Without --vrm the 3D track downloads the catalog's default model (pinned, SHA-256 checked) instead of
+            // falling back to the procedural face.
+            catalog: a.avatar_download.then(|| a.asset_cache.clone()),
             stamp_frames: 8,
         },
         overlay::OverlayAssets(proxy.clone()),

@@ -3,47 +3,21 @@
 //! [`hash_id`] is the server project's `hashId(text)` (legacy `www/src/index.ts`, `www/public/static/js`):
 //! `ethers.computeAddress(ethers.hashMessage(text)).toLowerCase()`, i.e. the EIP-191 message hash used as a
 //! secp256k1 private key, and the address of its public key. The server only checks `ethers.isAddress`, so any
-//! 20 bytes would pass; using the same recipe keeps `to` / `bcc` comparable with the other clients.
+//! 20 bytes would pass; using the same recipe keeps `to` / `bcc` comparable with the other clients. The hashing
+//! itself is premium-discount's `pd-identity`; this module keeps only what the MCP layer adds (content
+//! normalisation for `bcc`, address checks).
 
-use anyhow::{bail, Result};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use tiny_keccak::{Hasher, Keccak};
+use anyhow::{anyhow, bail, Result};
 use unicode_normalization::UnicodeNormalization;
 
-fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut k = Keccak::v256();
-    for p in parts {
-        k.update(p);
-    }
-    let mut out = [0u8; 32];
-    k.finalize(&mut out);
-    out
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// `ethers.hashMessage(text)`: keccak256 of `"\x19Ethereum Signed Message:\n" + byte length + text`.
-pub fn hash_message(text: &str) -> [u8; 32] {
-    let len = text.len().to_string();
-    keccak256(&[b"\x19Ethereum Signed Message:\n", len.as_bytes(), text.as_bytes()])
-}
+pub use pd_identity::hash_message;
 
-/// `ethers.computeAddress(private_key)`: the last 20 bytes of keccak256 of the uncompressed public key.
-pub fn compute_address(private_key: &[u8; 32]) -> Result<String> {
-    let Ok(secret) = k256::SecretKey::from_slice(private_key) else {
-        // Zero or ≥ the curve order: ethers throws too. Probability ~2^-128 for a hash.
-        bail!("not a valid secp256k1 private key");
-    };
-    let point = secret.public_key().to_encoded_point(false);
-    let digest = keccak256(&[&point.as_bytes()[1..]]);
-    Ok(format!("0x{}", hex(&digest[12..])))
-}
-
-/// `hashId(text)` of the premium.discount web client.
+/// `hashId(text)` of the premium.discount web client: premium-discount's `pd_identity::hash_id`, the same code
+/// premium-discount-app and `pd-nav` hash with.
 pub fn hash_id(text: &str) -> Result<String> {
-    compute_address(&hash_message(text))
+    // `None` only when the message hash is zero or ≥ the curve order (ethers throws too, probability ~2^-128).
+    pd_identity::hash_id(text).ok_or_else(|| anyhow!("hashId({text:?}) is not a valid secp256k1 private key"))
 }
 
 /// The text a content address (`bcc`) is computed from: NFC, trimmed, whitespace runs folded to one space,
@@ -75,6 +49,10 @@ pub fn normalize_address(field: &str, raw: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     // Generated with the ethers 6.9.0 bundle the server project ships (www/public/static/js/ethers.umd.min.js):
     // { hashMessage(s), computeAddress(hashMessage(s)).toLowerCase() }.
@@ -148,11 +126,5 @@ mod tests {
         );
         assert!(normalize_address("to", "0x1234").is_err());
         assert!(normalize_address("to", "abcdefabcdefabcdefabcdefabcdefabcdefabcdef").is_err());
-    }
-
-    #[test]
-    fn invalid_private_keys_fail() {
-        assert!(compute_address(&[0u8; 32]).is_err());
-        assert!(compute_address(&[0xff; 32]).is_err());
     }
 }

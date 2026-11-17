@@ -12,6 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# The avatar catalog's downloader (pinned URLs, SHA-256 checked): the same ureq 2 / sha2 0.10 the workspace locks
+ureq = "2"
+sha2 = "0.10"
 
 [[bin]]
 name = "zena-subculture-mcp"

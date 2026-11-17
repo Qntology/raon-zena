@@ -527,19 +527,25 @@ pub fn plan_raon1_nano(st: &SafeTensors, cfg: &PyramidConfig, vocab: &VocabSlice
 // Raon-VisionEncoder (vision tower only)
 // ---------------------------------------------------------------------------------------------
 
+/// The vision tower of Raon-VisionEncoder (timm names) or of `google/siglip2-so400m-patch16-naflex` (Hugging Face
+/// names: `vision_model.encoder.layers.{i}.self_attn.{q,k,v,out}_proj`, `vision_model.head.*`, `text_model.*`) —
+/// the same network, so the same tiers: separate q / k / v projections are T3 like the fused `qkv`, the packed
+/// MAP-head `in_proj` is T2 like `attn_pool.q` / `kv`, and `position_embedding` stays in the spine like `pos_embed`.
 pub fn plan_raon_ve(st: &SafeTensors, cfg: &PyramidConfig) -> Result<Plan> {
+    let hf = st.tensors.keys().any(|n| n.starts_with("vision_model."));
+    let marker = if hf { ".layers." } else { ".blocks." };
     let n_blocks = st
         .tensors
         .keys()
-        .filter_map(|n| layer_of(n, ".blocks."))
+        .filter_map(|n| layer_of(n, marker))
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
     let mut items = Vec::new();
     let mut excluded = Vec::new();
-    let edge = |n: &str| match layer_of(n, ".blocks.") {
+    let edge = |n: &str| match layer_of(n, marker) {
         Some(l) => l < cfg.edge_front || l + cfg.edge_back >= n_blocks,
-        None => true, // attn_pool (MAP head) = output boundary
+        None => true, // attn_pool / head (MAP head) = output boundary
     };
     // The MLP hidden width must agree between fc1 rows and fc2 columns.
     let hidden_pad = |n: &str| -> Result<usize> {
@@ -549,7 +555,7 @@ pub fn plan_raon_ve(st: &SafeTensors, cfg: &PyramidConfig) -> Result<Plan> {
     };
     for (name, info) in &st.tensors {
         let name = name.as_str();
-        if name.starts_with("text.") {
+        if name.starts_with("text.") || name.starts_with("text_model.") {
             excluded.push((
                 name.to_string(),
                 "contrastive text tower (0.71B) excluded; vision path only".to_string(),
@@ -560,14 +566,18 @@ pub fn plan_raon_ve(st: &SafeTensors, cfg: &PyramidConfig) -> Result<Plan> {
             items.push(spine(st, name, Some(hidden_pad(name)?))?);
             continue;
         }
-        if info.shape.len() != 2 || name.contains("patch_embed") || name.contains("pos_embed") {
+        if info.shape.len() != 2
+            || name.contains("patch_embed")
+            || name.contains("pos_embed")
+            || name.contains("position_embedding")
+        {
             items.push(spine(st, name, None)?);
             continue;
         }
         let e = edge(name);
         let (tier, f) = if e {
             (Tier::T2Gate, cfg.tier2)
-        } else if name.contains(".attn.") {
+        } else if name.contains(".attn.") || name.contains(".self_attn.") {
             (Tier::T3Attention, cfg.tier3)
         } else {
             (Tier::T4Bulk, cfg.tier4)
@@ -593,7 +603,11 @@ pub fn plan_raon_ve(st: &SafeTensors, cfg: &PyramidConfig) -> Result<Plan> {
         ("general.architecture".into(), Kv::Str("raon_ve_vision".into())),
         (
             "general.name".into(),
-            Kv::Str("KRAFTON/Raon-VisionEncoder vision tower (Raon Zena pyramid)".into()),
+            Kv::Str(if hf {
+                "google/siglip2-so400m-patch16-naflex vision tower (Raon Zena pyramid)".into()
+            } else {
+                "KRAFTON/Raon-VisionEncoder vision tower (Raon Zena pyramid)".into()
+            }),
         ),
         ("raon_ve.block_count".into(), Kv::U32(n_blocks as u32)),
         ("raon_ve.patch_size".into(), Kv::U32(16)),

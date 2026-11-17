@@ -1,14 +1,60 @@
-//! NaFlex patchification for `Raon-VisionEncoder` (`LocCa ViT-SO400M-16-SigLIP2`).
+//! NaFlex patchification for the SigLIP2 So400m/16 NaFlex encoders.
 //!
-//! Port of the released processor (`modeling_raonve.py::RaonVEProcessor` and
-//! `raon_vision_encoder/transform.py::get_image_size_for_max_num_patches`): resize while keeping
-//! aspect ratio so `ceil(h/16)*ceil(w/16) <= max_patches`, normalise with the CLIP mean/std,
-//! and flatten each 16×16 patch as `[C, ph, pw]` (channel-major), zero-padding to `max_patches`.
+//! Port of the released processors: Raon-VisionEncoder's (`modeling_raonve.py::RaonVEProcessor` and
+//! `raon_vision_encoder/transform.py::get_image_size_for_max_num_patches`: PIL bicubic, CLIP mean/std) and
+//! transformers' `Siglip2ImageProcessor` for `google/siglip2-so400m-patch16-naflex` (bilinear, mean = std = 0.5,
+//! i.e. `pixel / 127.5 − 1`). Both resize while keeping aspect ratio so `ceil(h/16)*ceil(w/16) <= max_patches`
+//! (the same search) and cut 16×16 patches. Patches are flattened here as `[C, ph, pw]` (channel-major) for both;
+//! a Hugging Face checkpoint's patch projection is reordered to match when it is loaded (`raon_vision::layout`).
+//! [`Preprocess`] holds what differs.
 
 pub const PATCH: usize = 16;
 pub const DEFAULT_MAX_PATCHES: usize = 256;
 pub const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 pub const STD: [f32; 3] = [0.268_629_5, 0.261_302_6, 0.275_777_1];
+
+/// The resampling filter of the processor (PIL's, with the kernel stretched when shrinking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resample {
+    /// `PIL.Image.BICUBIC` (3): Raon-VisionEncoder.
+    Bicubic,
+    /// `PIL.Image.BILINEAR` (2): `Siglip2ImageProcessor`.
+    Bilinear,
+}
+
+impl Resample {
+    /// PIL's numbering, as `preprocessor_config.json` writes it (`"resample": 2`).
+    pub fn from_pil(code: u64) -> Option<Resample> {
+        match code {
+            2 => Some(Resample::Bilinear),
+            3 => Some(Resample::Bicubic),
+            _ => None,
+        }
+    }
+}
+
+/// What a checkpoint's image processor does to pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Preprocess {
+    pub mean: [f32; 3],
+    pub std: [f32; 3],
+    pub resample: Resample,
+}
+
+impl Preprocess {
+    /// Raon-VisionEncoder: PIL bicubic, CLIP mean / std.
+    pub const RAON_VE: Preprocess = Preprocess {
+        mean: MEAN,
+        std: STD,
+        resample: Resample::Bicubic,
+    };
+    /// `google/siglip2-*` (`Siglip2ImageProcessor`): bilinear, mean = std = 0.5.
+    pub const SIGLIP2: Preprocess = Preprocess {
+        mean: [0.5; 3],
+        std: [0.5; 3],
+        resample: Resample::Bilinear,
+    };
+}
 
 /// Binary search identical to the Python reference (same eps and bounds).
 pub fn image_size_for_max_patches(h: usize, w: usize, patch: usize, max_patches: usize) -> (usize, usize) {
@@ -43,18 +89,27 @@ fn bicubic(x: f64) -> f64 {
     }
 }
 
+/// PIL's bilinear (triangle) kernel, support 1.
+fn triangle(x: f64) -> f64 {
+    (1.0 - x.abs()).max(0.0)
+}
+
 /// Per output pixel: the first input index and the normalised weights (PIL `precompute_coeffs`: the kernel is
 /// stretched by the scale when shrinking, which is what makes PIL's resize antialiased).
-fn coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> {
+fn coeffs(in_size: usize, out_size: usize, resample: Resample) -> Vec<(usize, Vec<f64>)> {
+    let (kernel, base_support): (fn(f64) -> f64, f64) = match resample {
+        Resample::Bicubic => (bicubic, 2.0),
+        Resample::Bilinear => (triangle, 1.0),
+    };
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
-    let support = 2.0 * filterscale;
+    let support = base_support * filterscale;
     (0..out_size)
         .map(|xx| {
             let center = (xx as f64 + 0.5) * scale;
             let xmin = ((center - support + 0.5).floor().max(0.0)) as usize;
             let xmax = ((center + support + 0.5).floor() as usize).min(in_size);
-            let mut w: Vec<f64> = (xmin..xmax).map(|x| bicubic((x as f64 - center + 0.5) / filterscale)).collect();
+            let mut w: Vec<f64> = (xmin..xmax).map(|x| kernel((x as f64 - center + 0.5) / filterscale)).collect();
             let sum: f64 = w.iter().sum();
             if sum != 0.0 {
                 w.iter_mut().for_each(|v| *v /= sum);
@@ -67,11 +122,16 @@ fn coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> {
 /// Resizes interleaved 8-bit pixels (`ch` channels) like `PIL.Image.resize(..., BICUBIC)`: horizontal pass, round
 /// and clip to 8 bits, vertical pass (the order and the intermediate rounding PIL uses).
 pub fn resize_bicubic(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: usize) -> Vec<u8> {
+    resize(src, w, h, ch, tw, th, Resample::Bicubic)
+}
+
+/// [`resize_bicubic`] with the filter chosen (`PIL.Image.resize(..., BILINEAR)` for [`Resample::Bilinear`]).
+pub fn resize(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: usize, resample: Resample) -> Vec<u8> {
     let clip = |v: f64| v.round().clamp(0.0, 255.0) as u8;
     let horizontal = if tw == w {
         src[..w * h * ch].to_vec()
     } else {
-        let cx = coeffs(w, tw);
+        let cx = coeffs(w, tw, resample);
         let mut out = vec![0u8; tw * h * ch];
         for y in 0..h {
             for (ox, (x0, ws)) in cx.iter().enumerate() {
@@ -90,7 +150,7 @@ pub fn resize_bicubic(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: 
     if th == h {
         return horizontal;
     }
-    let cy = coeffs(h, th);
+    let cy = coeffs(h, th, resample);
     let mut out = vec![0u8; tw * th * ch];
     for (oy, (y0, ws)) in cy.iter().enumerate() {
         for x in 0..tw {
@@ -129,8 +189,13 @@ impl PatchGrid {
 /// `RaonVEProcessor` on an RGB8 image: PIL-bicubic resize to the largest grid within `max_patches`, CLIP mean/std,
 /// `[C, ph, pw]` patches.
 pub fn patchify_frame(rgb: &[u8], w: usize, h: usize, max_patches: usize) -> PatchGrid {
+    patchify_frame_with(rgb, w, h, max_patches, &Preprocess::RAON_VE)
+}
+
+/// [`patchify_frame`] with the checkpoint's own processor settings ([`Preprocess::SIGLIP2`] for google's).
+pub fn patchify_frame_with(rgb: &[u8], w: usize, h: usize, max_patches: usize, pre: &Preprocess) -> PatchGrid {
     let (th, tw) = image_size_for_max_patches(h, w, PATCH, max_patches);
-    let img = resize_bicubic(rgb, w, h, 3, tw, th);
+    let img = resize(rgb, w, h, 3, tw, th, pre.resample);
     let (gh, gw) = (th / PATCH, tw / PATCH);
     let mut patches = vec![0f32; gh * gw * PatchGrid::DIM];
     for py in 0..gh {
@@ -140,7 +205,7 @@ pub fn patchify_frame(rgb: &[u8], w: usize, h: usize, max_patches: usize) -> Pat
                 for yy in 0..PATCH {
                     for xx in 0..PATCH {
                         let v = img[((py * PATCH + yy) * tw + px * PATCH + xx) * 3 + c] as f32 / 255.0;
-                        patches[base + c * PATCH * PATCH + yy * PATCH + xx] = (v - MEAN[c]) / STD[c];
+                        patches[base + c * PATCH * PATCH + yy * PATCH + xx] = (v - pre.mean[c]) / pre.std[c];
                     }
                 }
             }

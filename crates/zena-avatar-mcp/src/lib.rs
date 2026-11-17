@@ -11,10 +11,12 @@
 //! * [`solidcraft`] – Track A bridge to SolidCraft's MCP server (`solidcraft-cli mcp`), falling back to [`forge`].
 //! * [`chibi`]      – Track B-1 SD (chibi) stamp compositor from layered PNG parts, with a procedural kit.
 //! * [`vrm`]        – Track B-2 VRM 0.x / 1.0 expression and humanoid metadata.
+//! * [`catalog`]    – openly licensed `.vrm` models and 2D kits, pinned by SHA-256, and their downloader.
 //! * [`service`]    – [`service::AssetService`], the background thread the overlay app asks for assets.
 //!
-//! The `zena-subculture-mcp` binary exposes [`chibi`], [`forge`] and [`vrm`] as MCP tools.
+//! The `zena-subculture-mcp` binary exposes [`chibi`], [`forge`], [`vrm`] and [`catalog`] as MCP tools.
 
+pub mod catalog;
 pub mod chibi;
 pub mod forge;
 mod math;

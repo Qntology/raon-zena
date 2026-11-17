@@ -13,7 +13,9 @@
 
 raon-zena 가 맡는 것:
 - 캐릭터 챗
-- 같은 판정 규칙을 기기 안에서 돌리는 로컬 판정(`crates/zena-verdict`)
+- 같은 판정 규칙을 기기 안에서 돌리는 로컬 판정(`crates/zena-verdict`, 판정 코드 자체는 premium-discount 의 `pd-verdict`)
+
+**공유 라이브러리(2026-11-17).** premium-discount 의 `crates/`(`pd-verdict` · `pd-identity` · `pd-nav`)를 작업 공간 `Cargo.toml` 의 `[workspace.dependencies]` 에 git 리비전(`540311b`)으로 고정해 링크합니다. 이 크레이트들은 LanceDB · HTTP · Tauri · 모델 런타임에 의존하지 않아서, 앱 전체(아래 "프로세스로 둡니다")와 달리 두 벌 빌드 문제가 없습니다. 옆에 둔 체크아웃으로 빌드하려면 `[patch."https://github.com/Qntology/premium-discount"]` 에 `path` 를 적습니다(작업 공간 `Cargo.toml` 주석).
 
 이 MCP 서버의 이름은 기획서의 `zena-pd-sync-mcp` 에서 `premium-discount-mcp` 로 바꿨습니다. 도구의 인자와 결과는 premium-discount 의 필드 이름을 그대로 씁니다.
 
@@ -21,7 +23,7 @@ raon-zena 가 맡는 것:
 
 ```text
 raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON 한 줄씩)──▶ premium-discount-app
-  SyncLoop (병합 · 남은 일이 있으면 10초)        pd_* 도구 8개, cc · hashId,           LanceDB 보관함(원문) · 투표 · 판정 캐시,
+  SyncLoop (병합 · 남은 일이 있으면 10초)        pd_* 도구 9개, cc · hashId,           LanceDB 보관함(원문) · 투표 · 판정 캐시,
   zena-verdict (로컬 판정)                       GET /graph*                           embeddinggemma-2(768), QR 로그인
                                                         │                                    │
                                                         └──────────── HTTPS ─────────────────┴──▶ premium.discount
@@ -34,6 +36,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 - **처음 필요할 때 띄웁니다.** 앱은 시작하면서 embeddinggemma-2 를 올립니다. 그래서 쉬고 있는 제나는 모델도 LanceDB 도 메모리에 두지 않습니다.
 - **죽으면 다음 명령에서 다시 띄웁니다.** `service.rs` 의 Track B 처럼 한 번 죽으면 끝나지 않습니다.
 - **`--idle-secs`(기본 300) 동안 명령이 없으면 내립니다.** 단, 처리 중인 요청이 있거나(시간 초과로 포기한 요청도 셉니다) 모델 내려받기가 진행 중이면 내리지 않습니다. 보관함은 디스크에 있고 앱은 켤 때 `queued` · `pending` 행으로 큐를 다시 만들기 때문에 잃는 것은 없습니다.
+- **앱 찾기(`find_pd_app`)**: `--pd-app` → `$PD_APP` → 이 실행 파일 옆 → `<home>/pd-app.json` 의 `"pd_app"` → premium.discount 데스크톱 설치 폴더(`%LOCALAPPDATA%\premium.discount\` NSIS 사용자 설치 기본값, `%ProgramFiles%\premium.discount\`, macOS `/Applications/premium.discount.app/Contents/MacOS/`) → `PATH`. 설치 폴더 단계는 데스크톱 설치본이 헤드리스 코어(`premium-discount-app`)를 사이드카(`bundle.externalBin`)로 함께 넣어야 효과가 있습니다. 지금 premium-discount 의 Tauri 번들은 창 실행 파일(`premium-discount-desktop`)만 넣습니다.
 - 기본 설정은 `PD_MODALITIES=text`(제나는 글만 보냄)와 `PD_QUANT=q8_0` 입니다. Q8_0 은 상주 약 300 MB 로 F32(약 660 MB)의 절반이고, 참조 벡터와의 코사인은 0.9999 입니다(premium-discount README 16절). 모델은 한 번에 하나만 올린다는 원칙에 맞춘 값입니다.
 
 ## 도구
@@ -48,8 +51,16 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 | `pd_graph_inspect` | (없음) 서버 `GET /graph?cc=`, `/graph/local?id=`, `/graph/similar?id=&topK=` | 노드 · 간선 종류별 개수, 작성자 수, 스레드(root) 크기, 서버 등급 분포 |
 | `pd_auth_session` | `cmd_session` · `cmd_login_start` · `cmd_login_status` · `cmd_logout` | — |
 | `pd_model_manage` | `cmd_model_status` · `cmd_model_download` · `cmd_model_download_cancel` | 자식 프로세스 상태(`running`, `starts`, `idle_ms`) |
+| `pd_nav_number` | (없음) 프로세스 안에서 premium-discount `pd-nav` | 후보 합치기 · 1 ~ 9 번호 · 개인정보 화면 판정(아래) |
 
 도구 오류는 `<kind>: <message>` 형식입니다. `kind` 는 premium-discount-app 의 `CommandError.kind`(`offline`, `not_ready`, `invalid_input`, `rejected`, `queue_full` …)를 그대로 씁니다. 앱을 띄우거나 닿을 수 없으면 `unavailable` 입니다.
+
+### `pd_nav_number`: 접근성 번호 매기기 (pd-nav)
+
+앱 프로세스 · 모델 없이 premium-discount 의 `pd-nav` 를 그대로 부릅니다. 두 앱이 같은 화면에 같은 번호를 붙이게 하려는 도구입니다.
+- 입력: 후보 영역(`anchor` · `role` · `name` · `rect`(창 기준 0 ~ 1) · `source`(tree · vision · event) · `score` · `changed` · `sensitive`), 선택으로 `tiers`(anchor → premium · neutral · discount · unrated)와 `iou`(기본 0.4).
+- 처리: 사각형은 `Rect::new` 로 창 안으로 자르고 넓이가 없으면 버립니다(`dropped`). `merge`(트리 > 비전 > 이벤트, 이벤트가 겹친 영역은 `changed`) → `number`(premium 앞 · discount 뒤, 종류, 읽는 순서, 앞의 9개가 1 ~ 9).
+- 개인정보 화면: 후보 하나라도 `sensitive` 면 트리 후보만 남기고 `record: false` 를 돌려줍니다. 호출하는 쪽은 그 화면을 기록하지 않습니다.
 
 ### `cc` · `to` · `bcc`
 
@@ -66,7 +77,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 
 장면(scene)을 `cc` 에 넣지 않은 이유는 서버가 `cc` 를 정확히 일치로 비교하기 때문입니다. 장면을 넣으면 한 프로그램이 장면 수만큼 다른 도메인으로 갈라져, 같은 프로그램을 쓰는 다른 사용자의 스레드와 만나지 못합니다.
 
-`to` · `bcc` 는 웹 클라이언트의 `hashId(text)` = `ethers.computeAddress(ethers.hashMessage(text)).toLowerCase()` 로 만듭니다. EIP-191 해시를 secp256k1 개인 키로 써서 그 공개 키의 주소를 구하는 방식입니다. 서버는 `ethers.isAddress` 만 검사하므로 아무 20바이트나 통과하지만, 같은 방식을 써야 다른 클라이언트의 값과 비교할 수 있습니다. 서버 저장소에 들어 있는 ethers 6.9.0 번들로 뽑은 8개 값과 바이트 단위로 같습니다(`address.rs` 테스트). `bcc` 는 NFC 정규화 · 공백 접기를 한 뒤 해시하므로, 다른 창에서 읽은 같은 오류 문구는 같은 주소가 됩니다.
+`to` · `bcc` 는 웹 클라이언트의 `hashId(text)` = `ethers.computeAddress(ethers.hashMessage(text)).toLowerCase()` 로 만듭니다. EIP-191 해시를 secp256k1 개인 키로 써서 그 공개 키의 주소를 구하는 방식입니다. 서버는 `ethers.isAddress` 만 검사하므로 아무 20바이트나 통과하지만, 같은 방식을 써야 다른 클라이언트의 값과 비교할 수 있습니다. 서버 저장소에 들어 있는 ethers 6.9.0 번들로 뽑은 8개 값과 바이트 단위로 같습니다(`address.rs` 테스트). 해시 계산은 premium-discount 의 `pd_identity::hash_id` 를 부르고(이 크레이트의 `k256` · `tiny-keccak` 직접 의존은 없앴습니다), `address.rs` 에는 MCP 층이 더하는 정규화 · 주소 검사만 남았습니다. `bcc` 는 NFC 정규화 · 공백 접기를 한 뒤 해시하므로, 다른 창에서 읽은 같은 오류 문구는 같은 주소가 됩니다.
 
 ### 추천/비추천: 전역 판정은 서버, 로컬 판정은 `zena-verdict`
 
@@ -82,7 +93,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 - 이 저장소의 `zena-verdict`(Rust)
 - 앱 E2E 가짜 서버의 파이썬(참조 구현을 그대로 import)
 
-`zena-verdict` 는 계약 파일의 사본을 들고 있습니다. 시험은 두 가지를 확인합니다.
+`zena-verdict` 는 이제 `pd_verdict::*` 를 그대로 다시 내보냅니다(판정 수식 사본은 지웠습니다). 남은 것은 제나 전용인 대화 피드백 → 관측(`feedback`)과 말하는 방식(`speak`), 그리고 예전 이름 `RECIPE`(= `pd_verdict::RECIPE_V1`)입니다. 계약 파일의 사본은 고정한 리비전의 `pd-verdict` 를 이 저장소에서 다시 시험하려고 남겼습니다. 시험은 두 가지를 확인합니다.
 - 사본이 기록된 SHA-256 과 같은지
 - 옆에 `premium-discount` 저장소가 있으면 원본과 같은지
 

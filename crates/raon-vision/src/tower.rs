@@ -1,7 +1,9 @@
-//! Raon-VisionEncoder's vision tower on candle: the timm `vit_so400m_patch16_siglip_256` trunk (27 pre-norm blocks,
-//! fused qkv, GELU-tanh MLP) and its MAP head (`attn_pool`: one latent query), in the released NaFlex 1-D mode — each
-//! 16×16 patch through the patch projection as a linear map, the 16×16 position table bilinearly resized to the
-//! patch grid (`align_corners=False`, no antialias, as `_setup_1d_forward` does).
+//! The SigLIP2 So400m/16 NaFlex vision tower on candle — Raon-VisionEncoder's timm `vit_so400m_patch16_siglip_256`
+//! trunk (27 pre-norm blocks, fused qkv, GELU-tanh MLP) and its MAP head (`attn_pool`: one latent query) — in the
+//! released NaFlex 1-D mode: each 16×16 patch through the patch projection as a linear map, the 16×16 position table
+//! bilinearly resized to the patch grid (`align_corners=False`; without antialias as timm's `_setup_1d_forward` does
+//! for Raon-VE, antialiased as transformers does for `google/siglip2-so400m-patch16-naflex`). Both checkpoints load
+//! through [`crate::layout::Weights`].
 //!
 //! Besides the dense pass it has the sparse passes of noto-sandbox's `noto-ml` (`VisionTower::forward_sparse /
 //! extend_sparse / merge_sparse`): only some cells of the grid go through the encoder, each with its own cell's position
@@ -15,6 +17,8 @@ use candle_nn::LayerNorm;
 use raon_quant::kquant::{encode, Format};
 use raon_quant::safetensors::SafeTensors;
 use std::collections::HashMap;
+
+use crate::layout::{Layout, Weights};
 use std::sync::Mutex;
 use zena_sensor::naflex::PatchGrid;
 
@@ -94,9 +98,9 @@ impl Proj {
     }
 }
 
-/// Reads weights from the checkpoint (mmap, f32) into the chosen format.
+/// Reads weights from the checkpoint (mmap, f32; Raon-VE names in either layout) into the chosen format.
 pub(crate) struct Loader<'a> {
-    pub st: &'a SafeTensors,
+    pub st: &'a Weights<'a>,
     pub device: Device,
     pub format: WeightFormat,
 }
@@ -125,11 +129,11 @@ impl Loader<'_> {
     /// A projection `[out, in]` (+ bias `[out]`), zero-padded to `[out_pad, in_pad]`; Q8_0 when the format says so
     /// and `in_pad` is a whole number of 32-wide blocks.
     pub(crate) fn proj(&self, weight: &str, bias: Option<&str>, out_pad: usize, in_pad: usize) -> Result<Proj> {
-        let info = self.st.info(weight)?;
-        let (out, inp) = match info.shape.len() {
-            2 => (info.shape[0], info.shape[1]),
-            4 => (info.shape[0], info.shape[1..].iter().product()), // the patch conv as a linear map
-            _ => bail!("{weight}: unexpected shape {:?}", info.shape),
+        let shape = self.st.shape(weight)?;
+        let (out, inp) = match shape.len() {
+            2 => (shape[0], shape[1]),
+            4 => (shape[0], shape[1..].iter().product()), // the patch conv as a linear map
+            _ => bail!("{weight}: unexpected shape {shape:?}"),
         };
         let mut w = self.st.all_f32(weight)?;
         if (out_pad, in_pad) != (out, inp) {
@@ -309,6 +313,8 @@ pub struct SparsePass {
 }
 
 pub struct VisionTower {
+    /// Which checkpoint the weights came from.
+    pub layout: Layout,
     patch: Proj,
     pos: Tensor,
     blocks: Vec<Block>,
@@ -335,11 +341,37 @@ pub fn bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
     w
 }
 
+/// torch's bilinear weights with `antialias=True` (`align_corners=False`): when shrinking, the triangle filter is
+/// stretched by the scale (more than two taps a row); when growing, the same as [`bilinear_weights`]. Port of
+/// noto-sandbox's `noto-ml` `antialias_bilinear_weights`.
+pub fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
+    let scale = src as f64 / dst as f64;
+    let (support, inv_scale) = if scale >= 1.0 { (scale, 1.0 / scale) } else { (1.0, 1.0) };
+    let triangle = |x: f64| (1.0 - x.abs()).max(0.0);
+    let mut weights = vec![0f32; dst * src];
+    for o in 0..dst {
+        let center = scale * (o as f64 + 0.5);
+        let lo = ((center - support + 0.5) as i64).max(0) as usize;
+        let hi = ((center + support + 0.5) as i64).min(src as i64).max(lo as i64) as usize;
+        let taps: Vec<f64> = (lo..hi).map(|j| triangle((j as f64 - center + 0.5) * inv_scale)).collect();
+        let total: f64 = taps.iter().sum();
+        if total > 0.0 {
+            for (k, t) in taps.iter().enumerate() {
+                weights[o * src + lo + k] = (t / total) as f32;
+            }
+        }
+    }
+    weights
+}
+
 impl VisionTower {
+    /// Loads a Raon-VisionEncoder or a Hugging Face `google/siglip2-so400m-patch16-naflex` checkpoint (told apart by
+    /// the tensor names, see [`crate::layout`]).
     pub fn load(st: &SafeTensors, device: &Device, format: WeightFormat) -> Result<VisionTower> {
         let cfg = VisionConfig::default();
+        let w = Weights::new(st);
         let l = Loader {
-            st,
+            st: &w,
             device: device.clone(),
             format,
         };
@@ -347,13 +379,14 @@ impl VisionTower {
         let pd = 3 * cfg.patch * cfg.patch;
         let blocks = (0..cfg.layers).map(|i| Block::load(&l, i, &cfg)).collect::<Result<Vec<_>>>()?;
         Ok(VisionTower {
+            layout: w.layout,
             patch: l.proj(
                 "visual.trunk.patch_embed.proj.weight",
                 Some("visual.trunk.patch_embed.proj.bias"),
                 d,
                 pd,
             )?,
-            pos: Tensor::from_vec(st.all_f32("visual.trunk.pos_embed")?, (cfg.side * cfg.side, d), device)?,
+            pos: Tensor::from_vec(w.all_f32("visual.trunk.pos_embed")?, (cfg.side * cfg.side, d), device)?,
             blocks,
             norm: l.norm("visual.trunk.norm", d, cfg.eps)?,
             head: MapHead::load(&l, &cfg)?,
@@ -377,8 +410,13 @@ impl VisionTower {
         let t = if (gh, gw) == (s, s) {
             self.pos.clone()
         } else {
-            let wy = Tensor::from_vec(bilinear_weights(s, gh), (gh, s), &self.device)?;
-            let wx = Tensor::from_vec(bilinear_weights(s, gw), (gw, s), &self.device)?;
+            let weights = if self.layout.pos_antialias() {
+                antialias_bilinear_weights
+            } else {
+                bilinear_weights
+            };
+            let wy = Tensor::from_vec(weights(s, gh), (gh, s), &self.device)?;
+            let wx = Tensor::from_vec(weights(s, gw), (gw, s), &self.device)?;
             // rows: (gh, s) · (s, s·d) → (gh, s, d); columns: (gw, s) · (s, d) per row → (gh, gw, d)
             let by_rows = wy.matmul(&self.pos.reshape((s, s * d))?)?.reshape((gh, s, d))?;
             wx.broadcast_left(gh)?.contiguous()?.matmul(&by_rows)?.reshape((gh * gw, d))?

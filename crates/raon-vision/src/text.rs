@@ -1,4 +1,5 @@
-//! Raon-VisionEncoder's text tower (open_clip `TextTransformer`: 27 blocks, full bidirectional attention over the 64
+//! The SigLIP2 So400m text tower — Raon-VisionEncoder's open_clip `TextTransformer` or the same network in
+//! `google/siglip2-so400m-patch16-naflex`'s Hugging Face layout ([`crate::layout`]) — (27 blocks, full bidirectional attention over the 64
 //! positions with no padding mask, GELU-tanh MLP, `ln_final`, the **last** position pooled, `text_projection` with bias)
 //! and its tokenizer (the SigLIP2 Gemma tokenizer of `timm/ViT-SO400M-16-SigLIP2-256`: no BOS, EOS appended, `<pad>` = 0
 //! to 64, after open_clip's `canonicalize` cleaning: `_` → space, ASCII punctuation removed, lowercased).
@@ -7,6 +8,7 @@
 //! LanceDB, so at run time only the vision tower is loaded. The token table (256 000 × 1152) stays in the mmap; the
 //! rows of the tokens in use are gathered from it.
 
+use crate::layout::{Layout, Weights};
 use crate::tower::{attend, mlp_width, unit, Loader, Proj, WeightFormat};
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
@@ -37,7 +39,11 @@ pub struct SiglipTokenizer {
 
 impl SiglipTokenizer {
     pub fn load(path: &Path) -> Result<SiglipTokenizer> {
-        let inner = tokenizers::Tokenizer::from_file(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        let mut inner = tokenizers::Tokenizer::from_file(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        // google/siglip2-*'s tokenizer.json pads (and truncates) to 64 by itself; `encode` does both, with the EOS
+        // before the padding, so the file's own settings are turned off (timm's file has none).
+        inner.with_padding(None);
+        inner.with_truncation(None).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         Ok(SiglipTokenizer { inner })
     }
 
@@ -80,6 +86,7 @@ impl TextBlock {
 
 pub struct TextTower {
     st: SafeTensors,
+    pub layout: Layout,
     pos: Tensor,
     blocks: Vec<TextBlock>,
     ln_final: LayerNorm,
@@ -90,15 +97,19 @@ pub struct TextTower {
 }
 
 impl TextTower {
-    /// Loads from the Raon-VisionEncoder checkpoint (`model.safetensors`); the token table is gathered per use.
+    /// Loads from a Raon-VisionEncoder or Hugging Face SigLIP2 checkpoint (`model.safetensors`); the token table is
+    /// gathered per use.
     pub fn load(checkpoint: &Path, device: &Device, format: WeightFormat) -> Result<TextTower> {
         let st = SafeTensors::open(&[checkpoint.to_path_buf()]).with_context(|| checkpoint.display().to_string())?;
         let (d, heads, layers, eps) = (1152usize, 16usize, 27usize, 1e-6);
         let blocks;
         let (pos, ln_final, proj);
+        let layout;
         {
+            let w = Weights::new(&st);
+            layout = w.layout;
             let l = Loader {
-                st: &st,
+                st: &w,
                 device: device.clone(),
                 format,
             };
@@ -129,6 +140,7 @@ impl TextTower {
         }
         Ok(TextTower {
             st,
+            layout,
             pos,
             blocks,
             ln_final,
@@ -143,7 +155,7 @@ impl TextTower {
     pub fn embed_ids(&self, ids: &[u32], rows: usize) -> Result<Vec<Vec<f32>>> {
         let d = self.hidden;
         let mut emb = Vec::with_capacity(ids.len() * d);
-        self.st.gather_f32("text.token_embedding.weight", ids, &mut emb)?;
+        self.weights().gather_f32("text.token_embedding.weight", ids, &mut emb)?;
         let x = Tensor::from_vec(emb, (rows, CONTEXT, d), &self.device)?.to_dtype(self.dtype)?;
         let mut x = x.broadcast_add(&self.pos.unsqueeze(0)?)?;
         for b in &self.blocks {
@@ -168,9 +180,17 @@ impl TextTower {
         Ok(out)
     }
 
+    fn weights(&self) -> Weights<'_> {
+        Weights {
+            st: &self.st,
+            layout: self.layout,
+        }
+    }
+
     /// logit scale (already `exp`'d) and bias of the checkpoint, for SigLIP's pair probability.
     pub fn logit_scale_bias(&self) -> Result<(f32, f32)> {
-        Ok((self.st.all_f32("logit_scale")?[0].exp(), self.st.all_f32("logit_bias")?[0]))
+        let w = self.weights();
+        Ok((w.all_f32("logit_scale")?[0].exp(), w.all_f32("logit_bias")?[0]))
     }
 }
 
