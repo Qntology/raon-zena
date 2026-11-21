@@ -72,8 +72,8 @@ debug = false
 # so both workspaces build one candle. To build against a local checkout, swap the git lines for
 # `path = "../candle-rocm-vulkan/candle-core"` etc.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "b90b12c4abe5d5cd5e23cfe2e05c2489ae867d9a" }
+candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "b90b12c4abe5d5cd5e23cfe2e05c2489ae867d9a" }
 
 [profile.dev.package.candle-core]
 opt-level = 3

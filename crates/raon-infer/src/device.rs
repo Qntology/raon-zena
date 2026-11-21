@@ -183,6 +183,18 @@ pub fn device_label(d: &Device) -> String {
     }
 }
 
+/// GPU ordinal of `d` (0 for CPU).
+pub fn device_ordinal(d: &Device) -> usize {
+    match d.location() {
+        DeviceLocation::Cpu => 0,
+        DeviceLocation::Cuda { gpu_id }
+        | DeviceLocation::Rocm { gpu_id }
+        | DeviceLocation::Vulkan { gpu_id }
+        | DeviceLocation::Metal { gpu_id }
+        | DeviceLocation::OpenCl { gpu_id } => gpu_id,
+    }
+}
+
 pub fn describe(d: &Device) -> String {
     match d.location() {
         DeviceLocation::Cpu => format!("cpu ({} threads)", rayon::current_num_threads()),
@@ -203,21 +215,48 @@ pub fn describe(d: &Device) -> String {
                 format!("rocm:{gpu_id}")
             }
         }
-        DeviceLocation::Vulkan { gpu_id } => format!("vulkan:{gpu_id}"),
+        DeviceLocation::Vulkan { gpu_id } => {
+            #[cfg(feature = "vulkan")]
+            if let Device::Vulkan(vd) = d {
+                return format!("vulkan:{gpu_id} ({})", vd.name());
+            }
+            format!("vulkan:{gpu_id}")
+        }
         DeviceLocation::Metal { gpu_id } => format!("metal:{gpu_id}"),
         DeviceLocation::OpenCl { gpu_id } => format!("opencl:{gpu_id}"),
     }
 }
 
 /// Whether `QMatMul::forward_exact` is cheap on this device (native exact kernels without full
-/// dequantization every call). Includes CUDA, ROCm, and Metal (native F32-activation quantized
-/// kernel in candle-rocm-vulkan@881b3c80).
+/// dequantization every call). Includes CUDA, ROCm (`w8a16.hip`), and Metal (native F32-activation
+/// quantized kernel). Vulkan uses `QMatMul::forward` (`GpuQuant` VRAM shaders) instead.
 pub fn exact_matmul_native(d: &Device) -> bool {
     d.is_cuda() || is_rocm(d) || d.is_metal()
 }
 
-/// Releases cached GPU workspaces and trims memory pools back to the driver.
+/// Conservatively trims idle GPU memory pools between turns without dropping the ROCm hot pool.
+///
+/// On ROCm, trims down to a 256 MiB hot pool only when `pool_idle_bytes() >= 320 MiB`, avoiding
+/// `hipMallocAsync`/`hipFreeAsync` pipeline stalls between inference requests.
 pub fn trim_idle_gpu_pool(d: &Device) {
+    match d {
+        #[cfg(feature = "rocm")]
+        Device::Rocm(rd) => {
+            const HIGH_WATER: usize = 320 << 20;
+            const KEEP_HOT: usize = 256 << 20;
+            if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = rd.trim_memory_pool_to(KEEP_HOT);
+            }
+        }
+        Device::Cuda(_) | Device::Vulkan(_) => {
+            let _ = d.trim_memory_pool(0);
+        }
+        _ => {}
+    }
+}
+
+/// Full teardown drain: synchronizes, releases workspaces, trims pool to 0, and frees ROCm caches.
+pub fn drain_gpu_pool(d: &Device) {
     if d.is_cpu() {
         return;
     }
@@ -230,7 +269,7 @@ pub fn trim_idle_gpu_pool(d: &Device) {
     }
 }
 
-/// Trims every GPU device cached by `select_device` (safe to call on idle unload or exit).
+/// Drains every GPU device cached by `select_device` (safe to call on idle unload or exit).
 pub fn trim_all_opened_gpu_pools() {
     let devs: Vec<Device> = device_cache()
         .lock()
@@ -239,7 +278,7 @@ pub fn trim_all_opened_gpu_pools() {
         .cloned()
         .collect();
     for d in devs {
-        trim_idle_gpu_pool(&d);
+        drain_gpu_pool(&d);
     }
 }
 
@@ -449,24 +488,50 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
                 return Ok(f32::INFINITY);
             }
             let e_logits = rel_err_f32(got_l.max_vals.as_ref().unwrap(), want_l.max_vals.as_ref().unwrap())?;
-            Ok(e_fused.max(e_logits))
+            let mut worst = e_fused.max(e_logits);
+            if is_rocm(device) {
+                use candle_core::quantized::{GgmlDType, QTensor};
+                let hq = Tensor::from_vec(det_vec(4 * 256, 18), (4, 256), &Device::Cpu)?;
+                let wq = Tensor::from_vec(det_vec(64 * 256, 19), (64, 256), &Device::Cpu)?;
+                let hq_dev = hq.to_device(device)?;
+                let wq_dev = wq.to_device(device)?;
+                for dt in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+                    let qt_cpu = QTensor::quantize(&wq, dt)?;
+                    let want_q = candle_core::lm_head::logits_argmax_cs(&qt_cpu.forward_exact(&hq)?, None, None, None)?;
+                    let qt_dev = QTensor::quantize(&wq_dev, dt)?;
+                    let got_q = candle_core::lm_head::fused_quant_argmax_cs(&hq_dev, &qt_dev, None, None, None)?;
+                    if want_q.ids.to_vec1::<u32>()? != got_q.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+                        return Ok(f32::INFINITY);
+                    }
+                    if let (Some(gv), Some(wv)) = (got_q.max_vals.as_ref(), want_q.max_vals.as_ref()) {
+                        worst = worst.max(rel_err_f32(gv, wv)?);
+                    }
+                }
+            }
+            Ok(worst)
         }
         AccelOp::QuantQ8 => {
             use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
             use candle_core::Module;
-            let a = Tensor::from_vec(det_vec(4 * 64, 16), (4, 64), &Device::Cpu)?;
-            let w = Tensor::from_vec(det_vec(64 * 64, 17), (64, 64), &Device::Cpu)?;
-            let qt_cpu = QTensor::quantize(&w, GgmlDType::Q8_0)?;
-            let want = a.matmul(&qt_cpu.dequantize(&Device::Cpu)?.t()?)?;
-            let qd = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(device)?, GgmlDType::Q8_0)?)?;
-            let got = if exact_matmul_native(device) {
-                qd.forward_exact(&a.to_device(device)?)?
-            } else {
-                qd.forward(&a.to_device(device)?)?
-            };
-            let err = rel_err_f32(&got, &want)?;
-            let tol = if exact_matmul_native(device) { 1e-2 } else { 5e-2 };
-            Ok(if err <= tol { err * 0.1 } else { err })
+            let a = Tensor::from_vec(det_vec(4 * 256, 16), (4, 256), &Device::Cpu)?;
+            let w = Tensor::from_vec(det_vec(64 * 256, 17), (64, 256), &Device::Cpu)?;
+            let a_dev = a.to_device(device)?;
+            let w_dev = w.to_device(device)?;
+            let mut worst = 0f32;
+            for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+                let qt_cpu = QTensor::quantize(&w, dt)?;
+                let want = a.matmul(&qt_cpu.dequantize(&Device::Cpu)?.t()?)?;
+                let qd = QMatMul::from_qtensor(QTensor::quantize(&w_dev, dt)?)?;
+                let got = if exact_matmul_native(device) {
+                    qd.forward_exact(&a_dev)?
+                } else {
+                    qd.forward(&a_dev)?
+                };
+                let err = rel_err_f32(&got, &want)?;
+                let tol = if exact_matmul_native(device) || device.is_vulkan() { 1e-2 } else { 5e-2 };
+                worst = worst.max(if err <= tol { err * 0.1 } else { err });
+            }
+            Ok(worst)
         }
     }
 }
@@ -496,15 +561,20 @@ mod tests {
         let gpu = candle_nn::ops::softmax_last_dim(&a.to_device(&dev)?.matmul(&w.to_device(&dev)?.t()?)?)?;
         let d = max_abs_diff(&cpu, &gpu.to_device(&Device::Cpu)?)?;
         assert!(d < 1e-4, "dense matmul + softmax differ by {d}");
-        // Q8_0 weights through QMatMul (the block format the pyramid's T2 tier uses).
-        let q_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0)?)?;
-        let q_gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, GgmlDType::Q8_0)?)?;
-        let y_cpu = q_cpu.forward(&a)?;
-        let y_gpu = q_gpu.forward(&a.to_device(&dev)?)?.to_device(&Device::Cpu)?;
-        let scale = y_cpu.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-        let d = max_abs_diff(&y_cpu, &y_gpu)?;
-        assert!(d <= 0.05 * scale.max(1e-3), "Q8_0 matmul differs by {d} (scale {scale})");
-        trim_idle_gpu_pool(&dev);
+        // Q8_0 and K-quant weights (Q4_0 / Q4K / Q5K / Q6K) through QMatMul — verifies both
+        // ROCm w8a16 and Vulkan GpuQuant shaders across all pyramid tiers.
+        let a_dev = a.to_device(&dev)?;
+        let w_dev = w.to_device(&dev)?;
+        for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+            let q_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?;
+            let q_gpu = QMatMul::from_qtensor(QTensor::quantize(&w_dev, dt)?)?;
+            let y_cpu = q_cpu.forward(&a)?;
+            let y_gpu = q_gpu.forward(&a_dev)?.to_device(&Device::Cpu)?;
+            let scale = y_cpu.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            let d = max_abs_diff(&y_cpu, &y_gpu)?;
+            assert!(d <= 0.05 * scale.max(1e-3), "{dt:?} matmul differs by {d} (scale {scale})");
+        }
+        drain_gpu_pool(&dev);
         Ok(())
     }
 
