@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+raon-cpu-kernels.workspace = true
 zena-core = { path = "../zena-core" }
 zena-lexicon = { path = "../zena-lexicon" }
 zena-sds = { path = "../zena-sds" }
@@ -14,11 +15,12 @@ anyhow = "1"
 # The domain-neutral NLP-NMS core (premium-discount); `neural`: granite embeddings, `stanza`: + Stanza roles.
 premium-discount-nms.workspace = true
 premium-discount-nlp = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
 
 [features]
 default = []
-neural = ["premium-discount-nms/neural", "dep:premium-discount-nlp"]
+neural = ["premium-discount-nms/neural", "dep:premium-discount-nlp", "dep:candle-core"]
 stanza = ["neural", "premium-discount-nms/stanza", "premium-discount-nlp/stanza"]

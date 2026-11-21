@@ -19,7 +19,7 @@ serde_json.workspace = true
 
 [features]
 default = []
-cuda = ["raon-vision/cuda"]
-rocm = ["raon-vision/rocm"]
-vulkan = ["raon-vision/vulkan"]
-metal = ["raon-vision/metal"]
+cuda = ["raon-infer/cuda", "raon-vision/cuda"]
+rocm = ["raon-infer/rocm", "raon-vision/rocm"]
+vulkan = ["raon-infer/vulkan", "raon-vision/vulkan"]
+metal = ["raon-infer/metal", "raon-vision/metal"]

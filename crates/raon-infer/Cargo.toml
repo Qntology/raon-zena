@@ -6,12 +6,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+raon-cpu-kernels.workspace = true
 raon-quant = { path = "../raon-quant" }
 anyhow = "1"
 candle-core.workspace = true
 candle-nn.workspace = true
 # Same optional ROCm helper crate logis-center pulls from the fork (device info, pool trimming).
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", optional = true }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463", optional = true }
 half.workspace = true
 rayon = "1.10"
 serde.workspace = true

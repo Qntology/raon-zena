@@ -19,7 +19,7 @@
 //!   and `BlindAssist` (`SessionContext.privacy_locked`).
 
 use crate::browser_uia::{
-    build_web_nav_overlay, embedder_similarity, is_browser_exe, AsyncBrowserUiaWorker,
+    build_web_nav_overlay, is_browser_exe, precompute_label_similarity, AsyncBrowserUiaWorker,
     BrowserSessionTracker, NavBadgeOverlay, ScanRequest, TabTransition,
 };
 use crate::capture::FrameSource;
@@ -793,6 +793,7 @@ pub fn run(
                             .map(|s| s.mask(now))
                             .unwrap_or(0);
                         let embedder = router.models.embedder.clone();
+                        let label_sim = precompute_label_similarity(&embedder, &[], &snap.regions);
                         if let Some((badge_ov, web_brief)) = build_web_nav_overlay(
                             &snap,
                             &[],
@@ -800,7 +801,7 @@ pub fn run(
                             &mut sticky_numberer,
                             locked_mask,
                             None,
-                            |a, b| embedder_similarity(&embedder, a, b),
+                            label_sim,
                             now_i64,
                         ) {
                             if let Ok(mut m) = pd_bridge.rag.mirror.lock() {
@@ -833,7 +834,8 @@ pub fn run(
                     right: (w * 4) as i32,
                     bottom: (h * 4) as i32,
                 };
-                if let Some(fg) = foreground_window() {
+                let fg_window = foreground_window();
+                if let Some(fg) = fg_window.as_ref() {
                     let fg_exe = fg.exe_name.as_deref().unwrap_or_default();
                     let fg_cc = fg
                         .app_uri()
@@ -872,7 +874,8 @@ pub fn run(
                     .iter()
                     .filter_map(|&(rx, ry, rw, rh)| premium_discount_nav::Rect::new(rx, ry, rw, rh))
                     .collect();
-                let seed_in_title = foreground_window()
+                let seed_in_title = fg_window
+                    .as_ref()
                     .is_some_and(|w| detect_seed_phrase_checked(&w.title).is_some());
                 let shield = evaluate_privacy(&PrivacyProbeInput {
                     regions: &[],

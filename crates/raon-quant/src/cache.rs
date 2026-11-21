@@ -234,10 +234,51 @@ fn build(spec: &CacheSpec, dir: &Path, key: &str) -> Result<(f32, Report)> {
             }
         },
     )?;
-    std::fs::write(dir.join("report.json"), serde_json::to_string_pretty(&report)?)?;
+    write_atomic(&dir.join("report.json"), serde_json::to_string_pretty(&report)?.as_bytes())?;
     // READY last: a crash before this line leaves no valid cache behind.
-    std::fs::write(dir.join(READY_FILE), key)?;
+    write_atomic(&dir.join(READY_FILE), key.as_bytes())?;
     Ok((t0.elapsed().as_secs_f32(), report))
+}
+
+/// Writes `bytes` to a unique sibling temp file, `sync_all()`s it, and atomically replaces `target`.
+pub fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_os = target.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.exists() => {
+            let mut bak_os = target.as_os_str().to_os_string();
+            bak_os.push(format!(".bak.{}.{seq}", std::process::id()));
+            let bak = PathBuf::from(bak_os);
+            let _ = std::fs::remove_file(&bak);
+            std::fs::rename(target, &bak)?;
+            match std::fs::rename(&tmp, target) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, target);
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,18 @@ pub trait LlmBackend: Send {
     /// produced; returns the whole completion. `situation` is passed alongside the rendered prompt so non-neural
     /// backends can respond without parsing text.
     fn generate(&mut self, prompt: &str, situation: &Situation, on_text: &mut dyn FnMut(&str)) -> String;
+
+    /// Interruptible variant polled between tokens so superseded requests (`ask_epoch`) or privacy locks
+    /// abort immediately instead of burning remaining decode tokens.
+    fn generate_cancellable(
+        &mut self,
+        prompt: &str,
+        situation: &Situation,
+        on_text: &mut dyn FnMut(&str),
+        _is_cancelled: &dyn Fn() -> bool,
+    ) -> String {
+        self.generate(prompt, situation, on_text)
+    }
 }
 
 /// Receives what the LLM thread produces for each job.
@@ -111,7 +123,17 @@ impl LlmBackend for RaonNanoBackend {
         "raon-1-nano"
     }
 
-    fn generate(&mut self, prompt: &str, _situation: &Situation, on_text: &mut dyn FnMut(&str)) -> String {
+    fn generate(&mut self, prompt: &str, situation: &Situation, on_text: &mut dyn FnMut(&str)) -> String {
+        self.generate_cancellable(prompt, situation, on_text, &|| false)
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        prompt: &str,
+        _situation: &Situation,
+        on_text: &mut dyn FnMut(&str),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> String {
         // Special tokens are atomic, so splitting right before the user turn tokenizes exactly
         // like the whole prompt.
         let suffix = prompt.find(USER_TURN).map(|i| &prompt[i..]).unwrap_or(prompt);
@@ -119,10 +141,16 @@ impl LlmBackend for RaonNanoBackend {
             let ids = self.gen.encode(suffix)?;
             let t0 = std::time::Instant::now();
             let mut first: Option<f64> = None;
-            let (text, stats) = self.gen.generate_from(self.prefix.clone(), &ids, self.max_new, |d| {
-                first.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1e3);
-                on_text(d)
-            })?;
+            let (text, stats) = self.gen.generate_from_cancellable(
+                self.prefix.clone(),
+                &ids,
+                self.max_new,
+                |d| {
+                    first.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1e3);
+                    on_text(d)
+                },
+                is_cancelled,
+            )?;
             eprintln!(
                 "[llm] {} prompt tok, {} new tok, prefill {:.0} ms, first text {:.0} ms, {:.1} tok/s",
                 stats.prompt_tokens,
@@ -279,7 +307,9 @@ impl LlmWorker {
                             Ok(j) => j,
                             Err(RecvTimeoutError::Timeout) => {
                                 backend = None;
-                                eprintln!("[llm] {label}: idle for {}s, unloaded", idle.as_secs());
+                                raon_infer::device::trim_all_opened_gpu_pools();
+                                raon_infer::device::trim_process_working_set();
+                                eprintln!("[llm] {label}: idle for {}s, unloaded (GPU pool + working set trimmed)", idle.as_secs());
                                 continue;
                             }
                             Err(RecvTimeoutError::Disconnected) => break,
@@ -314,11 +344,16 @@ impl LlmWorker {
                     let out = backend
                         .as_mut()
                         .expect("loaded")
-                        .generate(&job.prompt, &job.situation, &mut |d| {
-                            if job.epoch == 0 || job.epoch == ask_epoch.load(Ordering::Acquire) {
-                                handler.delta(&job, d);
-                            }
-                        });
+                        .generate_cancellable(
+                            &job.prompt,
+                            &job.situation,
+                            &mut |d| {
+                                if job.epoch == 0 || job.epoch == ask_epoch.load(Ordering::Acquire) {
+                                    handler.delta(&job, d);
+                                }
+                            },
+                            &|| job.epoch > 0 && job.epoch != ask_epoch.load(Ordering::Acquire),
+                        );
                     if job.epoch == 0 || job.epoch == ask_epoch.load(Ordering::Acquire) {
                         handler.done(job, out);
                     }

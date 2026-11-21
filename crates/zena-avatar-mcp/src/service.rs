@@ -140,12 +140,46 @@ fn cached(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
-/// Writes via a temporary file so a crash never leaves a truncated cache entry.
+/// Writes via a unique temporary file + `sync_all()` + backup-swap so a crash or concurrent
+/// writer never leaves a truncated cache entry (safe on Windows when replacing an existing file).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.exists() => {
+            let mut bak_os = path.as_os_str().to_os_string();
+            bak_os.push(format!(".bak.{}.{seq}", std::process::id()));
+            let bak = PathBuf::from(bak_os);
+            let _ = std::fs::remove_file(&bak);
+            std::fs::rename(path, &bak).with_context(|| format!("backing up {}", path.display()))?;
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, path);
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e).with_context(|| format!("renaming to {}", path.display()))
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("renaming to {}", path.display()))
+        }
+    }
 }
 
 struct Worker {

@@ -158,8 +158,9 @@ fn main() -> Result<()> {
                 hf.write_all(&x.to_le_bytes())?;
             }
         }
-        std::fs::write(path.with_extension("ids.json"), serde_json::to_string(&ids)?)?;
+        raon_infer::device::write_file_atomic(&path.with_extension("ids.json"), serde_json::to_string(&ids)?.as_bytes())?;
         eprintln!("[raon-chat] dumped {} positions to {}", rows.len(), path.display());
+        raon_infer::device::rocm_exit_now_if_used(0);
         return Ok(());
     }
     let (_, stats) = gen.generate(&ids, a.max_new, |s| {
@@ -168,5 +169,6 @@ fn main() -> Result<()> {
     })?;
     println!();
     eprintln!("[raon-chat] {}", serde_json::to_string(&stats)?);
+    raon_infer::device::rocm_exit_now_if_used(0);
     Ok(())
 }
