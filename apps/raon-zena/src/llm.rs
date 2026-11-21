@@ -16,7 +16,9 @@ use raon_infer::generate::Generator;
 use raon_infer::head::HeadMode;
 use raon_infer::model::State;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::time::Duration;
 use zena_core::prompt::{build_fast_path_prompt, Situation};
 
@@ -200,6 +202,9 @@ pub struct LlmJob {
     pub prompt: String,
     pub situation: Situation,
     pub level: zena_core::reaction::ReactionLevel,
+    /// Generation epoch (`0` means unscoped). When non-zero and behind `ask_epoch`, generation
+    /// is skipped or its remaining deltas are discarded cleanly (CR-06 / PS-12).
+    pub epoch: u64,
 }
 
 /// Loads a backend when it is first needed.
@@ -215,6 +220,15 @@ pub struct LlmWorker {
 impl LlmWorker {
     /// A backend that stays loaded.
     pub fn spawn(backend: Box<dyn LlmBackend>, handler: impl JobHandler) -> Self {
+        Self::spawn_with_epoch(backend, handler, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A resident backend guarded by a shared `ask_epoch` for instant cancellation.
+    pub fn spawn_with_epoch(
+        backend: Box<dyn LlmBackend>,
+        handler: impl JobHandler,
+        ask_epoch: Arc<AtomicU64>,
+    ) -> Self {
         let name = backend.name().to_string();
         let mut slot = Some(backend);
         Self::start(
@@ -222,14 +236,27 @@ impl LlmWorker {
             Box::new(move || slot.take().ok_or_else(|| anyhow::anyhow!("backend already taken"))),
             None,
             handler,
+            ask_epoch,
         )
     }
 
     /// Not resident: the backend is loaded on the first request and dropped after `idle` without one, so
     /// Raon-1-nano only holds VRAM / RAM while Zena is actually answering (with the block cache a reload takes
     /// about a second). Requests that arrive while it loads fall back to cached cues, as when it is busy.
+    #[allow(dead_code)]
     pub fn spawn_lazy(name: &str, loader: Loader, idle: Duration, handler: impl JobHandler) -> Self {
-        Self::start(name.to_string(), Box::new(loader), Some(idle), handler)
+        Self::spawn_lazy_with_epoch(name, loader, idle, handler, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Lazy backend guarded by a shared `ask_epoch`.
+    pub fn spawn_lazy_with_epoch(
+        name: &str,
+        loader: Loader,
+        idle: Duration,
+        handler: impl JobHandler,
+        ask_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        Self::start(name.to_string(), Box::new(loader), Some(idle), handler, ask_epoch)
     }
 
     fn start(
@@ -237,6 +264,7 @@ impl LlmWorker {
         mut load: Box<dyn FnMut() -> anyhow::Result<Box<dyn LlmBackend>> + Send>,
         idle: Option<Duration>,
         mut handler: impl JobHandler,
+        ask_epoch: Arc<AtomicU64>,
     ) -> Self {
         let (tx, rx): (SyncSender<LlmJob>, Receiver<LlmJob>) = sync_channel(0);
         let label = name.clone();
@@ -260,6 +288,9 @@ impl LlmWorker {
                             Err(_) => break,
                         },
                     };
+                    if job.epoch > 0 && job.epoch != ask_epoch.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if backend.is_none() {
                         let t = std::time::Instant::now();
                         match load() {
@@ -276,11 +307,20 @@ impl LlmWorker {
                             }
                         }
                     }
+                    if job.epoch > 0 && job.epoch != ask_epoch.load(Ordering::Acquire) {
+                        continue;
+                    }
                     let out = backend
                         .as_mut()
                         .expect("loaded")
-                        .generate(&job.prompt, &job.situation, &mut |d| handler.delta(&job, d));
-                    handler.done(job, out);
+                        .generate(&job.prompt, &job.situation, &mut |d| {
+                            if job.epoch == 0 || job.epoch == ask_epoch.load(Ordering::Acquire) {
+                                handler.delta(&job, d);
+                            }
+                        });
+                    if job.epoch == 0 || job.epoch == ask_epoch.load(Ordering::Acquire) {
+                        handler.done(job, out);
+                    }
                 }
             })
             .expect("spawn llm thread");
@@ -323,6 +363,7 @@ mod tests {
                 prompt: String::new(),
                 situation: Situation::default(),
                 level: zena_core::reaction::ReactionLevel::Lv3Coaching,
+                epoch: 0,
             }) {
                 ok = true;
                 break;
@@ -356,6 +397,7 @@ mod tests {
                     prompt: String::new(),
                     situation: Situation::default(),
                     level: zena_core::reaction::ReactionLevel::Lv3Coaching,
+                    epoch: 0,
                 }) {
                     return;
                 }

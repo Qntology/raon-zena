@@ -79,6 +79,34 @@ pub struct EmoteShow {
     pub angle_deg: f32,
 }
 
+use crate::browser_uia::NavBadge;
+use crate::pd_bridge::DrawerItem;
+use premium_discount_verdict::Tier;
+use zena_verdict::UserPin;
+
+/// Clickable `[▲]` / `[▼]` hit regions for one Stage 2 drawer row (window pixel coordinates).
+#[derive(Debug, Clone)]
+pub struct DrawerHitRow {
+    pub record_id: String,
+    pub up_rect: [f32; 4],
+    pub down_rect: [f32; 4],
+}
+
+/// Interactive hit-test layout computed during the latest frame (window pixel coordinates `[x0, y0, x1, y1]`).
+#[derive(Debug, Clone, Default)]
+pub struct OverlayLayout {
+    pub pill_rect: Option<[f32; 4]>,
+    pub rejection_rect: Option<[f32; 4]>,
+    pub drawer_rows: Vec<DrawerHitRow>,
+    pub badge_rects: Vec<(u8, bool, [f32; 4])>,
+}
+
+impl OverlayLayout {
+    pub fn hit_rect(r: [f32; 4], x: f32, y: f32) -> bool {
+        x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]
+    }
+}
+
 /// Everything one frame needs.
 #[derive(Clone, Copy)]
 pub struct Stage<'a> {
@@ -90,6 +118,16 @@ pub struct Stage<'a> {
     pub bubble: Option<(&'a str, f32)>,
     /// The chat box: committed text, IME preedit, caret visible.
     pub input: Option<(&'a str, &'a str, bool)>,
+    /// Stage 0 status pill: label text and status dot/border color.
+    pub sync_pill: Option<(&'a str, [f32; 4])>,
+    /// Stage 1 unacknowledged rejection alert chip.
+    pub rejection_chip: Option<&'a str>,
+    /// Stage 2 history/verdict drawer rows (non-blended local vs global + ▲/▼ pin controls).
+    pub drawer: Option<&'a [DrawerItem]>,
+    /// 1–9 numbered navigation badges for the active screen/browser tab.
+    pub badges: &'a [NavBadge],
+    /// Drop-note banner shown while authoring a note for a dragged/dropped target window.
+    pub drop_hint: Option<&'a str>,
 }
 
 enum Body {
@@ -113,6 +151,12 @@ pub struct Scene {
     bodies: HashMap<AvatarTrack, Body>,
     bubble: Option<(String, Sprite)>,
     input: Option<(String, Sprite)>,
+    pill: Option<(String, Sprite)>,
+    rejection: Option<(String, Sprite)>,
+    drawer_rows: Vec<(String, Sprite)>,
+    badge_sprites: Vec<(String, Sprite)>,
+    drop_hint: Option<(String, Sprite)>,
+    layout: OverlayLayout,
     /// Assets that failed to load (not asked for again).
     pub failed: HashSet<Missing>,
 }
@@ -190,8 +234,18 @@ impl Scene {
             bodies: HashMap::new(),
             bubble: None,
             input: None,
+            pill: None,
+            rejection: None,
+            drawer_rows: Vec::new(),
+            badge_sprites: Vec::new(),
+            drop_hint: None,
+            layout: OverlayLayout::default(),
             failed: HashSet::new(),
         }
+    }
+
+    pub fn layout(&self) -> &OverlayLayout {
+        &self.layout
     }
 
     pub fn load(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, asset: Loaded) {
@@ -444,8 +498,184 @@ impl Scene {
             }
         }
 
-        // ---- bubble and chat box (re-rasterized only when their text changes)
+        // ---- pass 3 prep: Stage 0 pill, Stage 1 rejection chip, Stage 2 drawer, 1–9 badges, bubble & chat
+        self.layout = OverlayLayout::default();
         let width = (p.width as f32 - 16.0 * px).max(32.0) as u32;
+        let mut y_top = 8.0 * px;
+
+        let mut show_pill = false;
+        if let Some((label, color)) = stage.sync_pill.filter(|(t, _)| !t.trim().is_empty()) {
+            let key = format!("{label}|{:.2},{:.2},{:.2}", color[0], color[1], color[2]);
+            let pill_w = (p.width as f32 * 0.56).clamp(96.0, width as f32) as u32;
+            if self.pill.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.pill = self
+                    .text
+                    .render_box(label, "", false, pill_w, &BoxStyle::pill(px, color))
+                    .map(|img| (key, self.sprites.sprite(device, queue, img.w, img.h, &img.rgba)));
+            }
+            if let Some((_, s)) = &self.pill {
+                let (sw, sh) = (s.width as f32, s.height as f32);
+                let x0 = 8.0 * px;
+                s.place(
+                    queue,
+                    &Placement::pixels(x0 + sw / 2.0, y_top + sh / 2.0, sw, sh, p.width, p.height),
+                    aspect,
+                );
+                self.layout.pill_rect = Some([x0, y_top, x0 + sw, y_top + sh]);
+                y_top += sh + 4.0 * px;
+                show_pill = true;
+            }
+        }
+
+        let mut show_rejection = false;
+        if let Some(msg) = stage.rejection_chip.filter(|t| !t.trim().is_empty()) {
+            if self.rejection.as_ref().is_none_or(|(k, _)| k != msg) {
+                self.rejection = self
+                    .text
+                    .render_box(msg, "", false, width, &BoxStyle::rejection(px))
+                    .map(|img| (msg.to_string(), self.sprites.sprite(device, queue, img.w, img.h, &img.rgba)));
+            }
+            if let Some((_, s)) = &self.rejection {
+                let (sw, sh) = (s.width as f32, s.height as f32);
+                let x0 = (p.width as f32 - sw) / 2.0;
+                s.place(
+                    queue,
+                    &Placement::pixels(x0 + sw / 2.0, y_top + sh / 2.0, sw, sh, p.width, p.height),
+                    aspect,
+                );
+                self.layout.rejection_rect = Some([x0, y_top, x0 + sw, y_top + sh]);
+                y_top += sh + 4.0 * px;
+                show_rejection = true;
+            }
+        }
+
+        let mut show_drop_hint = false;
+        if let Some(hint) = stage.drop_hint.filter(|t| !t.trim().is_empty()) {
+            if self.drop_hint.as_ref().is_none_or(|(k, _)| k != hint) {
+                self.drop_hint = self
+                    .text
+                    .render_box(hint, "", false, width, &BoxStyle::pill(px, [0.42, 0.85, 0.62, 1.0]))
+                    .map(|img| (hint.to_string(), self.sprites.sprite(device, queue, img.w, img.h, &img.rgba)));
+            }
+            if let Some((_, s)) = &self.drop_hint {
+                let (sw, sh) = (s.width as f32, s.height as f32);
+                s.place(
+                    queue,
+                    &Placement::pixels(p.width as f32 / 2.0, y_top + sh / 2.0, sw, sh, p.width, p.height),
+                    aspect,
+                );
+                y_top += sh + 4.0 * px;
+                show_drop_hint = true;
+            }
+        }
+
+        // Stage 2 history/verdict drawer rows (up to 4 visible rows with clickable ▲/▼ areas).
+        let mut drawer_draw_count = 0usize;
+        if let Some(items) = stage.drawer {
+            let max_rows = items.len().min(4);
+            let mut keys: Vec<String> = Vec::with_capacity(max_rows);
+            for item in &items[..max_rows] {
+                let local_chip = tier_chip("나", item.pair.local_tier, item.pair.local_wl);
+                let global_chip = tier_chip("전체", item.pair.global_tier, item.pair.global_up_down);
+                let up_mark = if item.pinned == Some(UserPin::Promoted) { "【▲】" } else { "[▲]" };
+                let down_mark = if item.pinned == Some(UserPin::Demoted) { "【▼】" } else { "[▼]" };
+                keys.push(format!(
+                    "{}\n{local_chip} · {global_chip}  {up_mark} {down_mark}",
+                    item.label
+                ));
+            }
+            let cache_matches = self.drawer_rows.len() == keys.len()
+                && self.drawer_rows.iter().zip(&keys).all(|((k, _), want)| k == want);
+            if !cache_matches {
+                self.drawer_rows.clear();
+                for k in &keys {
+                    if let Some(img) = self.text.render_box(k, "", false, width, &BoxStyle::drawer(px)) {
+                        self.drawer_rows
+                            .push((k.clone(), self.sprites.sprite(device, queue, img.w, img.h, &img.rgba)));
+                    }
+                }
+            }
+            let x0 = (p.width as f32 - width as f32) / 2.0;
+            for (idx, (_, s)) in self.drawer_rows.iter().enumerate() {
+                let (sw, sh) = (s.width as f32, s.height as f32);
+                s.place(
+                    queue,
+                    &Placement::pixels(x0 + sw / 2.0, y_top + sh / 2.0, sw, sh, p.width, p.height),
+                    aspect,
+                );
+                let btn_w = 36.0 * px;
+                let down_x1 = x0 + sw - 6.0 * px;
+                let down_x0 = (down_x1 - btn_w).max(x0);
+                let up_x1 = (down_x0 - 4.0 * px).max(x0);
+                let up_x0 = (up_x1 - btn_w).max(x0);
+                let btn_y0 = y_top + sh * 0.45;
+                let btn_y1 = y_top + sh;
+                if let Some(item) = items.get(idx) {
+                    self.layout.drawer_rows.push(DrawerHitRow {
+                        record_id: item.record_id.clone(),
+                        up_rect: [up_x0, btn_y0, up_x1, btn_y1],
+                        down_rect: [down_x0, btn_y0, down_x1, btn_y1],
+                    });
+                }
+                y_top += sh + 3.0 * px;
+                drawer_draw_count += 1;
+            }
+        }
+
+        // 1–9 numbered navigation badges (stacked cleanly along the right edge when drawer is closed).
+        let mut badge_draw_count = 0usize;
+        if !stage.badges.is_empty() && drawer_draw_count == 0 {
+            let max_badges = stage.badges.len().min(9);
+            let badge_w = (124.0 * px).min(p.width as f32 * 0.44) as u32;
+            let keys: Vec<(String, [f32; 4], bool)> = stage.badges[..max_badges]
+                .iter()
+                .map(|b| {
+                    let lock = if b.commit_guarded { "🔒 " } else { "" };
+                    let short: String = b.label.chars().take(10).collect();
+                    let label = format!("#{} {lock}{short}", b.number);
+                    let border = tier_border(b.tier);
+                    (label, border, b.commit_guarded)
+                })
+                .collect();
+            let cache_matches = self.badge_sprites.len() == keys.len()
+                && self
+                    .badge_sprites
+                    .iter()
+                    .zip(&keys)
+                    .all(|((k, _), (want, _, cg))| *k == format!("{want}|{cg}"));
+            if !cache_matches {
+                self.badge_sprites.clear();
+                for (label, border, cg) in &keys {
+                    if let Some(img) =
+                        self.text
+                            .render_box(label, "", false, badge_w, &BoxStyle::badge(px, *border, *cg))
+                    {
+                        self.badge_sprites.push((
+                            format!("{label}|{cg}"),
+                            self.sprites.sprite(device, queue, img.w, img.h, &img.rgba),
+                        ));
+                    }
+                }
+            }
+            let mut by = 8.0 * px;
+            for (idx, (_, s)) in self.badge_sprites.iter().enumerate() {
+                let (sw, sh) = (s.width as f32, s.height as f32);
+                let x0 = p.width as f32 - sw - 8.0 * px;
+                s.place(
+                    queue,
+                    &Placement::pixels(x0 + sw / 2.0, by + sh / 2.0, sw, sh, p.width, p.height),
+                    aspect,
+                );
+                if let Some(b) = stage.badges.get(idx) {
+                    self.layout
+                        .badge_rects
+                        .push((b.number, b.commit_guarded, [x0, by, x0 + sw, by + sh]));
+                }
+                by += sh + 3.0 * px;
+                badge_draw_count += 1;
+            }
+        }
+
         let mut y_bottom = p.height as f32 - 8.0 * px;
         let mut show_input = false;
         if let Some((text, pre, caret)) = stage.input {
@@ -508,9 +738,31 @@ impl Scene {
                 self.sprites.draw(&mut rp, &self.stamps[&e].sprite);
             }
         }
-        // ---- pass 3: speech bubble + chat box
-        if show_bubble || show_input {
+        // ---- pass 3: Stage 0/1/2 overlay chrome, 1–9 badges, speech bubble + chat box
+        let has_ui = show_pill
+            || show_rejection
+            || show_drop_hint
+            || drawer_draw_count > 0
+            || badge_draw_count > 0
+            || show_bubble
+            || show_input;
+        if has_ui {
             let mut rp = begin(enc, color, depth, false, "pass3.bubble");
+            if let (true, Some((_, s))) = (show_pill, &self.pill) {
+                self.sprites.draw(&mut rp, s);
+            }
+            if let (true, Some((_, s))) = (show_rejection, &self.rejection) {
+                self.sprites.draw(&mut rp, s);
+            }
+            if let (true, Some((_, s))) = (show_drop_hint, &self.drop_hint) {
+                self.sprites.draw(&mut rp, s);
+            }
+            for (_, s) in self.drawer_rows.iter().take(drawer_draw_count) {
+                self.sprites.draw(&mut rp, s);
+            }
+            for (_, s) in self.badge_sprites.iter().take(badge_draw_count) {
+                self.sprites.draw(&mut rp, s);
+            }
             if let (true, Some((_, s))) = (show_bubble, &self.bubble) {
                 self.sprites.draw(&mut rp, s);
             }
@@ -518,6 +770,28 @@ impl Scene {
                 self.sprites.draw(&mut rp, s);
             }
         }
+    }
+}
+
+fn tier_chip(who: &str, tier: Tier, counts: Option<(u32, u32)>) -> String {
+    let word = match tier {
+        Tier::Premium => "추천",
+        Tier::Discount => "비추",
+        Tier::Neutral => "보통",
+        Tier::Unrated => "판정전",
+    };
+    match counts {
+        Some((a, b)) => format!("{who}:{word}({a}/{b})"),
+        None => format!("{who}:{word}"),
+    }
+}
+
+fn tier_border(tier: Option<Tier>) -> [f32; 4] {
+    match tier {
+        Some(Tier::Premium) => [0.28, 0.85, 0.56, 1.0],
+        Some(Tier::Discount) => [0.95, 0.36, 0.38, 1.0],
+        Some(Tier::Neutral) => [0.92, 0.76, 0.34, 1.0],
+        _ => [0.60, 0.46, 0.94, 1.0],
     }
 }
 

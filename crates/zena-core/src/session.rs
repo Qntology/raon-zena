@@ -19,6 +19,7 @@ pub use crate::exposure::{ExposedRecord, ExposureLedger, ExposureRole};
 #[derive(Debug, Clone)]
 pub struct SessionTracker {
     scene: Option<(String, String, u64)>,
+    scene_paused_ms: u64,
     defeat_streak: u32,
     victory_streak: u32,
     affinity: f32,
@@ -32,6 +33,7 @@ impl Default for SessionTracker {
     fn default() -> Self {
         Self {
             scene: None,
+            scene_paused_ms: 0,
             defeat_streak: 0,
             victory_streak: 0,
             affinity: 0.3,
@@ -47,6 +49,7 @@ impl SessionTracker {
     pub fn scene(&mut self, key: &str, semantic: &str, now_ms: u64) {
         if self.scene.as_ref().is_none_or(|(k, _, _)| k != key) {
             self.scene = Some((key.to_string(), semantic.to_string(), now_ms));
+            self.scene_paused_ms = 0;
         }
     }
 
@@ -55,7 +58,23 @@ impl SessionTracker {
     }
 
     pub fn scene_ms(&self, now_ms: u64) -> u64 {
-        self.scene.as_ref().map(|(_, _, t)| now_ms.saturating_sub(*t)).unwrap_or(0)
+        self.scene
+            .as_ref()
+            .map(|(_, _, t)| now_ms.saturating_sub(*t).saturating_sub(self.scene_paused_ms))
+            .unwrap_or(0)
+    }
+
+    /// Excludes privacy-lock time from the scene duration so returning from a long banking window does not
+    /// trigger an immediate 50-minute stretch break (`Proactive::Break`).
+    pub fn add_paused_ms(&mut self, delta_ms: u64) {
+        self.scene_paused_ms = self.scene_paused_ms.saturating_add(delta_ms);
+        self.tension_ms = self.tension_ms.saturating_add(delta_ms);
+    }
+
+    /// Current decayed tension in `0.0..=1.0`.
+    pub fn tension(&mut self, now_ms: u64) -> f32 {
+        self.decay(now_ms);
+        self.tension
     }
 
     pub fn defeat(&mut self, now_ms: u64) {

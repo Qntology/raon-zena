@@ -459,8 +459,25 @@ fn seed_phrases(text: &str, is_word: &dyn Fn(&str) -> bool) -> Vec<PiiSpan> {
     out
 }
 
+#[derive(Clone, Copy)]
+enum SeedCheck<'a> {
+    None,
+    Word(&'a dyn Fn(&str) -> bool),
+    Span(&'a dyn Fn(&str) -> Option<(usize, usize)>),
+}
+
 /// Every sensitive span of `text`, sorted by start (longer first on ties).
 pub(crate) fn find_pii(text: &str, is_seed_word: Option<&dyn Fn(&str) -> bool>) -> Vec<PiiSpan> {
+    find_pii_with(
+        text,
+        match is_seed_word {
+            Some(f) => SeedCheck::Word(f),
+            None => SeedCheck::None,
+        },
+    )
+}
+
+fn find_pii_with(text: &str, seed_check: SeedCheck<'_>) -> Vec<PiiSpan> {
     let mut spans: Vec<PiiSpan> = digit_runs(text)
         .iter()
         .filter_map(|r| {
@@ -475,8 +492,18 @@ pub(crate) fn find_pii(text: &str, is_seed_word: Option<&dyn Fn(&str) -> bool>) 
     spans.extend(emails(text));
     spans.extend(user_paths(text));
     spans.extend(password_tokens(text));
-    if let Some(f) = is_seed_word {
-        spans.extend(seed_phrases(text, f));
+    match seed_check {
+        SeedCheck::None => {}
+        SeedCheck::Word(f) => spans.extend(seed_phrases(text, f)),
+        SeedCheck::Span(det) => {
+            if let Some((start, end)) = det(text).filter(|&(s, e)| s < e && e <= text.len()) {
+                spans.push(PiiSpan {
+                    start,
+                    end,
+                    kind: PiiKind::Hard(SecretKind::WalletSeedPhrase),
+                });
+            }
+        }
     }
     spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
     spans
@@ -491,16 +518,16 @@ fn mask_token(kind: PiiKind) -> &'static str {
     }
 }
 
-/// The ingress gate with an optional BIP-39 word predicate.
+/// The ingress gate with an optional BIP-39 word predicate or full span detector.
 #[derive(Clone, Copy)]
 pub struct IngressPiiScrubber<'a> {
-    is_seed_word: Option<&'a dyn Fn(&str) -> bool>,
+    seed_check: SeedCheck<'a>,
 }
 
 impl std::fmt::Debug for IngressPiiScrubber<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngressPiiScrubber")
-            .field("seed_list", &self.is_seed_word.is_some())
+            .field("seed_list", &!matches!(self.seed_check, SeedCheck::None))
             .finish()
     }
 }
@@ -509,18 +536,28 @@ impl<'a> IngressPiiScrubber<'a> {
     /// `is_seed_word`: whether a lowercase word is in the BIP-39 English list.
     pub fn new(is_seed_word: &'a dyn Fn(&str) -> bool) -> Self {
         Self {
-            is_seed_word: Some(is_seed_word),
+            seed_check: SeedCheck::Word(is_seed_word),
+        }
+    }
+
+    /// Uses a full seed-phrase span detector (e.g. `premium_discount_identity::detect_seed_phrase_span` or a
+    /// checksum / context-aware checker that avoids false positives on plain English gaming words).
+    pub fn with_seed_detector(detector: &'a dyn Fn(&str) -> Option<(usize, usize)>) -> Self {
+        Self {
+            seed_check: SeedCheck::Span(detector),
         }
     }
 
     /// Without a word list seed phrases are not detected (everything else is).
     pub fn without_seed_list() -> Self {
-        Self { is_seed_word: None }
+        Self {
+            seed_check: SeedCheck::None,
+        }
     }
 
     /// Read-only check: the first hard secret in `text`, if any.
     pub fn detect(&self, text: &str) -> Option<SecretKind> {
-        find_pii(text, self.is_seed_word).into_iter().find_map(|s| match s.kind {
+        find_pii_with(text, self.seed_check).into_iter().find_map(|s| match s.kind {
             PiiKind::Hard(k) => Some(k),
             _ => None,
         })
@@ -529,7 +566,7 @@ impl<'a> IngressPiiScrubber<'a> {
     /// Checks `raw` in place. A hard secret zeroes the buffer and blocks; soft data is masked into a copy and the
     /// buffer zeroed; a clean line is moved out of the buffer unchanged. `raw` is left empty in every case.
     pub fn inspect_and_scrub(&self, raw: &mut String) -> IngressVerdict {
-        let spans = find_pii(raw, self.is_seed_word);
+        let spans = find_pii_with(raw, self.seed_check);
         if let Some(kind) = spans.iter().find_map(|s| match s.kind {
             PiiKind::Hard(k) => Some(k),
             _ => None,

@@ -81,6 +81,78 @@ impl BoxStyle {
             tail: false,
         }
     }
+
+    /// Stage 0 compact sync status pill.
+    pub fn pill(scale: f32, border: [f32; 4]) -> Self {
+        Self {
+            font_px: 12.5 * scale,
+            fill: [0.10, 0.09, 0.16, 0.88],
+            border,
+            text: [0.96, 0.96, 1.0, 1.0],
+            accent: border,
+            radius: 12.0 * scale,
+            border_px: 1.5 * scale,
+            padding: 5.0 * scale,
+            max_lines: 1,
+            tail: false,
+        }
+    }
+
+    /// Stage 1 unseen rejection alert chip.
+    pub fn rejection(scale: f32) -> Self {
+        Self {
+            font_px: 13.0 * scale,
+            fill: [0.24, 0.10, 0.12, 0.94],
+            border: [0.95, 0.42, 0.42, 1.0],
+            text: [1.0, 0.92, 0.92, 1.0],
+            accent: [1.0, 0.65, 0.45, 1.0],
+            radius: 10.0 * scale,
+            border_px: 2.0 * scale,
+            padding: 7.0 * scale,
+            max_lines: 2,
+            tail: false,
+        }
+    }
+
+    /// Stage 2 history / verdict drawer panel (non-blended local vs global rows + ▲/▼).
+    pub fn drawer(scale: f32) -> Self {
+        Self {
+            font_px: 12.5 * scale,
+            fill: [0.09, 0.08, 0.15, 0.94],
+            border: [0.52, 0.38, 0.85, 1.0],
+            text: [0.95, 0.94, 0.99, 1.0],
+            accent: [0.76, 0.66, 1.0, 1.0],
+            radius: 10.0 * scale,
+            border_px: 1.8 * scale,
+            padding: 7.0 * scale,
+            max_lines: 10,
+            tail: false,
+        }
+    }
+
+    /// 1–9 numbered navigation badge (gold lock border when `commit_guarded`).
+    pub fn badge(scale: f32, border: [f32; 4], commit_guarded: bool) -> Self {
+        Self {
+            font_px: 13.0 * scale,
+            fill: if commit_guarded {
+                [0.24, 0.18, 0.06, 0.94]
+            } else {
+                [0.12, 0.10, 0.20, 0.92]
+            },
+            border: if commit_guarded {
+                [0.98, 0.78, 0.24, 1.0]
+            } else {
+                border
+            },
+            text: [1.0, 1.0, 1.0, 1.0],
+            accent: border,
+            radius: 8.0 * scale,
+            border_px: 2.0 * scale,
+            padding: 4.5 * scale,
+            max_lines: 1,
+            tail: false,
+        }
+    }
 }
 
 /// Premultiplied float canvas.

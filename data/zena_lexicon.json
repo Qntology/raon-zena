@@ -223,6 +223,34 @@
     }
   },
 
+  "feedback": {
+    "recommend": {
+      "semantic": "The user explicitly recommends a strategy, route or tip that Zena suggested.",
+      "bias": "이거 추천, 이 공략 추천, 강추야, 완전 추천, 진짜 추천해, recommend this, great tip",
+      "prejudice": "비추, 추천해 줘, 다른 공략 추천해 줘, 별로야, 나쁘다",
+      "exact_match": ["추천", "강추"],
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "STAR_EYES", "lines": ["기억해 둘게! 잘 통해서 다행이야."] }
+    },
+    "not_recommend": {
+      "semantic": "The user advises against or dislikes a strategy, route or tip that Zena suggested.",
+      "bias": "비추야, 이거 비추, 별로야, 이 공략 별로, 비추천, 나쁘다, not recommended, bad tip",
+      "prejudice": "이거 추천, 강추야, 나쁘지 않았어, 별로지 않았어",
+      "exact_match": ["비추", "별로", "나쁘", "나쁜"],
+      "express": { "emotion": "WORRIED", "motion": "NOD", "lines": ["알겠어, 다음엔 다른 길로 알려 줄게."] }
+    }
+  },
+
+  "analytic": {
+    "report": {
+      "semantic": "A site operator asks for web funnel conversion, traffic or drop-off analytics (pd_analytic).",
+      "bias": "이번 주 전환율 어때, 지난주 대비 전환율 왜 떨어졌어, 결제 이탈 원인이 뭐야, 트래픽 분석해 줘, 사이트 운영 리포트 보여 줘, conversion rate report, funnel drop-off analysis",
+      "prejudice": "보스 패턴 어떻게 피해, 주식 차트 어때",
+      "exact_match": ["전환율", "이탈 원인", "트래픽 분석", "운영 리포트"],
+      "ask": "analytic",
+      "express": { "emotion": "FOCUSED", "motion": "THINK", "emote": "SPARKLE_IDEA", "lines": [] }
+    }
+  },
+
   "avatar": {
     "robot_mode": {
       "semantic": "The user asks Zena to transform into her parametric robot / toy body (Track A, SolidCraft).",

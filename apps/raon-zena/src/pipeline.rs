@@ -1,43 +1,123 @@
-//! Worker thread: capture → event sensor → tracker → NLP-NMS router (word dictionary) → reaction routing →
-//! dictionary expressions / (Lv3) generation → avatar commands for the UI thread. Every few seconds a downscaled
-//! frame also goes to the screen watcher, whose observations come back as dictionary expressions too.
+//! Worker thread: capture → privacy state machine → event sensor → tracker → ingress PII guard →
+//! NLP-NMS router (word dictionary) → feedback / credit / 600 ms two-track RAG / proactive 5-gate
+//! coaching / browser UIA watcher → Lv2 expressions or Lv3 generation → avatar commands for UI.
 //!
-//! Character chat on top of that:
-//! * **multi-turn memory** — the last few exchanges ([`Dialogue`]) and a session summary ([`SessionTracker`]: scene
-//!   time, win/loss streaks, affinity, tension) go into every Lv3 prompt's user turn;
-//! * **streamed tool calls** — [`StreamToAvatar`] turns Raon-1-nano's deltas into an expression first and the line
-//!   sentence by sentence ([`AvatarCmd::Expression`], [`AvatarCmd::Speak`]);
-//! * **proactive chatter** — after a silence Zena says a `proactive.*` dictionary line for the current scene, or
-//!   suggests a break after a long session ([`ProactiveTimer`]);
-//! * **avatar assets** — "로봇 모드로 변신해 줘" / "안경 써 봐" become [`AvatarCmd::Asset`].
-//!
-//! Utterances are handled on every tick, also while the screen is static and the capture has no new frame.
+//! All 6 scenario state machines are wired here:
+//! * **Scenario 1 (Course & badges)**: `StickyNumberer`, `SpokenSlotLock`, `NavTargetProjector`, `CourseBrief`.
+//! * **Scenario 2 (Proactive coaching)**: `LiveEpisodeWindow`, `FrictionBaselines::peek_live`,
+//!   `PrewarmGuard`, 5-gate `InterruptSignals`, `PendingCoachHook`, `CoachingFatigueController`,
+//!   `EphemeralOffer`, `route_proactive`, `ProactiveTimer::due_gated`.
+//! * **Scenario 3 (Two-track RAG & quarantine)**: `TopicTracker`, `RagCoordinator` (0 ms `PreThink`,
+//!   600 ms `LocalMirrorIndex` vs `pd_search_merged`, `SceneRagCache`, `ask_epoch × privacy_epoch`),
+//!   `QuarantineLedger`, `ExposureLedger::record_delivered_turn`.
+//! * **Scenario 4 (Feedback & lossless sync)**: `PdBridge` (`SyncLoop`, `LocalFilter`, `LocalVerdictStore`,
+//!   reversible `▲`/`▼` pins, `OutcomeVoteGate`, `extract_pragmatic_feedback`, `attribute_and_update_duels`).
+//! * **Scenario 5 (Web analytic & shopping coach)**: `AsyncBrowserUiaWorker`, `BrowserSessionTracker`,
+//!   `build_web_nav_overlay`, `WebCoachBrief` (`CommitGuard`), 11th MCP tool `pd_analytic` (`AnalyticBrief`).
+//! * **Scenario 6 (Privacy shield)**: `PrivacyStateMachine`, 500 ms `ZeroPixelProbe`, dormant
+//!   `GameOverlayUI.exe` filter, `PurgableSensor`, `IngressPiiScrubber` + checked BIP-39 seed guard,
+//!   and `BlindAssist` (`SessionContext.privacy_locked`).
 
+use crate::browser_uia::{
+    build_web_nav_overlay, embedder_similarity, is_browser_exe, AsyncBrowserUiaWorker,
+    BrowserSessionTracker, NavBadgeOverlay, ScanRequest, TabTransition,
+};
 use crate::capture::FrameSource;
 use crate::lexicon::LexiconMsg;
 use crate::llm::{JobHandler, LlmJob, LlmWorker};
+use crate::pd_bridge::{
+    default_quarantine_path, detect_seed_phrase_checked, filter_dormant_game_overlays,
+    topic_hash_id, DropOutcome, OverlaySyncView, PdBridge, RagOutcome,
+};
 use crate::watcher::{ScreenFrame, ScreenObservation};
 use nlp_nms_router::{Caught, Hit, NlpNmsRouter, RouterInput};
+use premium_discount_nav::behavior::{
+    BehaviorParams, Event as NavEvent, FrictionAlertStage, FrictionBaselines, LiveEpisodeWindow,
+    Signal as NavSignal,
+};
+use premium_discount_nav::order::StickyNumberer;
+use premium_discount_nav::privacy::{evaluate_privacy, PrivacyProbeInput, PrivacyShield};
+use premium_discount_nav::resume::{
+    payment_route, receipt_finish_page, PrivacyStateMachine, SurfaceSignature, ZeroPixelProbe,
+};
+use premium_discount_schema::envelope;
+use premium_discount_sensor::naflex::bgra_to_rgb;
+use premium_discount_sensor::{extract_rois, LogLumSensor, PurgableSensor, RoiTracker};
+use premium_discount_verdict::Tier;
+use premium_discount_window::{
+    assess_surfaces, foreground_window, visible_windows_intersecting, PxRect,
+};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zena_core::avatar::viseme_timeline;
+use zena_core::brief::WebCoachBrief;
+use zena_core::claims::PackedVerdictSlot;
+use zena_core::coach::{
+    route_proactive, CoachEvidence, CoachingFatigueController, EphemeralOffer, InterruptSignals,
+    PendingCoach, PendingCoachHook, ProactiveRoute,
+};
 use zena_core::cues::{cue, cue_for_reason, CuePlayer};
+use zena_core::exposure::{ExposureLedger, ExposureRole};
 use zena_core::geometry::{FlowDirection, ScreenGeometry};
+use zena_core::ingress_guard::{zeroize_string, IngressPiiScrubber, IngressVerdict};
+use zena_core::nav_target::SpokenSlotLock;
 use zena_core::prompt::{build_fast_path_prompt, Dialogue, Situation};
 use zena_core::reaction::{Observation, ReactionLevel, ReactionRouter};
+use zena_core::reference::{normalize_cc, ScreenAnchorSnapshot, TopicTracker};
 use zena_core::session::{Proactive, ProactiveTimer, SessionTracker};
 use zena_core::stream::{StreamEvent, ToolCallStream};
-use zena_core::tools::{GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAssetArgs, ZenaAvatarArgs};
+use zena_core::tools::{
+    BodyMotion, EmotionState, GazeTarget, SystemCommand, ToolCall, WindowLayerMode, ZenaAssetArgs,
+    ZenaAvatarArgs,
+};
 use zena_lexicon::{Action, Express, ExpressLevel, Lexicon, VisionKind};
-use premium_discount_sensor::naflex::bgra_to_rgb;
-use premium_discount_sensor::{extract_rois, LogLumSensor, RoiTracker};
+use zena_verdict::{
+    AttributionCandidate, CreditTargetKind, FeedbackContext, FeedbackToken, UserPin,
+};
+
+/// Actions sent from the overlay UI thread back to the pipeline worker.
+#[derive(Debug, Clone)]
+pub enum OverlayAction {
+    TypingChanged(bool),
+    DraggingChanged(bool),
+    AvatarHidden(bool),
+    /// User dropped a note onto a target window (`cc`).
+    DropNote {
+        cc: String,
+        to: Option<String>,
+        text: String,
+    },
+    /// User clicked ▲ or ▼ on a Stage 2 drawer row (local-only, reversible, 0 server packets).
+    TogglePin {
+        record_id: String,
+        pin: UserPin,
+    },
+    /// User viewed Stage 1 rejection chip or opened Stage 2 drawer.
+    AckRejections,
+    /// User opened/refreshed Stage 2 drawer.
+    RefreshDrawer,
+    /// User selected badge 1..=9 (respects `CommitGuard` for final payment buttons).
+    BadgePicked {
+        number: u8,
+        commit_guarded: bool,
+    },
+    /// User dismissed a proactive coaching bubble.
+    DismissCoaching,
+    /// Overlay began graceful shutdown (Farewell 0 ms).
+    ShutdownStarted,
+}
 
 /// What the UI thread is asked to do.
 #[derive(Debug, Clone)]
 pub enum AvatarCmd {
     /// Lv1: look toward an event, no speech.
     Gaze(GazeTarget),
+    /// 0 ms immediate pre-think pose while the 600 ms RAG race runs (CR-05).
+    PreThink { epoch: u64 },
     /// Lv2/Lv3: a whole reaction — expression with optional speech and its viseme timeline (replaces what Zena was
     /// saying).
     Act {
@@ -61,6 +141,14 @@ pub enum AvatarCmd {
     System(SystemCommand, Option<WindowLayerMode>),
     /// Switch the avatar track / put on or take off an accessory.
     Asset(ZenaAssetArgs),
+    /// Privacy lock transition (`PrivacyStateMachine` locked ↔ normal, PS-12).
+    PrivacyLock { locked: bool },
+    /// Immediately clears speech bubble & TTS (no 2.5 s linger).
+    ClearSpeech,
+    /// 1–9 numbered overlay badges for the active screen / browser tab.
+    NavBadges(NavBadgeOverlay),
+    /// Stage 0 status pill, Stage 1 rejections, Stage 2 history/verdict drawer rows.
+    SyncStatus(OverlaySyncView),
 }
 
 impl AvatarCmd {
@@ -89,6 +177,14 @@ pub struct PipelineConfig {
     pub history_turns: usize,
     /// Which natural-language router runs.
     pub nlp: NlpMode,
+    /// Optional path to `premium-discount-mcp` binary (`None`: offline mirror mode).
+    pub pd_mcp: Option<PathBuf>,
+    /// Explicit user opt-in for outcome-confirmed server votes (`vote_outcome`).
+    pub consent_share_outcomes: bool,
+    /// Whether to poll host OS foreground/visible windows & UIA browser tabs (disabled in headless unit tests).
+    pub enable_host_probes: bool,
+    /// Custom path for `quarantine_v1.json` (default `%LOCALAPPDATA%\RaonZena\sds\quarantine_v1.json`).
+    pub quarantine_path: Option<PathBuf>,
 }
 
 /// The natural-language router (`nlp_nms_router::router::Models`).
@@ -158,15 +254,22 @@ impl Default for PipelineConfig {
             proactive_silence_ms: 90_000,
             history_turns: 4,
             nlp: NlpMode::V1,
+            pd_mcp: None,
+            consent_share_outcomes: false,
+            enable_host_probes: false,
+            quarantine_path: None,
         }
     }
 }
 
-/// What Zena answered to a request, reported back by the LLM thread for the dialogue memory.
+/// What Zena answered to a request, reported back by the LLM thread for the dialogue memory and
+/// the 5-minute exposure ledger (CR-12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reply {
     pub user: Option<String>,
     pub zena: String,
+    pub epoch: u64,
+    pub slots: Vec<PackedVerdictSlot>,
 }
 
 /// The channels the pipeline talks through besides the frame source.
@@ -182,11 +285,26 @@ pub struct Links {
     pub screen: Option<Receiver<ScreenObservation>>,
     /// Zena's Lv3 answers (from [`StreamToAvatar`]).
     pub replies: Option<Receiver<Reply>>,
+    /// UI interaction events from the overlay (typing, dragging, drop notes, ▲/▼ pins, badge picks).
+    pub actions: Option<Receiver<OverlayAction>>,
+    /// Shared ask epoch (bumped on every new question and on privacy lock).
+    pub ask_epoch: Arc<AtomicU64>,
+    /// Shared privacy epoch (observed by screen watcher & RAG cache).
+    pub privacy_epoch: Arc<AtomicU64>,
+    /// Shared spoken badge slot lock (updated while speech streams).
+    pub spoken_lock: Arc<Mutex<SpokenSlotLock>>,
 }
 
 /// Rough speaking time for Korean TTS (≈ 7 syllables per second) until real TTS durations exist.
 pub fn speech_ms(text: &str) -> u32 {
     (text.chars().filter(|c| !c.is_whitespace()).count() as u32 * 140).max(400)
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Plays dictionary expressions: lines rotate per domain, the same domain is not repeated within `gap_ms`.
@@ -197,8 +315,19 @@ pub struct ExpressionPlayer {
 }
 
 impl ExpressionPlayer {
-    pub fn play(&mut self, key: &str, e: &Express, gaze: Option<GazeTarget>, now: u64, gap_ms: u64) -> Option<AvatarCmd> {
-        if self.last_ms.get(key).is_some_and(|&t| now.saturating_sub(t) < gap_ms) {
+    pub fn play(
+        &mut self,
+        key: &str,
+        e: &Express,
+        gaze: Option<GazeTarget>,
+        now: u64,
+        gap_ms: u64,
+    ) -> Option<AvatarCmd> {
+        if self
+            .last_ms
+            .get(key)
+            .is_some_and(|&t| now.saturating_sub(t) < gap_ms)
+        {
             return None;
         }
         self.last_ms.insert(key.to_string(), now);
@@ -265,7 +394,10 @@ fn topic_context(c: &Caught, lex: &Lexicon, screen: Option<&(String, f32)>) -> V
     if let Action::Ask { topic, .. } = &c.action {
         if topic == "screen" || topic == "market" {
             if let Some((key, score)) = screen {
-                let what = lex.vision_node(key).map(|v| v.semantic.clone()).unwrap_or_else(|| key.clone());
+                let what = lex
+                    .vision_node(key)
+                    .map(|v| v.semantic.clone())
+                    .unwrap_or_else(|| key.clone());
                 out.push(format!("지금 화면: {what} (확신도 {:.0}%)", score * 100.0));
             } else {
                 out.push("지금 화면은 아직 모른다.".into());
@@ -288,22 +420,59 @@ fn session_signal(session: &mut SessionTracker, key: &str, now: u64) {
     }
 }
 
-/// Sends avatar commands; anything Zena says counts as activity for the proactive timer.
+/// Sends avatar commands; anything Zena says counts as activity for the proactive timer and tracks
+/// when the speech channel is busy (G4).
 struct Out<'a> {
     tx: &'a Sender<AvatarCmd>,
+    speaking_until_ms: u64,
 }
 
 impl Out<'_> {
-    fn send(&self, cmd: AvatarCmd, now: u64, proactive: &mut ProactiveTimer) -> anyhow::Result<()> {
-        if cmd.speech().is_some() {
-            proactive.touch(now);
+    fn send(&mut self, cmd: AvatarCmd, now: u64, proactive: &mut ProactiveTimer) -> anyhow::Result<()> {
+        match &cmd {
+            AvatarCmd::Act { speech_ms, args, .. } if args.speech_text.is_some() => {
+                proactive.touch(now);
+                self.speaking_until_ms = self.speaking_until_ms.max(now + *speech_ms as u64 + 2_500);
+            }
+            AvatarCmd::Speak { speech_ms, .. } => {
+                proactive.touch(now);
+                self.speaking_until_ms = self.speaking_until_ms.max(now + *speech_ms as u64 + 2_500);
+            }
+            AvatarCmd::ClearSpeech => {
+                self.speaking_until_ms = 0;
+            }
+            _ => {}
         }
         self.tx.send(cmd)?;
         Ok(())
     }
+
+    fn channel_busy(&self, now: u64) -> bool {
+        now < self.speaking_until_ms
+    }
 }
 
-pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cfg: PipelineConfig) -> anyhow::Result<()> {
+fn plain_line_cmd(line: &str, emotion: EmotionState, motion: BodyMotion, level: ReactionLevel) -> AvatarCmd {
+    let ms = speech_ms(line);
+    AvatarCmd::Act {
+        args: ZenaAvatarArgs {
+            emotion_state: emotion,
+            body_motion: motion,
+            speech_text: Some(line.to_string()),
+            ..Default::default()
+        },
+        level,
+        visemes: viseme_timeline(line, ms),
+        speech_ms: ms,
+    }
+}
+
+pub fn run(
+    mut src: Box<dyn FrameSource>,
+    links: Links,
+    mut lexicon: Lexicon,
+    cfg: PipelineConfig,
+) -> anyhow::Result<()> {
     let Links {
         llm,
         utterances,
@@ -313,8 +482,16 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
         screen_frames,
         screen,
         replies,
+        actions,
+        ask_epoch,
+        privacy_epoch,
+        spoken_lock,
     } = links;
-    let out = Out { tx: &out };
+    let out_tx = out.clone();
+    let mut out = Out {
+        tx: &out_tx,
+        speaking_until_ms: 0,
+    };
     let (w, h) = src.size();
     let geo = ScreenGeometry::new(w as u32, h as u32);
     let mut sensor = LogLumSensor::new(w, h, cfg.sensor_threshold);
@@ -328,25 +505,72 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
     let mut session = SessionTracker::default();
     let mut dialogue = Dialogue::new(cfg.history_turns);
     let mut proactive = ProactiveTimer::new(cfg.proactive_silence_ms);
+
+    // Scenario 1–6 state machines
+    let mut pd_bridge = PdBridge::new(
+        cfg.pd_mcp.as_deref(),
+        router.models.embedder.clone(),
+        ask_epoch.clone(),
+        privacy_epoch.clone(),
+        cfg.consent_share_outcomes,
+        cfg.quarantine_path
+            .clone()
+            .unwrap_or_else(default_quarantine_path),
+    );
+    let mut privacy_sm = PrivacyStateMachine::new();
+    let mut live_episode = LiveEpisodeWindow::new("desktop.local", "screen:init", 0);
+    let mut friction_baselines = FrictionBaselines::default();
+    let behavior_params = BehaviorParams::default();
+    let mut coach_hook = PendingCoachHook::default();
+    let mut fatigue = CoachingFatigueController::default();
+    let mut topic_tracker = TopicTracker::default().with_hasher(topic_hash_id);
+    let mut exposure_ledger = ExposureLedger::default();
+    let mut sticky_numberer = StickyNumberer::default();
+    let mut permanent_web_tiers: HashMap<String, Tier> = HashMap::new();
+    let mut browser_tracker = BrowserSessionTracker::default();
+    let browser_worker = cfg
+        .enable_host_probes
+        .then(AsyncBrowserUiaWorker::spawn_platform);
+
     let mut scene_link: Option<String> = None;
-    let mut quiet_until = 0u64;
+    let mut active_cc = "desktop.local".to_string();
+    let mut active_screen_key = "screen:init".to_string();
+    let mut active_surface = SurfaceSignature::default();
+    let mut active_web_brief: Option<WebCoachBrief> = None;
+    let mut active_nav_overlay: Option<NavBadgeOverlay> = None;
     let mut last_screen: Option<(String, f32)> = None;
     let mut last_frame_sent: Option<u64> = None;
+    let mut last_probe_ms = 0u64;
+    let mut last_sync_push_ms = 0u64;
+    let mut last_uia_scan_ms = 0u64;
+    let mut last_defeat_ms: Option<u64> = None;
+    let mut last_victory_ms: Option<u64> = None;
+    let mut defeat_shielded_until_ms = 0u64;
+    let mut vision_privacy_hit = false;
+    let mut redact_zones: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut privacy_locked_since: Option<u64> = None;
+    let mut user_typing = false;
+    let mut user_dragging = false;
+    let mut avatar_hidden = false;
+    let mut shutting_down = false;
+
     let t0 = Instant::now();
     eprintln!(
-        "pipeline: {w}x{h} sensor, dictionary revision {} ({} domains), Lv3 backend = {}, screen watcher {}, proactive {}",
+        "pipeline: {w}x{h} sensor, dictionary revision {} ({} domains), Lv3 backend = {}, screen watcher {}, pd-mcp {}, proactive {}",
         lexicon.version,
         router.bank.len(),
         llm.name,
         if screen_frames.is_some() { "on" } else { "off" },
+        if pd_bridge.client.is_some() { "on" } else { "offline-mirror" },
         if cfg.proactive_silence_ms > 0 {
             format!("after {}s", cfg.proactive_silence_ms / 1000)
         } else {
             "off".into()
         }
     );
+
     loop {
-        // A static screen gives no frame; everything but the sensor still runs.
+        // Static screen gives no frame; everything else still ticks.
         let frame = src.next_frame()?;
         if let Some(f) = &frame {
             if (f.width, f.height) != (w, h) {
@@ -354,8 +578,136 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             }
         }
         let now = t0.elapsed().as_millis() as u64;
+        let now_i64 = now as i64;
+        let wall_ms = unix_now_ms();
+        let mut just_defeated = false;
+        let mut progress_advanced = false;
 
-        // SDS observations go to this run's file every 15 s (folded into the ledger at the next start).
+        // 1. Drain overlay UI actions (typing, dragging, drop notes, ▲/▼ pins, badge picks, shutdown).
+        if let Some(rx) = &actions {
+            for act in rx.try_iter() {
+                match act {
+                    OverlayAction::TypingChanged(t) => user_typing = t,
+                    OverlayAction::DraggingChanged(d) => user_dragging = d,
+                    OverlayAction::AvatarHidden(h) => avatar_hidden = h,
+                    OverlayAction::DropNote { cc, to, text } => {
+                        let target_cc = if cc.trim().is_empty() {
+                            active_cc.clone()
+                        } else {
+                            cc
+                        };
+                        match pd_bridge.enqueue_drop(&target_cc, to.as_deref(), &text, wall_ms) {
+                            DropOutcome::BlockedPii { reaction } => {
+                                out.send(
+                                    plain_line_cmd(
+                                        &reaction,
+                                        EmotionState::Worried,
+                                        BodyMotion::HideCrouch,
+                                        ReactionLevel::Lv2Cached,
+                                    ),
+                                    now,
+                                    &mut proactive,
+                                )?;
+                            }
+                            DropOutcome::BlockedProfanity => {
+                                out.send(
+                                    plain_line_cmd(
+                                        "욕설이 들어간 메모는 저장할 수 없어. 표현을 조금만 다듬어 줄래?",
+                                        EmotionState::Worried,
+                                        BodyMotion::Idle,
+                                        ReactionLevel::Lv2Cached,
+                                    ),
+                                    now,
+                                    &mut proactive,
+                                )?;
+                            }
+                            DropOutcome::Enqueued { .. } => {
+                                let _ = pd_bridge.curate_cc(&target_cc, wall_ms);
+                                let view = pd_bridge.poll_overlay_view(Some(&active_cc), wall_ms);
+                                out.send(AvatarCmd::SyncStatus(view), now, &mut proactive)?;
+                                out.send(
+                                    plain_line_cmd(
+                                        "메모를 저장해 뒀어! 다음에 여기서 바로 꺼내 쓸게.",
+                                        EmotionState::Joy,
+                                        BodyMotion::Nod,
+                                        ReactionLevel::Lv2Cached,
+                                    ),
+                                    now,
+                                    &mut proactive,
+                                )?;
+                            }
+                        }
+                    }
+                    OverlayAction::TogglePin { record_id, pin } => {
+                        let q = pd_bridge.rag.quarantine.lock().unwrap().clone();
+                        let _ = pd_bridge.verdicts.toggle_pin(&record_id, pin, wall_ms, &q);
+                        if pin == UserPin::Demoted {
+                            fatigue.on_ignored_or_dismissed(true);
+                        }
+                        let view = pd_bridge.poll_overlay_view(Some(&active_cc), wall_ms);
+                        out.send(AvatarCmd::SyncStatus(view), now, &mut proactive)?;
+                    }
+                    OverlayAction::AckRejections => {
+                        let _ = pd_bridge.ack_rejections();
+                        let view = pd_bridge.poll_overlay_view(Some(&active_cc), wall_ms);
+                        out.send(AvatarCmd::SyncStatus(view), now, &mut proactive)?;
+                    }
+                    OverlayAction::RefreshDrawer => {
+                        if let Some(sl) = &pd_bridge.sync_loop {
+                            sl.request(false);
+                        }
+                        let view = pd_bridge.poll_overlay_view(Some(&active_cc), wall_ms);
+                        out.send(AvatarCmd::SyncStatus(view), now, &mut proactive)?;
+                    }
+                    OverlayAction::BadgePicked {
+                        number,
+                        commit_guarded,
+                    } => {
+                        if commit_guarded {
+                            // CommitGuard (WA-10): never auto-click final payment button!
+                            out.send(
+                                plain_line_cmd(
+                                    &format!("{number}번은 최종 결제 버튼이야! 금액이랑 배송지 먼저 확인하고 직접 눌러 줘."),
+                                    EmotionState::Focused,
+                                    BodyMotion::LeanForwardPoint,
+                                    ReactionLevel::Lv2Cached,
+                                ),
+                                now,
+                                &mut proactive,
+                            )?;
+                        } else {
+                            progress_advanced = true;
+                            live_episode.push_filtered(
+                                NavEvent {
+                                    at_ms: now_i64,
+                                    signal: NavSignal::Picked,
+                                    anchor: Some(format!("#{number}")),
+                                },
+                                false,
+                            );
+                            if let Some(accepted) = fatigue.on_target_picked(&active_cc, number, now)
+                            {
+                                if let Some(exp) = accepted.exposure() {
+                                    exposure_ledger.insert(exp);
+                                }
+                            }
+                        }
+                    }
+                    OverlayAction::DismissCoaching => {
+                        fatigue.on_ignored_or_dismissed(true);
+                    }
+                    OverlayAction::ShutdownStarted => {
+                        shutting_down = true;
+                        pd_bridge.shutdown();
+                        if let Some(l) = &router.models.sds {
+                            let _ = l.lock().unwrap().flush();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. SDS periodic flush every 15 s & overlay sync status refresh every 2 s.
         if now.saturating_sub(sds_flushed) >= 15_000 {
             sds_flushed = now;
             if let Some(l) = &router.models.sds {
@@ -364,74 +716,356 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
                 }
             }
         }
+        if now.saturating_sub(last_sync_push_ms) >= 2_000 {
+            last_sync_push_ms = now;
+            let view = pd_bridge.poll_overlay_view(Some(&active_cc), wall_ms);
+            let _ = out.send(AvatarCmd::SyncStatus(view), now, &mut proactive);
+        }
 
-        // A new dictionary revision (edited with `zena-lexicon`, or learned).
+        // 3. Dictionary hot reload.
         for lex in reloads.try_iter() {
             router.reload(&lex);
-            eprintln!("[lexicon] router now on revision {} ({} domains)", lex.version, router.bank.len());
+            eprintln!(
+                "[lexicon] router now on revision {} ({} domains)",
+                lex.version,
+                router.bank.len()
+            );
             lexicon = lex;
         }
 
-        // What Zena answered (dialogue memory). Her automatic coaching calls are not conversation: only answers to
-        // the player are remembered, so warnings do not push the exchange out of the window.
+        // 4. Consume completed Lv3 replies -> Dialogue memory + 5-min ExposureLedger (CR-12).
         if let Some(rx) = &replies {
             for r in rx.try_iter().filter(|r| !r.zena.trim().is_empty()) {
                 proactive.touch(now);
+                if let Ok(mut sl) = spoken_lock.lock() {
+                    sl.end_line(now);
+                }
                 if r.user.is_some() {
                     dialogue.push(r.user.as_deref(), &r.zena);
+                }
+                if !r.slots.is_empty() {
+                    let mirror_ref = pd_bridge.rag.mirror.clone();
+                    let _ = exposure_ledger.record_delivered_turn(
+                        &r.slots,
+                        &r.zena,
+                        |a, b| mirror_ref.lock().map(|m| m.similarity(a, b)).unwrap_or(0.0),
+                        now,
+                    );
                 }
             }
         }
 
-        // Periodic screen sampling: one RGB copy every interval, dropped if the watcher is still busy.
-        if let (Some(tx), Some(f)) = (&screen_frames, &frame) {
-            if last_frame_sent.is_none_or(|t| now.saturating_sub(t) >= cfg.screen_interval_ms) {
-                last_frame_sent = Some(now);
-                let _ = tx.try_send(ScreenFrame {
-                    rgb: bgra_to_rgb(&f.bgra),
-                    w,
-                    h,
+        // 5. Async Browser UIA snapshot handling (Scenario 5 WA-09 / WA-10).
+        if let Some(worker) = &browser_worker {
+            if let Some(snap) = worker.try_recv_latest() {
+                match browser_tracker.observe(&snap) {
+                    TabTransition::IncognitoBlocked => {
+                        active_web_brief = None;
+                        active_nav_overlay = None;
+                        sticky_numberer.reset();
+                        let _ = out.send(
+                            AvatarCmd::NavBadges(NavBadgeOverlay::default()),
+                            now,
+                            &mut proactive,
+                        );
+                    }
+                    TabTransition::PendingUrlResolution { .. } => {}
+                    TabTransition::ActiveTab { cc, page_hash, .. } => {
+                        if active_cc != cc {
+                            active_cc = cc.clone();
+                            progress_advanced = true;
+                        }
+                        if let Some(ph) = &page_hash {
+                            if active_screen_key != *ph {
+                                if let Some(done) = live_episode.flush_completed(ph, now_i64) {
+                                    friction_baselines.decide(
+                                        &active_cc,
+                                        &active_screen_key,
+                                        None,
+                                        &done,
+                                        &behavior_params,
+                                    );
+                                }
+                                active_screen_key = ph.clone();
+                            }
+                        }
+                        let locked_mask = spoken_lock
+                            .lock()
+                            .map(|s| s.mask(now))
+                            .unwrap_or(0);
+                        let embedder = router.models.embedder.clone();
+                        if let Some((badge_ov, web_brief)) = build_web_nav_overlay(
+                            &snap,
+                            &[],
+                            &mut permanent_web_tiers,
+                            &mut sticky_numberer,
+                            locked_mask,
+                            None,
+                            |a, b| embedder_similarity(&embedder, a, b),
+                            now_i64,
+                        ) {
+                            if let Ok(mut m) = pd_bridge.rag.mirror.lock() {
+                                for b in &badge_ov.badges {
+                                    m.register_label(&b.anchor, &b.label);
+                                }
+                            }
+                            active_web_brief = Some(web_brief);
+                            active_nav_overlay = Some(badge_ov.clone());
+                            let _ = out.send(AvatarCmd::NavBadges(badge_ov), now, &mut proactive);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Scenario 6: 500 ms ZeroPixelProbe + PrivacyStateMachine (replaces fixed 60 s timer).
+        let should_probe = now.saturating_sub(last_probe_ms) >= 500 || vision_privacy_hit;
+        if should_probe {
+            last_probe_ms = now;
+            let mut probe_trigger = None;
+            let mut in_pay_flow = false;
+            let mut receipt_hash = None;
+            let mut new_redact_zones: Vec<(f32, f32, f32, f32)> = Vec::new();
+
+            if cfg.enable_host_probes {
+                let monitor = PxRect {
+                    left: 0,
+                    top: 0,
+                    right: (w * 4) as i32,
+                    bottom: (h * 4) as i32,
+                };
+                if let Some(fg) = foreground_window() {
+                    let fg_cc = envelope::normalize_cc(&fg.app_uri())
+                        .map(|c| c.cc)
+                        .unwrap_or_else(|_| normalize_cc(&fg.exe));
+                    let route_or_title = format!("{}|{}", fg.exe, fg.title);
+                    active_surface = SurfaceSignature::new(fg.pid as isize, &route_or_title);
+                    if is_browser_exe(&fg.exe) {
+                        if let Some(worker) = &browser_worker {
+                            if now.saturating_sub(last_uia_scan_ms) >= 1_000 {
+                                last_uia_scan_ms = now;
+                                // Pass visible hwnd when available
+                                let fg_hwnd = visible_windows_intersecting(monitor)
+                                    .into_iter()
+                                    .find(|e| e.info.pid == fg.pid)
+                                    .map(|e| e.hwnd)
+                                    .unwrap_or(fg.pid as isize);
+                                worker.request_scan(ScanRequest {
+                                    hwnd: fg_hwnd,
+                                    exe: fg.exe.clone(),
+                                    title: fg.title.clone(),
+                                    now_ms: now_i64,
+                                });
+                            }
+                        }
+                    } else if !fg_cc.is_empty() && active_cc != fg_cc {
+                        active_cc = fg_cc;
+                        active_web_brief = None;
+                        progress_advanced = true;
+                    }
+                    in_pay_flow = payment_route(&fg.title);
+                    receipt_hash = receipt_finish_page(&fg.title, None);
+                }
+
+                let raw_windows = visible_windows_intersecting(monitor);
+                let filtered_windows = filter_dormant_game_overlays(raw_windows);
+                let surface_verdict = assess_surfaces(&filtered_windows, monitor);
+                let notif_rects: Vec<premium_discount_nav::Rect> = surface_verdict
+                    .notification_zones
+                    .iter()
+                    .filter_map(|r| {
+                        let mw = (monitor.width().max(1)) as f32;
+                        let mh = (monitor.height().max(1)) as f32;
+                        premium_discount_nav::Rect::new(
+                            (r.left - monitor.left) as f32 / mw,
+                            (r.top - monitor.top) as f32 / mh,
+                            r.width() as f32 / mw,
+                            r.height() as f32 / mh,
+                        )
+                    })
+                    .collect();
+                let seed_in_title = foreground_window()
+                    .is_some_and(|w| detect_seed_phrase_checked(&w.title).is_some());
+                let shield = evaluate_privacy(&PrivacyProbeInput {
+                    regions: &[],
+                    os_capture_protected: surface_verdict.capture_protected,
+                    os_overlay_payment_detected: surface_verdict.payment_overlay,
+                    os_notification_zones: &notif_rects,
+                    vision_privacy_hit,
+                    seed_phrase_detected: seed_in_title,
+                    auth_or_payment_context: in_pay_flow,
                 });
+                match shield {
+                    PrivacyShield::FullLockdown(trig) => probe_trigger = Some(trig),
+                    PrivacyShield::PartialRedaction { zones } => {
+                        new_redact_zones = zones.into_iter().map(|z| (z.x, z.y, z.w, z.h)).collect();
+                    }
+                    PrivacyShield::Clear => {}
+                }
+            } else if vision_privacy_hit {
+                let shield = evaluate_privacy(&PrivacyProbeInput {
+                    vision_privacy_hit: true,
+                    ..Default::default()
+                });
+                probe_trigger = shield.trigger();
+            }
+
+            redact_zones = new_redact_zones;
+            let probe = ZeroPixelProbe {
+                now_ms: now_i64,
+                active_cc: active_cc.clone(),
+                surface: active_surface,
+                unoccluded_trigger: probe_trigger,
+                in_payment_flow: in_pay_flow,
+                receipt_finish_page_hash: receipt_hash,
+            };
+            let outcome = privacy_sm.step(&probe);
+            vision_privacy_hit = false;
+
+            if outcome.privacy_epoch_started {
+                let _ = pd_bridge.rag.bump_privacy_epoch();
+                sensor.purge_privacy_residue();
+                tracker.purge_privacy_residue();
+                live_episode.begin_privacy_lock(now_i64);
+                sticky_numberer.reset();
+                if let Ok(mut sl) = spoken_lock.lock() {
+                    sl.clear();
+                }
+                privacy_locked_since = Some(now);
+                out.send(AvatarCmd::ClearSpeech, now, &mut proactive)?;
+                out.send(AvatarCmd::PrivacyLock { locked: true }, now, &mut proactive)?;
+            }
+            if outcome.trigger_sensor_reprime {
+                sensor.purge_privacy_residue();
+                tracker.purge_privacy_residue();
+                live_episode.end_privacy_lock(now_i64);
+                if let Some(since) = privacy_locked_since.take() {
+                    session.add_paused_ms(now.saturating_sub(since));
+                }
+                out.send(AvatarCmd::PrivacyLock { locked: false }, now, &mut proactive)?;
+            }
+        }
+
+        let privacy_locked = !privacy_sm.capture_allowed();
+
+        // 7. Periodic screen sampling (strictly gated by PrivacyStateMachine::capture_allowed).
+        if !privacy_locked {
+            if let (Some(tx), Some(f)) = (&screen_frames, &frame) {
+                if last_frame_sent.is_none_or(|t| now.saturating_sub(t) >= cfg.screen_interval_ms) {
+                    last_frame_sent = Some(now);
+                    let _ = tx.try_send(ScreenFrame {
+                        rgb: bgra_to_rgb(&f.bgra),
+                        w,
+                        h,
+                        captured_epoch: privacy_epoch.load(Ordering::Acquire),
+                        redact_zones: redact_zones.clone(),
+                    });
+                }
             }
         }
         if let Some(rx) = &screen {
             for o in rx.try_iter() {
-                last_screen = (o.kind != VisionKind::Privacy).then(|| (o.key.clone(), o.score));
-                match o.kind {
-                    VisionKind::Scene => {
-                        let what = lexicon
-                            .vision_node(&o.key)
-                            .map(|v| v.semantic.clone())
-                            .unwrap_or_else(|| o.key.clone());
-                        session.scene(&o.key, &what, now);
-                        scene_link = Some(o.link.clone());
+                if o.kind == VisionKind::Privacy {
+                    vision_privacy_hit = true;
+                    // Immediately step the PrivacyStateMachine on VisionKind::Privacy!
+                    let probe = ZeroPixelProbe {
+                        now_ms: now_i64,
+                        active_cc: active_cc.clone(),
+                        surface: active_surface,
+                        unoccluded_trigger: Some(
+                            premium_discount_nav::privacy::PrivacyTrigger::VisionPrivacyDomain,
+                        ),
+                        in_payment_flow: false,
+                        receipt_finish_page_hash: None,
+                    };
+                    let outcome = privacy_sm.step(&probe);
+                    if outcome.privacy_epoch_started {
+                        let _ = pd_bridge.rag.bump_privacy_epoch();
+                        sensor.purge_privacy_residue();
+                        tracker.purge_privacy_residue();
+                        live_episode.begin_privacy_lock(now_i64);
+                        sticky_numberer.reset();
+                        privacy_locked_since = Some(now);
+                        out.send(AvatarCmd::ClearSpeech, now, &mut proactive)?;
+                        out.send(AvatarCmd::PrivacyLock { locked: true }, now, &mut proactive)?;
                     }
-                    VisionKind::Privacy => quiet_until = now + o.cooldown_s as u64 * 1000,
-                    VisionKind::Event => {}
+                    continue;
+                }
+                if !privacy_sm.capture_allowed() {
+                    continue;
+                }
+                last_screen = Some((o.key.clone(), o.score));
+                if o.kind == VisionKind::Scene {
+                    let what = lexicon
+                        .vision_node(&o.key)
+                        .map(|v| v.semantic.clone())
+                        .unwrap_or_else(|| o.key.clone());
+                    session.scene(&o.key, &what, now);
+                    scene_link = Some(o.link.clone());
+                    if active_screen_key != o.key {
+                        if let Some(done) = live_episode.flush_completed(&o.key, now_i64) {
+                            friction_baselines.decide(
+                                &active_cc,
+                                &active_screen_key,
+                                None,
+                                &done,
+                                &behavior_params,
+                            );
+                        }
+                        active_screen_key = o.key.clone();
+                        progress_advanced = true;
+                    }
                 }
                 if !gate.admit(&o, now) {
                     continue;
                 }
                 if o.kind == VisionKind::Event {
                     match o.key.as_str() {
-                        "vision.game_defeat" => session.defeat(now),
-                        "vision.game_victory" => session.victory(now),
+                        "vision.game_defeat" => {
+                            session.defeat(now);
+                            last_defeat_ms = Some(now);
+                            just_defeated = true;
+                            let shielded = now <= defeat_shielded_until_ms;
+                            let cands = active_credit_candidates(&mut exposure_ledger, &active_cc, now);
+                            let outbound = pd_bridge.verdicts.apply_outcome_credit(
+                                &cands,
+                                -1,
+                                wall_ms,
+                                shielded,
+                                &mut pd_bridge.vote_gate,
+                            );
+                            for (id, sign) in outbound {
+                                pd_bridge.send_outcome_vote(&id, sign);
+                            }
+                        }
+                        "vision.game_victory" => {
+                            session.victory(now);
+                            last_victory_ms = Some(now);
+                            let cands = active_credit_candidates(&mut exposure_ledger, &active_cc, now);
+                            let outbound = pd_bridge.verdicts.apply_outcome_credit(
+                                &cands,
+                                1,
+                                wall_ms,
+                                false,
+                                &mut pd_bridge.vote_gate,
+                            );
+                            for (id, sign) in outbound {
+                                pd_bridge.send_outcome_vote(&id, sign);
+                            }
+                        }
                         _ => {}
                     }
                 }
                 let Some(e) = lexicon.vision_express(&o.key).cloned() else {
                     continue;
                 };
-                let gaze = match (o.kind, o.peak) {
-                    (VisionKind::Privacy, _) | (_, None) => None,
-                    (_, Some((x, y))) => {
-                        let p = geo.to_polar(x * w as f32, y * h as f32);
-                        Some(GazeTarget {
-                            angle_deg: p.theta_deg,
-                            distance_norm: p.r,
-                        })
+                let gaze = o.peak.map(|(x, y)| {
+                    let p = geo.to_polar(x * w as f32, y * h as f32);
+                    GazeTarget {
+                        angle_deg: p.theta_deg,
+                        distance_norm: p.r,
                     }
-                };
+                });
                 eprintln!(
                     "[screen] {} (cos {:.3}, p {:.2}, {} of {} tokens, {:.0} ms) → {}",
                     o.key, o.cos, o.score, o.tokens, o.cells, o.encode_ms, o.link
@@ -442,21 +1076,66 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             }
         }
 
-        let tracks = match &frame {
-            Some(f) => {
-                let stats = sensor.process_bgra(&f.bgra);
-                let rois = extract_rois(&stats, &geo, cfg.min_tile_events);
-                tracker.update(rois, now).to_vec()
+        // 8. Event sensor + ROI tracker (only when capture is allowed).
+        let privacy_locked = !privacy_sm.capture_allowed();
+        let tracks = if privacy_locked {
+            Vec::new()
+        } else {
+            match &frame {
+                Some(f) => {
+                    let stats = sensor.process_bgra(&f.bgra);
+                    let rois = extract_rois(&stats, &geo, cfg.min_tile_events);
+                    tracker.update(rois, now).to_vec()
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
         };
         let max_energy = tracks.iter().map(|t| t.roi.energy).fold(1.0f32, f32::max);
 
-        let mut inputs: Vec<RouterInput> = utterances
-            .try_iter()
-            .map(|text| RouterInput::Utterance { text, t_ms: now })
-            .collect();
-        if !inputs.is_empty() {
+        // 9. Front-gate every user utterance through IngressPiiScrubber (PS-12) BEFORE router/dialogue/LLM!
+        let scrubber = IngressPiiScrubber::with_seed_detector(&detect_seed_phrase_checked);
+        let mut inputs: Vec<RouterInput> = Vec::new();
+        let mut allow_lexicon_learn = true;
+        for mut raw_text in utterances.try_iter() {
+            match scrubber.inspect(&raw_text) {
+                IngressVerdict::HardBlock { .. } => {
+                    zeroize_string(&mut raw_text);
+                    out.send(
+                        plain_line_cmd(
+                            IngressPiiScrubber::block_reaction(),
+                            EmotionState::Worried,
+                            BodyMotion::HideCrouch,
+                            ReactionLevel::Lv2Cached,
+                        ),
+                        now,
+                        &mut proactive,
+                    )?;
+                }
+                IngressVerdict::Scrubbed { clean, .. } => {
+                    zeroize_string(&mut raw_text);
+                    allow_lexicon_learn = false;
+                    // Promote recent ephemeral proactive offer into Dialogue if user responded within 45 s (PF-11).
+                    if let Some(promoted) = fatigue.on_user_utterance(&active_cc, now) {
+                        dialogue.push_turn(promoted);
+                    }
+                    inputs.push(RouterInput::Utterance {
+                        text: clean,
+                        t_ms: now,
+                    });
+                }
+                IngressVerdict::Clean(clean) => {
+                    if let Some(promoted) = fatigue.on_user_utterance(&active_cc, now) {
+                        dialogue.push_turn(promoted);
+                    }
+                    inputs.push(RouterInput::Utterance {
+                        text: clean,
+                        t_ms: now,
+                    });
+                }
+            }
+        }
+        let user_spoke = !inputs.is_empty();
+        if user_spoke {
             proactive.touch(now);
             session.affinity(0.01);
         }
@@ -480,24 +1159,72 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             router.route(inputs, now)
         };
 
-        // Learning: spans the dictionary caught by vectors alone.
-        if let (Some(tx), Some(min)) = (&learn, cfg.learn_min) {
-            for c in routed
-                .expressions
-                .iter()
-                .chain(&routed.queries)
-                .filter(|c| c.hit == Hit::Vector && c.score >= min)
-            {
-                let _ = tx.send(LexiconMsg::Learn {
-                    key: c.key.clone(),
-                    span: c.span.clone(),
-                });
+        // 10. Scenario 4: consume `routed.feedback` via pragmatic feedback extractor!
+        if !routed.feedback.is_empty() {
+            let fb_ctx = FeedbackContext {
+                recent_defeat_within_15s: last_defeat_ms
+                    .is_some_and(|t| now.saturating_sub(t) <= 15_000),
+                recent_victory_within_15s: last_victory_ms
+                    .is_some_and(|t| now.saturating_sub(t) <= 15_000),
+                high_friction_burst: session.tension(now) >= 0.6,
+            };
+            let active_exposed = exposure_ledger.active_in_window(&active_cc, now);
+            for fb in &routed.feedback {
+                let toks: Vec<FeedbackToken<'_>> = fb
+                    .words
+                    .iter()
+                    .map(|w| FeedbackToken {
+                        surface: &w.surface,
+                        lemma: &w.lemma,
+                        is_auxiliary_request: w.is_auxiliary_request,
+                        is_negation: w.is_negation,
+                        negated_in_clause: w.negated_in_clause,
+                        is_subject_or_topic: w.is_subject_or_topic,
+                    })
+                    .collect();
+                let target_id = active_exposed
+                    .last()
+                    .map(|e| e.record_id.clone())
+                    .unwrap_or_else(|| active_cc.clone());
+                let extracted = pd_bridge.verdicts.apply_spoken_feedback(
+                    &target_id,
+                    &fb.utterance,
+                    &toks,
+                    &fb_ctx,
+                    1.0,
+                    wall_ms,
+                );
+                if extracted.shield_defeat_outcome {
+                    defeat_shielded_until_ms = now + 15_000;
+                }
+            }
+        }
+
+        // Learning: spans caught by vectors alone (never on scrubbed PII utterances).
+        if allow_lexicon_learn {
+            if let (Some(tx), Some(min)) = (&learn, cfg.learn_min) {
+                for c in routed
+                    .expressions
+                    .iter()
+                    .chain(&routed.queries)
+                    .filter(|c| c.hit == Hit::Vector && c.score >= min)
+                {
+                    let _ = tx.send(LexiconMsg::Learn {
+                        key: c.key.clone(),
+                        span: c.span.clone(),
+                    });
+                }
             }
         }
         for c in &routed.expressions {
             session_signal(&mut session, &c.key, now);
+            if c.key == "emotion.frustrated" {
+                last_defeat_ms = Some(now);
+                just_defeated = true;
+            }
         }
-        // Dictionary expressions first, then the commands (quitting plays the overlay's own farewell sequence).
+
+        // Dictionary expressions first, then system & asset commands.
         if let Some(c) = routed.expressions.iter().find(|c| {
             !matches!(
                 c.action,
@@ -523,13 +1250,12 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             out.send(AvatarCmd::Asset(a.clone()), now, &mut proactive)?;
         }
 
-        // Pick the strongest surviving signal for this tick.
+        // 11. Pick strongest surviving signal for this tick + 600 ms two-track RAG race on Ask!
         let mut obs = Observation::default();
         let mut label = None;
         let query = routed.queries.first().cloned();
         if let Some(q) = &query {
             obs.user_query = Some(q.utterance.clone());
-            // Acknowledge at once (e.g. a thinking pose) while Raon-1-nano answers.
             if let Some(e) = q.action.express() {
                 if let Some(cmd) = expressions.play(&q.key, e, None, now, cfg.expression_gap_ms) {
                     out.send(cmd, now, &mut proactive)?;
@@ -538,8 +1264,10 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
         }
         if let Some((l, p, s)) = routed.events.iter().max_by(|a, b| a.2.total_cmp(&b.2)) {
             let tr = tracks.iter().min_by(|a, b| {
-                let da = (a.roi.polar.r - p.r).abs() + (a.roi.polar.theta_deg - p.theta_deg).abs() / 360.0;
-                let db = (b.roi.polar.r - p.r).abs() + (b.roi.polar.theta_deg - p.theta_deg).abs() / 360.0;
+                let da = (a.roi.polar.r - p.r).abs()
+                    + (a.roi.polar.theta_deg - p.theta_deg).abs() / 360.0;
+                let db = (b.roi.polar.r - p.r).abs()
+                    + (b.roi.polar.theta_deg - p.theta_deg).abs() / 360.0;
                 da.total_cmp(&db)
             });
             obs.polar = Some(*p);
@@ -548,58 +1276,157 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             obs.radial_velocity = tr.map(|t| t.radial_velocity).unwrap_or(0.0);
             label = Some(l.clone());
         }
+
+        let mut high_tension_combat = session.tension(now) >= zena_core::coach::COMBAT_TENSION;
         if obs.user_query.is_some() || obs.polar.is_some() {
             let d = reactions.route(&obs, now);
+            high_tension_combat =
+                InterruptSignals::combat_from(d.level, d.reason, session.tension(now));
             if obs.user_query.is_none() && d.level >= ReactionLevel::Lv2Cached {
                 session.combat(obs.energy, now);
             }
             match d.level {
                 ReactionLevel::Lv1Silent => {
-                    if let Some(p) = obs.polar {
+                    if !privacy_locked {
+                        if let Some(p) = obs.polar {
+                            out.send(
+                                AvatarCmd::Gaze(GazeTarget {
+                                    angle_deg: p.theta_deg,
+                                    distance_norm: p.r,
+                                }),
+                                now,
+                                &mut proactive,
+                            )?;
+                        }
+                    }
+                }
+                ReactionLevel::Lv2Cached => {
+                    if !privacy_locked {
                         out.send(
-                            AvatarCmd::Gaze(GazeTarget {
-                                angle_deg: p.theta_deg,
-                                distance_norm: p.r,
-                            }),
+                            cached_cue(&mut cues, d.reason, obs.polar, d.level),
                             now,
                             &mut proactive,
                         )?;
                     }
                 }
-                ReactionLevel::Lv2Cached => {
-                    out.send(cached_cue(&mut cues, d.reason, obs.polar, d.level), now, &mut proactive)?;
-                }
                 ReactionLevel::Lv3Coaching => {
                     let mut context = Vec::new();
-                    if let Some(q) = &query {
+                    let mut sess_ctx = session.snapshot(now);
+                    let mut job_epoch = 0u64;
+
+                    if privacy_locked {
+                        // BlindAssist (PS-12): answer text query only, zero screen pixels/verdicts.
+                        sess_ctx.privacy_locked = true;
+                        sess_ctx.scene = None;
+                        job_epoch = pd_bridge.rag.next_ask_epoch();
+                    } else if let Some(q) = &query {
                         context = topic_context(q, &lexicon, last_screen.as_ref());
+                        let is_analytic = matches!(
+                            &q.action,
+                            Action::Ask { topic, .. } if topic == "analytic"
+                        );
+                        if is_analytic {
+                            if let Some(brief) = pd_bridge.query_analytic(&active_cc, &q.utterance) {
+                                sess_ctx.analytic = Some(brief);
+                            }
+                            job_epoch = pd_bridge.rag.next_ask_epoch();
+                        } else {
+                            // Scenario 3: TopicTracker -> 0 ms PreThink + 600 ms two-track RAG race!
+                            let screen_snap = ScreenAnchorSnapshot {
+                                cc: active_cc.clone(),
+                                screen_key: Some(active_screen_key.clone()),
+                                screen_label: last_screen
+                                    .as_ref()
+                                    .and_then(|(k, _)| lexicon.vision_node(k))
+                                    .map(|v| v.semantic.clone()),
+                                checkpoint_to: None,
+                                focused: None,
+                                changed_at_ms: None,
+                            };
+                            let extracted: Vec<String> = (!q.span.trim().is_empty())
+                                .then(|| q.span.clone())
+                                .into_iter()
+                                .collect();
+                            let plan = topic_tracker.resolve_and_plan(
+                                &q.utterance,
+                                &extracted,
+                                &screen_snap,
+                                now,
+                            );
+                            if let Some(guard_line) = plan.context_guard() {
+                                context.push(guard_line);
+                            }
+                            let q_snap = pd_bridge.rag.quarantine.lock().unwrap().clone();
+                            let local_grades: HashMap<String, zena_core::claims::Grade> = pd_bridge
+                                .verdicts
+                                .records
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map(|id| {
+                                    let g = pd_bridge.verdicts.local_grade(&id, wall_ms, &q_snap);
+                                    (id, g)
+                                })
+                                .collect();
+                            match pd_bridge.rag.retrieve(
+                                &plan,
+                                pd_bridge.sync_loop.as_ref(),
+                                Some(&out_tx),
+                                Arc::new(move |id| {
+                                    local_grades
+                                        .get(id)
+                                        .copied()
+                                        .unwrap_or(zena_core::claims::Grade::Unrated)
+                                }),
+                                now,
+                            ) {
+                                RagOutcome::Ready {
+                                    epoch,
+                                    slots,
+                                    ..
+                                } => {
+                                    job_epoch = epoch;
+                                    sess_ctx.verdict_slots = slots;
+                                }
+                                RagOutcome::Cancelled { .. } => {
+                                    continue;
+                                }
+                            }
+                        }
+                        if sess_ctx.web_coach.is_none() {
+                            sess_ctx.web_coach = active_web_brief.clone();
+                        }
                     }
+
                     let sit = Situation {
-                        event_label: label,
-                        polar: obs.polar,
-                        flow: obs.flow,
+                        event_label: if privacy_locked { None } else { label },
+                        polar: if privacy_locked { None } else { obs.polar },
+                        flow: if privacy_locked { None } else { obs.flow },
                         hp_ratio: obs.hp_ratio,
                         user_query: obs.user_query.clone(),
                         context,
                         history: dialogue.turns(),
-                        session: Some(session.snapshot(now)),
+                        session: Some(sess_ctx),
                     };
                     let prompt = build_fast_path_prompt(&sit);
                     eprintln!(
-                        "[lv3] {}{} ({} remembered turns)",
+                        "[lv3] {}{} ({} remembered turns, epoch {job_epoch})",
                         d.reason,
                         query
                             .as_ref()
-                            .map(|q| format!(" → {} ({:?} {:.2} on '{}'): {}", q.key, q.hit, q.score, q.span, q.utterance))
+                            .map(|q| format!(
+                                " → {} ({:?} {:.2} on '{}'): {}",
+                                q.key, q.hit, q.score, q.span, q.utterance
+                            ))
                             .unwrap_or_default(),
                         sit.history.len()
                     );
-                    // Generation runs on the LLM thread (loading the model first if it is not resident); if it is
-                    // busy, fall back to an immediate cached cue so Zena still reacts.
                     if !llm.try_submit(LlmJob {
                         prompt,
                         situation: sit,
                         level: d.level,
+                        epoch: job_epoch,
                     }) {
                         out.send(
                             cached_cue(&mut cues, d.reason, obs.polar, ReactionLevel::Lv2Cached),
@@ -611,23 +1438,220 @@ pub fn run(mut src: Box<dyn FrameSource>, links: Links, mut lexicon: Lexicon, cf
             }
         }
 
-        // Nothing has happened for a while: Zena speaks up on her own.
-        if let Some(kind) = proactive.due(now, session.scene_ms(now), now < quiet_until) {
-            if let Some((key, e)) = lexicon.proactive(scene_link.as_deref(), kind == Proactive::Break) {
-                let (key, e) = (key.to_string(), e.clone());
-                if let Some(cmd) = expressions.play(&key, &e, None, now, 0) {
-                    if let Some(line) = cmd.speech() {
-                        eprintln!("[proactive] {key}");
-                        dialogue.push(None, line);
+        // 12. Scenario 2: Live friction peek + 5-gate InterruptSignals + PendingCoachHook + ProactiveTimer::due_gated.
+        let _ = fatigue.expire(now);
+        let sig = InterruptSignals {
+            now_ms: now,
+            privacy_or_hidden: privacy_locked || avatar_hidden || shutting_down,
+            user_composing: user_typing || user_dragging,
+            high_tension_combat,
+            speech_channel_busy: out.channel_busy(now),
+            just_defeated,
+        };
+
+        if !privacy_locked && fatigue.allows_proactive() {
+            let live_reading = live_episode.peek(&friction_baselines, now_i64, 0, &behavior_params);
+            match live_reading.stage {
+                FrictionAlertStage::PreWarm => {
+                    pd_bridge.maybe_prewarm(now, privacy_locked, out.channel_busy(now));
+                }
+                FrictionAlertStage::CoachReady => {
+                    let reason_tag = match live_reading.dominant_signal {
+                        Some(NavSignal::RageClick) => "rage_click",
+                        Some(NavSignal::Retried) => "retried",
+                        Some(NavSignal::Searched { .. }) => "pre_action_stall",
+                        _ => "ghost_overrun",
+                    };
+                    let mut cand = PendingCoach::new(
+                        &active_cc,
+                        &active_screen_key,
+                        live_reading.bottleneck_anchor.as_deref(),
+                        reason_tag,
+                        now,
+                        ask_epoch.load(Ordering::Acquire),
+                    );
+                    cand.friction_z = live_reading.screen.z;
+                    if let Some((ready, mode)) = coach_hook.submit(cand, &sig) {
+                        deliver_proactive_coach(
+                            &ready,
+                            mode,
+                            &active_nav_overlay,
+                            &active_web_brief,
+                            &mut fatigue,
+                            &llm,
+                            &mut session,
+                            &dialogue,
+                            &ask_epoch,
+                            &mut out,
+                            &mut proactive,
+                            now,
+                        )?;
                     }
-                    out.send(cmd, now, &mut proactive)?;
+                }
+                FrictionAlertStage::Calm => {}
+            }
+            if let Some((released, mode)) = coach_hook.poll(
+                &active_cc,
+                &active_screen_key,
+                progress_advanced,
+                ask_epoch.load(Ordering::Acquire),
+                &sig,
+            ) {
+                deliver_proactive_coach(
+                    &released,
+                    mode,
+                    &active_nav_overlay,
+                    &active_web_brief,
+                    &mut fatigue,
+                    &llm,
+                    &mut session,
+                    &dialogue,
+                    &ask_epoch,
+                    &mut out,
+                    &mut proactive,
+                    now,
+                )?;
+            }
+        }
+
+        // Unprompted chatter / stretch break: gated by all 5 InterruptSignals via `due_gated`!
+        if fatigue.allows_proactive() {
+            if let Some(kind) = proactive.due_gated(now, session.scene_ms(now), &sig) {
+                if let Some((key, e)) =
+                    lexicon.proactive(scene_link.as_deref(), kind == Proactive::Break)
+                {
+                    let (key, e) = (key.to_string(), e.clone());
+                    if let Some(cmd) = expressions.play(&key, &e, None, now, 0) {
+                        if let Some(line) = cmd.speech() {
+                            eprintln!("[proactive] {key}");
+                            fatigue.offer(EphemeralOffer::new(&active_cc, None, None, line, now));
+                        }
+                        out.send(cmd, now, &mut proactive)?;
+                    }
                 }
             }
         }
     }
 }
 
-fn cached_cue(cues: &mut CuePlayer, reason: &str, polar: Option<zena_core::Polar>, level: ReactionLevel) -> AvatarCmd {
+#[allow(clippy::too_many_arguments)]
+fn deliver_proactive_coach(
+    coach: &PendingCoach,
+    mode: zena_core::coach::CoachDeliveryMode,
+    nav_overlay: &Option<NavBadgeOverlay>,
+    web_brief: &Option<WebCoachBrief>,
+    fatigue: &mut CoachingFatigueController,
+    llm: &LlmWorker,
+    session: &mut SessionTracker,
+    dialogue: &Dialogue,
+    ask_epoch: &Arc<AtomicU64>,
+    out: &mut Out<'_>,
+    proactive: &mut ProactiveTimer,
+    now: u64,
+) -> anyhow::Result<()> {
+    let primary_badge = nav_overlay
+        .as_ref()
+        .and_then(|ov| ov.badges.iter().find(|b| !b.unavailable && !b.commit_guarded));
+    let evidence = CoachEvidence {
+        bottleneck_label: coach.bottleneck_anchor.clone(),
+        verified_alternative: web_brief
+            .as_ref()
+            .and_then(|w| w.primary.as_ref().filter(|p| p.verified))
+            .map(|p| format!("#{} '{}'", p.number, p.label)),
+        confirmed_trap: web_brief.as_ref().and_then(|w| w.friction_trap.clone()),
+        point_at: primary_badge.map(|b| b.number),
+    };
+    let cur_epoch = ask_epoch.load(Ordering::Acquire);
+    match route_proactive(coach, mode, &evidence, true, cur_epoch, fatigue) {
+        ProactiveRoute::Lv3(brief) => {
+            let mut sess = session.snapshot(now);
+            sess.friction_brief = Some(brief);
+            let sit = Situation {
+                history: dialogue.turns(),
+                session: Some(sess),
+                ..Default::default()
+            };
+            let prompt = build_fast_path_prompt(&sit);
+            if !llm.try_submit(LlmJob {
+                prompt,
+                situation: sit,
+                level: ReactionLevel::Lv3Coaching,
+                epoch: cur_epoch,
+            }) {
+                let fallback = "잠깐 막혔어? 다른 경로도 한번 볼까?";
+                fatigue.offer(EphemeralOffer::new(
+                    &coach.cc,
+                    None,
+                    evidence.point_at,
+                    fallback,
+                    now,
+                ));
+                out.send(
+                    plain_line_cmd(
+                        fallback,
+                        EmotionState::Focused,
+                        BodyMotion::LeanForwardPoint,
+                        ReactionLevel::Lv2Cached,
+                    ),
+                    now,
+                    proactive,
+                )?;
+            }
+        }
+        ProactiveRoute::Lv2(cached) => {
+            fatigue.offer(EphemeralOffer::new(
+                &coach.cc,
+                None,
+                cached.point_at,
+                &cached.line,
+                now,
+            ));
+            out.send(
+                plain_line_cmd(
+                    &cached.line,
+                    EmotionState::Focused,
+                    BodyMotion::LeanForwardPoint,
+                    ReactionLevel::Lv2Cached,
+                ),
+                now,
+                proactive,
+            )?;
+        }
+        ProactiveRoute::Cancel(_) => {}
+    }
+    Ok(())
+}
+
+fn active_credit_candidates(
+    ledger: &mut ExposureLedger,
+    cc: &str,
+    now_ms: u64,
+) -> Vec<AttributionCandidate> {
+    ledger
+        .active_in_window(cc, now_ms)
+        .into_iter()
+        .map(|rec| AttributionCandidate {
+            id: rec.record_id,
+            kind: CreditTargetKind::RagRecord,
+            exclusive_slot_group: rec.to,
+            is_warned_trap: rec.role == ExposureRole::WarnedTrap,
+            exposure_weight: rec.w_spoken,
+            age_ms: now_ms.saturating_sub(rec.exposed_at_ms),
+            semantic_sim: 0.7,
+            matches_explicit_mention: false,
+            friction_z: None,
+            ambient_prior: 0.20,
+            prior_same_sign_outcomes: 0,
+        })
+        .collect()
+}
+
+fn cached_cue(
+    cues: &mut CuePlayer,
+    reason: &str,
+    polar: Option<zena_core::Polar>,
+    level: ReactionLevel,
+) -> AvatarCmd {
     let kind = cue_for_reason(reason);
     let c = cue(kind);
     let line = cues.next_line(kind).to_string();
@@ -652,7 +1676,9 @@ fn cached_cue(cues: &mut CuePlayer, reason: &str, polar: Option<zena_core::Polar
 /// One streamed event as an avatar command.
 pub fn event_cmd(ev: StreamEvent, level: ReactionLevel) -> Option<AvatarCmd> {
     match ev {
-        StreamEvent::Expression(args) | StreamEvent::Call(ToolCall::ControlZenaAvatar(args)) => Some(AvatarCmd::Expression { args, level }),
+        StreamEvent::Expression(args) | StreamEvent::Call(ToolCall::ControlZenaAvatar(args)) => {
+            Some(AvatarCmd::Expression { args, level })
+        }
         StreamEvent::Speech(text) => {
             let ms = speech_ms(&text);
             Some(AvatarCmd::Speak {
@@ -662,7 +1688,9 @@ pub fn event_cmd(ev: StreamEvent, level: ReactionLevel) -> Option<AvatarCmd> {
                 level,
             })
         }
-        StreamEvent::Call(ToolCall::ManageZenaSystem(s)) => Some(AvatarCmd::System(s.command, s.window_layer_mode)),
+        StreamEvent::Call(ToolCall::ManageZenaSystem(s)) => {
+            Some(AvatarCmd::System(s.command, s.window_layer_mode))
+        }
         StreamEvent::Call(ToolCall::ManageAvatarAsset(a)) => Some(AvatarCmd::Asset(a)),
         StreamEvent::Rejected { name, error } => {
             eprintln!("[llm] rejected tool call {name}: {error}");
@@ -677,51 +1705,103 @@ pub fn completion_to_cmds(completion: &str, level: ReactionLevel) -> Vec<AvatarC
     let mut s = ToolCallStream::new();
     let mut ev = s.push(completion);
     ev.extend(s.finish());
-    ev.into_iter().filter_map(|e| event_cmd(e, level)).collect()
+    ev.into_iter()
+        .filter_map(|e| event_cmd(e, level))
+        .collect()
 }
 
-/// The LLM thread's handler: parses the completion while it streams and sends avatar commands at once — the
-/// expression as soon as its parameters close, the line sentence by sentence — then reports the answer for the
-/// dialogue memory.
+/// The LLM thread's handler: parses the completion while it streams and sends avatar commands at once —
+/// guarding every delta & completion by `ask_epoch` (CR-06 / PS-12) and tracking spoken badge numbers in
+/// `SpokenSlotLock` (CN-12) — then reports the delivered answer & injected slots for `ExposureLedger` (CR-12).
 pub struct StreamToAvatar {
     out: Sender<AvatarCmd>,
     replies: Option<Sender<Reply>>,
+    ask_epoch: Arc<AtomicU64>,
+    spoken_lock: Arc<Mutex<SpokenSlotLock>>,
     stream: ToolCallStream,
     streamed: bool,
 }
 
 impl StreamToAvatar {
+    #[allow(dead_code)]
     pub fn new(out: Sender<AvatarCmd>, replies: Option<Sender<Reply>>) -> Self {
+        Self::with_guards(
+            out,
+            replies,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(SpokenSlotLock::default())),
+        )
+    }
+
+    pub fn with_guards(
+        out: Sender<AvatarCmd>,
+        replies: Option<Sender<Reply>>,
+        ask_epoch: Arc<AtomicU64>,
+        spoken_lock: Arc<Mutex<SpokenSlotLock>>,
+    ) -> Self {
         Self {
             out,
             replies,
+            ask_epoch,
+            spoken_lock,
             stream: ToolCallStream::new(),
             streamed: false,
         }
     }
 
+    fn is_current(&self, epoch: u64) -> bool {
+        epoch == 0 || epoch == self.ask_epoch.load(Ordering::Acquire)
+    }
+
     fn emit(&self, events: Vec<StreamEvent>, level: ReactionLevel) {
-        for cmd in events.into_iter().filter_map(|e| event_cmd(e, level)) {
-            let _ = self.out.send(cmd);
+        for ev in events {
+            if let StreamEvent::Speech(ref t) = ev {
+                if let Ok(mut sl) = self.spoken_lock.lock() {
+                    sl.push_spoken(t);
+                }
+            }
+            if let Some(cmd) = event_cmd(ev, level) {
+                let _ = self.out.send(cmd);
+            }
         }
     }
 }
 
 impl JobHandler for StreamToAvatar {
     fn delta(&mut self, job: &LlmJob, text: &str) {
+        if !self.is_current(job.epoch) {
+            return;
+        }
         self.streamed = true;
         let ev = self.stream.push(text);
         self.emit(ev, job.level);
     }
 
     fn done(&mut self, job: LlmJob, text: String) {
-        let mut ev = if self.streamed { Vec::new() } else { self.stream.push(&text) };
+        if !self.is_current(job.epoch) {
+            self.stream = ToolCallStream::new();
+            self.streamed = false;
+            return;
+        }
+        let mut ev = if self.streamed {
+            Vec::new()
+        } else {
+            self.stream.push(&text)
+        };
         ev.extend(self.stream.finish());
         self.emit(ev, job.level);
         if let Some(tx) = &self.replies {
+            let slots = job
+                .situation
+                .session
+                .as_ref()
+                .map(|s| s.verdict_slots.clone())
+                .unwrap_or_default();
             let _ = tx.send(Reply {
                 user: job.situation.user_query.clone(),
                 zena: self.stream.spoken().to_string(),
+                epoch: job.epoch,
+                slots,
             });
         }
         self.stream = ToolCallStream::new();
@@ -767,6 +1847,7 @@ mod tests {
             prompt: String::new(),
             situation: sit.clone(),
             level: ReactionLevel::Lv3Coaching,
+            epoch: 0,
         };
         while !w.try_submit(job()) {
             std::thread::sleep(Duration::from_millis(5));
@@ -775,8 +1856,14 @@ mod tests {
         assert_eq!(reply.user.as_deref(), Some("보스 패턴 어떻게 피해?"));
         assert!(reply.zena.contains("반격"), "{reply:?}");
         let cmds: Vec<AvatarCmd> = orx.try_iter().collect();
-        let first_expr = cmds.iter().position(|c| matches!(c, AvatarCmd::Expression { .. })).unwrap();
-        let first_speak = cmds.iter().position(|c| matches!(c, AvatarCmd::Speak { .. })).unwrap();
+        let first_expr = cmds
+            .iter()
+            .position(|c| matches!(c, AvatarCmd::Expression { .. }))
+            .unwrap();
+        let first_speak = cmds
+            .iter()
+            .position(|c| matches!(c, AvatarCmd::Speak { .. }))
+            .unwrap();
         assert!(first_expr < first_speak, "{cmds:?}");
         let spoken: Vec<&str> = cmds.iter().filter_map(AvatarCmd::speech).collect();
         assert_eq!(spoken.join(" "), reply.zena);
@@ -785,7 +1872,13 @@ mod tests {
     #[test]
     fn dictionary_expressions_rotate_lines_and_respect_the_gap() {
         let lex = Lexicon::bundled();
-        let e = lex.node("emotion.celebrate").unwrap().action.express().unwrap().clone();
+        let e = lex
+            .node("emotion.celebrate")
+            .unwrap()
+            .action
+            .express()
+            .unwrap()
+            .clone();
         let mut p = ExpressionPlayer::default();
         let line = |c: Option<AvatarCmd>| match c {
             Some(AvatarCmd::Act { args, level, .. }) => (args.speech_text, level),
@@ -796,7 +1889,13 @@ mod tests {
         assert!(p.play("emotion.celebrate", &e, None, 500, 1500).is_none(), "within the gap");
         let (b, _) = line(p.play("emotion.celebrate", &e, None, 2000, 1500));
         assert_ne!(a, b, "the next line of the node");
-        let silent = lex.node("react.combat").unwrap().action.express().unwrap().clone();
+        let silent = lex
+            .node("react.combat")
+            .unwrap()
+            .action
+            .express()
+            .unwrap()
+            .clone();
         assert_eq!(
             line(p.play("react.combat", &silent, None, 0, 1500)),
             (None, ReactionLevel::Lv1Silent)
@@ -809,7 +1908,10 @@ mod tests {
             0,
         ) {
             Some(AvatarCmd::Act { args, .. }) => {
-                assert_eq!(args.character_emote, Some(zena_core::tools::CharacterEmote::ChibiHeart))
+                assert_eq!(
+                    args.character_emote,
+                    Some(zena_core::tools::CharacterEmote::ChibiHeart)
+                )
             }
             other => panic!("{other:?}"),
         }
@@ -831,8 +1933,14 @@ mod tests {
         };
         let mut g = ScreenGate::default();
         assert!(g.admit(&obs("vision.stock_chart", VisionKind::Scene, 600), 0));
-        assert!(!g.admit(&obs("vision.stock_chart", VisionKind::Scene, 600), 3000), "same scene");
-        assert!(g.admit(&obs("vision.coding", VisionKind::Scene, 600), 6000), "the scene changed");
+        assert!(
+            !g.admit(&obs("vision.stock_chart", VisionKind::Scene, 600), 3000),
+            "same scene"
+        );
+        assert!(
+            g.admit(&obs("vision.coding", VisionKind::Scene, 600), 6000),
+            "the scene changed"
+        );
         assert!(
             !g.admit(&obs("vision.stock_chart", VisionKind::Scene, 600), 9000),
             "back to a scene seen within its cooldown"
@@ -866,7 +1974,14 @@ mod tests {
         }
     }
 
-    fn links(llm: LlmWorker) -> (Links, Sender<String>, Receiver<AvatarCmd>, Sender<ScreenObservation>) {
+    fn links(
+        llm: LlmWorker,
+    ) -> (
+        Links,
+        Sender<String>,
+        Receiver<AvatarCmd>,
+        Sender<ScreenObservation>,
+    ) {
         let (utx, urx) = channel();
         let (otx, orx) = channel();
         let (_ltx, lrx) = channel();
@@ -880,13 +1995,18 @@ mod tests {
             screen_frames: None,
             screen: Some(srx),
             replies: None,
+            actions: None,
+            ask_epoch: Arc::new(AtomicU64::new(0)),
+            privacy_epoch: Arc::new(AtomicU64::new(0)),
+            spoken_lock: Arc::new(Mutex::new(SpokenSlotLock::default())),
         };
         (links, utx, orx, stx)
     }
 
     #[test]
     fn utterances_and_screen_observations_become_dictionary_expressions() {
-        let (links, utx, orx, stx) = links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
+        let (links, utx, orx, stx) =
+            links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
         let src = Box::new(crate::capture::SyntheticSource::new(160, 90));
         std::thread::spawn(move || run(src, links, Lexicon::bundled(), PipelineConfig::default()));
         utx.send("와 보스 잡았다! 이겼어!".to_string()).unwrap();
@@ -907,16 +2027,22 @@ mod tests {
         let (mut cheered, mut chart) = (false, false);
         while std::time::Instant::now() < deadline && !(cheered && chart) {
             if let Ok(AvatarCmd::Act { args, .. }) = orx.recv_timeout(Duration::from_millis(200)) {
-                if (args.emotion_state, args.body_motion) == (EmotionState::Excited, BodyMotion::Cheer) {
+                if (args.emotion_state, args.body_motion) == (EmotionState::Excited, BodyMotion::Cheer)
+                {
                     cheered = args.speech_text.is_some();
                 }
-                if args.body_motion == BodyMotion::Think && args.gaze_target.is_some_and(|g| g.angle_deg < 90.0) {
-                    chart = true; // looks up-right, where the chart's peak cell is
+                if args.body_motion == BodyMotion::Think
+                    && args.gaze_target.is_some_and(|g| g.angle_deg < 90.0)
+                {
+                    chart = true;
                 }
             }
         }
         assert!(cheered, "the user's win is played from the dictionary");
-        assert!(chart, "the chart on screen is played from react.market, looking at its peak");
+        assert!(
+            chart,
+            "the chart on screen is played from react.market, looking at its peak"
+        );
     }
 
     #[test]
@@ -924,19 +2050,40 @@ mod tests {
         let (stx, srx) = channel();
         let (otx, _orx) = channel::<AvatarCmd>();
         let (rtx, rrx) = channel();
-        let llm = LlmWorker::spawn(Box::new(Recorder(stx)), StreamToAvatar::new(otx, Some(rtx)));
+        let ask_epoch = Arc::new(AtomicU64::new(0));
+        let spoken_lock = Arc::new(Mutex::new(SpokenSlotLock::default()));
+        let llm = LlmWorker::spawn_with_epoch(
+            Box::new(Recorder(stx)),
+            StreamToAvatar::with_guards(otx, Some(rtx), ask_epoch.clone(), spoken_lock.clone()),
+            ask_epoch.clone(),
+        );
         let (mut links, utx, orx, _screen) = links(llm);
         links.replies = Some(rrx);
-        std::thread::spawn(move || run(Box::new(StaticScreen), links, Lexicon::bundled(), PipelineConfig::default()));
+        links.ask_epoch = ask_epoch;
+        links.spoken_lock = spoken_lock;
+        std::thread::spawn(move || {
+            run(
+                Box::new(StaticScreen),
+                links,
+                Lexicon::bundled(),
+                PipelineConfig::default(),
+            )
+        });
         utx.send("제나야 보스 패턴 어떻게 피해?".into()).unwrap();
-        let first = srx.recv_timeout(Duration::from_secs(5)).expect("handled without any frame");
+        let first = srx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handled without any frame");
         assert!(first.history.is_empty());
         assert!(first.session.is_some());
         std::thread::sleep(Duration::from_millis(300));
         utx.send("제나야 인벤토리 어디 있어?".into()).unwrap();
         let second = srx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(second.history.len(), 1, "{:?}", second.history);
-        assert!(second.history[0].user.as_deref().unwrap().contains("보스 패턴"));
+        assert!(second.history[0]
+            .user
+            .as_deref()
+            .unwrap()
+            .contains("보스 패턴"));
         assert!(!second.history[0].zena.is_empty());
         let prompt = build_fast_path_prompt(&second);
         assert!(prompt.contains("[최근 대화]"));
@@ -945,7 +2092,8 @@ mod tests {
 
     #[test]
     fn zena_speaks_up_after_a_silence_and_switches_assets_on_request() {
-        let (links, utx, orx, stx) = links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
+        let (links, utx, orx, stx) =
+            links(LlmWorker::spawn(Box::new(TemplateBackend), OnDone(|_, _| {})));
         let cfg = PipelineConfig {
             proactive_silence_ms: 400,
             ..Default::default()
@@ -965,7 +2113,13 @@ mod tests {
         })
         .unwrap();
         let lex = Lexicon::bundled();
-        let coding_lines = &lex.node("proactive.coding").unwrap().action.express().unwrap().lines;
+        let coding_lines = &lex
+            .node("proactive.coding")
+            .unwrap()
+            .action
+            .express()
+            .unwrap()
+            .lines;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut proactive_line = None;
         while std::time::Instant::now() < deadline && proactive_line.is_none() {
@@ -981,9 +2135,95 @@ mod tests {
         let mut switched = false;
         while std::time::Instant::now() < deadline && !switched {
             if let Ok(AvatarCmd::Asset(a)) = orx.recv_timeout(Duration::from_millis(100)) {
-                switched = a.action == AssetAction::SwitchTrack && a.track == Some(AvatarTrack::Solidcraft);
+                switched =
+                    a.action == AssetAction::SwitchTrack && a.track == Some(AvatarTrack::Solidcraft);
             }
         }
         assert!(switched);
+    }
+
+    #[test]
+    fn ingress_pii_hard_blocks_card_and_seed_before_llm_and_privacy_lock_activates_blind_assist() {
+        let (stx, srx) = channel();
+        let (otx, _orx) = channel::<AvatarCmd>();
+        let ask_epoch = Arc::new(AtomicU64::new(0));
+        let llm = LlmWorker::spawn_with_epoch(
+            Box::new(Recorder(stx)),
+            StreamToAvatar::with_guards(
+                otx,
+                None,
+                ask_epoch.clone(),
+                Arc::new(Mutex::new(SpokenSlotLock::default())),
+            ),
+            ask_epoch.clone(),
+        );
+        let (mut links, utx, orx, scr_tx) = links(llm);
+        links.ask_epoch = ask_epoch;
+        std::thread::spawn(move || {
+            run(
+                Box::new(StaticScreen),
+                links,
+                Lexicon::bundled(),
+                PipelineConfig::default(),
+            )
+        });
+
+        // 1. Valid-checksum BIP-39 seed phrase in chat -> blocked at ingress, NEVER reaches LLM!
+        utx.send("제나야 legal winner thank year wave sausage worth useful legal winner thank yellow 이거 뭐야?".into())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut got_block_reaction = false;
+        while std::time::Instant::now() < deadline && !got_block_reaction {
+            if let Ok(AvatarCmd::Act { args, .. }) = orx.recv_timeout(Duration::from_millis(80)) {
+                if args
+                    .speech_text
+                    .as_deref()
+                    .is_some_and(|s| s == IngressPiiScrubber::block_reaction())
+                {
+                    got_block_reaction = true;
+                }
+            }
+        }
+        assert!(got_block_reaction, "seed phrase must trigger block reaction");
+        assert!(
+            srx.recv_timeout(Duration::from_millis(120)).is_err(),
+            "blocked seed phrase must NEVER reach LLM"
+        );
+
+        // 2. Trigger VisionKind::Privacy -> PrivacyStateMachine locks, sends PrivacyLock(true),
+        //    and a text question asked while locked runs in BlindAssist (`privacy_locked == true`).
+        scr_tx
+            .send(ScreenObservation {
+                key: "vision.privacy_bank".into(),
+                kind: VisionKind::Privacy,
+                link: String::new(),
+                score: 0.95,
+                cos: 0.4,
+                peak: None,
+                cooldown_s: 60,
+                encode_ms: 1.0,
+                tokens: 1,
+                cells: 1,
+            })
+            .unwrap();
+        let mut locked_event = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !locked_event {
+            if let Ok(AvatarCmd::PrivacyLock { locked: true }) =
+                orx.recv_timeout(Duration::from_millis(80))
+            {
+                locked_event = true;
+            }
+        }
+        assert!(locked_event, "VisionKind::Privacy must emit PrivacyLock(true)");
+
+        utx.send("제나야 보스 패턴 어떻게 피해?".into()).unwrap();
+        let blind = srx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("BlindAssist answers text question while locked");
+        assert!(
+            blind.session.as_ref().is_some_and(|s| s.privacy_locked),
+            "session must carry privacy_locked = true during BlindAssist"
+        );
     }
 }

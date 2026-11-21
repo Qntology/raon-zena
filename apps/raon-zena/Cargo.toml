@@ -7,7 +7,15 @@ license.workspace = true
 
 [dependencies]
 zena-core = { path = "../../crates/zena-core" }
+zena-verdict = { path = "../../crates/zena-verdict" }
 premium-discount-sensor.workspace = true
+premium-discount-identity.workspace = true
+premium-discount-mcp.workspace = true
+premium-discount-nav.workspace = true
+premium-discount-schema.workspace = true
+premium-discount-filter.workspace = true
+premium-discount-relay.workspace = true
+premium-discount-window = { workspace = true, features = ["win32"] }
 nlp-nms-router = { path = "../../crates/nlp-nms-router" }
 raon-quant = { path = "../../crates/raon-quant" }
 raon-infer = { path = "../../crates/raon-infer" }
@@ -15,6 +23,8 @@ raon-vision = { path = "../../crates/raon-vision" }
 zena-lexicon = { path = "../../crates/zena-lexicon" }
 zena-avatar-mcp = { path = "../../crates/zena-avatar-mcp" }
 zena-sds = { path = "../../crates/zena-sds" }
+serde.workspace = true
+serde_json.workspace = true
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
@@ -44,6 +54,10 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

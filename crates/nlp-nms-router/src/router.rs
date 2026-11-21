@@ -1057,6 +1057,31 @@ mod tests {
     }
 
     #[test]
+    fn bundled_lexicon_populates_feedback_channel_out_of_the_box() {
+        let mut r = NlpNmsRouter::with_models(&Lexicon::bundled(), Models::rules());
+        let out = r.route(
+            vec![RouterInput::Utterance {
+                text: "우회하긴 했는데 나쁘지 않았어".into(),
+                t_ms: 10,
+            }],
+            10,
+        );
+        assert_eq!(out.feedback.len(), 1, "bundled lexicon now has feedback.* nodes");
+        assert_eq!(out.feedback[0].spans[0].key, "feedback.not_recommend");
+        assert!(out.feedback[0].spans[0].negated());
+        let rec = r.route(
+            vec![RouterInput::Utterance {
+                text: "이거 추천".into(),
+                t_ms: 10_000,
+            }],
+            10_000,
+        );
+        assert_eq!(rec.feedback.len(), 1);
+        assert_eq!(rec.feedback[0].spans[0].key, "feedback.recommend");
+        assert!(!rec.feedback[0].spans[0].negated());
+    }
+
+    #[test]
     fn a_reloaded_dictionary_catches_new_words() {
         let mut r = NlpNmsRouter::default();
         let out = r.route(
