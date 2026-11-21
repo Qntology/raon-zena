@@ -18,12 +18,12 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nlp_nms_router::embed::{HashedNgramEmbedder, SharedEmbedder};
+use nlp_nms_router::embed::{HashedNgramEmbedder, SharedEmbedder, TextEmbedder};
 use premium_discount_filter::{LocalFilter, Verdict as FilterVerdict};
 use premium_discount_identity::{hash_id, is_bip39_word, is_valid_phrase};
 use premium_discount_mcp::client::{
@@ -46,11 +46,13 @@ use zena_core::claims::{
 use zena_core::hydrate::{LabelHydrator, RemoteHit};
 use zena_core::ingress_guard::{IngressPiiScrubber, IngressVerdict};
 use zena_core::reference::{normalize_cc, ContextualQueryPlan};
+use zena_sds::ScopeStat;
+use zena_verdict::feedback::RETRACT_WINDOW_MS;
 use zena_verdict::{
     apply_feedback_to_ledger, attribute_and_update_duels, duel_for_item, extract_pragmatic_feedback,
-    local_params, outcome_gate, record_demotion, toggle_pin, AttributionCandidate, Baselines, Case,
+    local_params, record_demotion, toggle_pin, AttributionCandidate, Baselines, Case,
     CreditTargetKind, CrossTrialMemory, ExtractedFeedback, FeedbackContext, FeedbackToken,
-    GlobalVerdict, LocalVerdictEntry, Obs, OutcomeGate, ScopeStat, Tier, UserPin, VerdictPairView,
+    GlobalVerdict, LocalVerdictEntry, Obs, Tier, UserPin, VerdictPairView,
 };
 
 use crate::pipeline::AvatarCmd;
@@ -117,7 +119,7 @@ fn is_numbered_sep(sep: &str) -> bool {
 
 fn run_has_valid_checksum(words: &[&str]) -> bool {
     for &len in &[12usize, 15, 18, 21, 24] {
-        if words.len() >= len && words.windows(len).any(is_valid_phrase) {
+        if words.len() >= len && words.windows(len).any(|w| is_valid_phrase(&w.join(" "))) {
             return true;
         }
     }
@@ -180,7 +182,7 @@ pub fn detect_seed_phrase_checked(text: &str) -> Option<(usize, usize)> {
             let sep_ok = sep.bytes().all(|b| {
                 b.is_ascii_whitespace()
                     || b.is_ascii_digit()
-                    || matches!(b, ',' | '.' | '-' | '/' | ':' | ')' | '(' | ';' | '#')
+                    || matches!(b, b',' | b'.' | b'-' | b'/' | b':' | b')' | b'(' | b';' | b'#')
             });
             if !sep_ok {
                 break;
@@ -224,7 +226,12 @@ pub fn filter_dormant_game_overlays(windows: Vec<VisibleWindowEntry>) -> Vec<Vis
 }
 
 pub fn is_dormant_game_overlay(w: &VisibleWindowEntry) -> bool {
-    let exe = w.info.exe.to_ascii_lowercase();
+    let exe = w
+        .info
+        .exe_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let is_overlay = GAME_OVERLAY_PREFIXES.iter().any(|p| exe.starts_with(p));
     if !is_overlay {
         return false;
@@ -272,6 +279,7 @@ pub struct MirroredLocalNote {
     pub request_id: String,
     pub server_id: Option<String>,
     pub cc: String,
+    #[allow(dead_code)]
     pub to: Option<String>,
     pub label: String,
     pub text: String,
@@ -301,8 +309,9 @@ impl LocalMirrorIndex {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn hashed() -> Self {
-        Self::new(Arc::new(HashedNgramEmbedder::default()))
+        Self::new(SharedEmbedder(Arc::new(HashedNgramEmbedder::default())))
     }
 
     pub fn embed(&self, text: &str) -> Vec<f32> {
@@ -589,6 +598,7 @@ impl SceneRagCache {
         self.entries.clear();
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1059,7 +1069,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[derive(Debug, Default)]
 pub struct PrewarmGuard {
     last_attempt_ms: Option<u64>,
-    suppressed: bool,
+    pub suppressed: Arc<AtomicBool>,
 }
 
 impl PrewarmGuard {
@@ -1070,7 +1080,7 @@ impl PrewarmGuard {
         busy: bool,
         ram_mb: Option<u64>,
     ) -> bool {
-        if self.suppressed || privacy_locked || busy {
+        if self.suppressed.load(Ordering::Acquire) || privacy_locked || busy {
             return false;
         }
         if ram_mb.is_some_and(|mb| mb < MIN_PREWARM_AVAIL_RAM_MB) {
@@ -1084,12 +1094,6 @@ impl PrewarmGuard {
         }
         self.last_attempt_ms = Some(now_ms);
         true
-    }
-
-    pub fn note_outcome(&mut self, outcome: &str) {
-        if outcome == "suppressed" {
-            self.suppressed = true;
-        }
     }
 }
 
@@ -1111,8 +1115,9 @@ impl OutcomeVoteGate {
         }
     }
 
-    /// Evaluates the 4 gates (`zena_verdict::outcome_gate`). Returns `Some((eval_id, sign))` when
-    /// ready to transmit immediately, or queues into `held_votes` when signed out.
+    /// Evaluates the 4 gates (`consent && remote && eval_id && decisive && credit >= 0.8 && eff >= 0.8`).
+    /// Returns `Some((eval_id, sign))` when ready to transmit immediately, or queues into `held_votes`
+    /// while signed out.
     pub fn consider(
         &mut self,
         eval_id: Option<&str>,
@@ -1122,32 +1127,29 @@ impl OutcomeVoteGate {
         effective_weight: f64,
         sign: i32,
     ) -> Option<(String, i32)> {
-        if !is_remote || sign == 0 {
+        if !self.consent_share_outcomes
+            || !is_remote
+            || !decisive
+            || sign == 0
+            || credit < 0.8
+            || effective_weight < 0.8
+        {
             return None;
         }
         let Some(id) = eval_id.filter(|s| !s.is_empty()) else {
             return None;
         };
-        match outcome_gate(
-            self.consent_share_outcomes,
-            self.signed_in,
-            true,
-            decisive,
-            credit,
-            effective_weight,
-        ) {
-            OutcomeGate::Send => Some((id.to_string(), sign.signum())),
-            OutcomeGate::HoldUntilSignedIn => {
-                if let Some(pos) = self.held_votes.iter().position(|(k, _)| k == id) {
-                    self.held_votes.remove(pos);
-                }
-                if self.held_votes.len() >= MAX_HELD_OUTCOME_VOTES {
-                    self.held_votes.pop_front();
-                }
-                self.held_votes.push_back((id.to_string(), sign.signum()));
-                None
+        if self.signed_in {
+            Some((id.to_string(), sign.signum()))
+        } else {
+            if let Some(pos) = self.held_votes.iter().position(|(k, _)| k == id) {
+                self.held_votes.remove(pos);
             }
-            OutcomeGate::Skip => None,
+            if self.held_votes.len() >= MAX_HELD_OUTCOME_VOTES {
+                self.held_votes.pop_front();
+            }
+            self.held_votes.push_back((id.to_string(), sign.signum()));
+            None
         }
     }
 
@@ -1192,6 +1194,7 @@ pub struct LocalRecordState {
     pub record_id: String,
     pub server_id: Option<String>,
     pub cc: String,
+    #[allow(dead_code)]
     pub to: Option<String>,
     pub label: String,
     pub sync_state: String,
@@ -1276,13 +1279,15 @@ impl LocalVerdictStore {
     ) -> Option<VerdictPairView> {
         let params = local_params();
         let rec = self.records.get_mut(record_id)?;
+        let was_demoted = rec.pin == Some(UserPin::Demoted);
         let res = toggle_pin(&mut rec.obs, rec.pin, clicked, now_ms, &params);
         rec.pin = res.pin;
         if res.pin.is_some() {
             rec.pin_set_at_ms = now_ms;
         }
-        if res.pin == Some(UserPin::Demoted) {
-            record_demotion(&mut self.scope_stat, record_id);
+        let now_demoted = res.pin == Some(UserPin::Demoted);
+        if now_demoted != was_demoted {
+            record_demotion(&mut self.scope_stat, record_id, now_demoted, now_ms);
         }
         Some(self.pair_view(record_id, now_ms, quarantine))
     }
@@ -1296,13 +1301,20 @@ impl LocalVerdictStore {
         ctx: &FeedbackContext,
         credit: f64,
         now_ms: i64,
-    ) -> ExtractedFeedback {
-        let extracted = extract_pragmatic_feedback(utterance, tokens, ctx);
+    ) -> Option<ExtractedFeedback> {
+        let extracted = extract_pragmatic_feedback(utterance, tokens, "ko", *ctx)?;
         let params = local_params();
         if let Some(rec) = self.records.get_mut(record_id) {
-            apply_feedback_to_ledger(&mut rec.obs, &extracted, credit, now_ms, &params);
+            apply_feedback_to_ledger(
+                &mut rec.obs,
+                &extracted,
+                credit,
+                now_ms,
+                RETRACT_WINDOW_MS,
+                &params,
+            );
         }
-        extracted
+        Some(extracted)
     }
 
     /// Distributes outcome / feedback credit across active candidates and updates cross-trial duels.
@@ -1317,16 +1329,17 @@ impl LocalVerdictStore {
         let params = local_params();
         let obs_kind = "outcome";
         let report = attribute_and_update_duels(
-            candidates,
-            sign,
             obs_kind,
+            sign,
             1.0,
             shielded,
-            now_ms,
+            candidates,
             &mut self.scope_stat,
-            &mut self.cross_trial,
+            self.cross_trial.failures(),
+            now_ms,
             &params,
         );
+        self.cross_trial.remember(&report, candidates, now_ms);
         let mut outbound = Vec::new();
         let decisive = report.shares.len() == 1;
         for share in &report.shares {
@@ -1622,13 +1635,14 @@ impl PdBridge {
         now_ms: i64,
     ) -> DropOutcome {
         let scrubber = IngressPiiScrubber::with_seed_detector(&detect_seed_phrase_checked);
-        let text = match scrubber.inspect(raw_text) {
-            IngressVerdict::HardBlock { .. } => {
+        let mut buf = raw_text.to_string();
+        let text = match scrubber.inspect_and_scrub(&mut buf) {
+            IngressVerdict::HardBlocked { kind } => {
                 return DropOutcome::BlockedPii {
-                    reaction: IngressPiiScrubber::block_reaction().to_string(),
+                    reaction: kind.warning_line().to_string(),
                 };
             }
-            IngressVerdict::Scrubbed { clean, .. } => clean,
+            IngressVerdict::Scrubbed { sanitized_text, .. } => sanitized_text,
             IngressVerdict::Clean(clean) => clean,
         };
         if self.filter.judge(&text) == FilterVerdict::Profane {
@@ -1755,6 +1769,7 @@ impl PdBridge {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let suppressed = self.prewarm.suppressed.clone();
         std::thread::Builder::new()
             .name("zena-pd-prewarm".into())
             .spawn(move || {
@@ -1763,7 +1778,11 @@ impl PdBridge {
                     if let Some(mb) = ram {
                         args["avail_ram_mb"] = json!(mb);
                     }
-                    let _ = guard.call("pd_model_manage", args);
+                    if let Ok(resp) = guard.call("pd_model_manage", args) {
+                        if resp.get("outcome").and_then(Value::as_str) == Some("suppressed") {
+                            suppressed.store(true, Ordering::Release);
+                        }
+                    }
                 }
             })
             .ok();
@@ -2219,10 +2238,11 @@ mod tests {
     #[test]
     fn dormant_steam_game_overlay_is_ignored_while_checkout_overlay_is_kept() {
         let dormant = VisibleWindowEntry {
-            hwnd: 1,
             info: WindowInfo {
+                hwnd: 1,
                 pid: 100,
-                exe: "GameOverlayUI.exe".into(),
+                exe_path: None,
+                exe_name: Some("GameOverlayUI.exe".into()),
                 title: "Steam Overlay".into(),
             },
             rect: PxRect { left: 0, top: 0, right: 1920, bottom: 1080 },
@@ -2231,10 +2251,11 @@ mod tests {
             class_name: "vguiPopupWindow".into(),
         };
         let checkout = VisibleWindowEntry {
-            hwnd: 2,
             info: WindowInfo {
+                hwnd: 2,
                 pid: 100,
-                exe: "GameOverlayUI.exe".into(),
+                exe_path: None,
+                exe_name: Some("GameOverlayUI.exe".into()),
                 title: "Steam Store Checkout".into(),
             },
             rect: PxRect { left: 200, top: 150, right: 1400, bottom: 900 },
@@ -2244,7 +2265,7 @@ mod tests {
         };
         let kept = filter_dormant_game_overlays(vec![dormant, checkout]);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].hwnd, 2);
+        assert_eq!(kept[0].info.hwnd, 2);
     }
 
     #[test]
@@ -2252,7 +2273,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("zena_bridge_test_{}.json", std::process::id()));
         let mut bridge = PdBridge::new(
             None,
-            Arc::new(HashedNgramEmbedder::default()),
+            SharedEmbedder(Arc::new(HashedNgramEmbedder::default())),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             false,

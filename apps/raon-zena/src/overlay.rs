@@ -648,9 +648,17 @@ impl Overlay {
             let win = premium_discount_window::exclude_self(
                 premium_discount_window::window_at(cx, cy),
             )?;
-            let cc = envelope::normalize_cc(&win.app_uri())
+            let cc = win
+                .app_uri()
+                .as_deref()
+                .and_then(|u| envelope::normalize_cc(u).ok())
                 .map(|c| c.cc)
-                .unwrap_or_else(|_| win.exe.to_ascii_lowercase());
+                .unwrap_or_else(|| {
+                    win.exe_name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                });
             (!cc.is_empty()).then_some(cc)
         }
         #[cfg(not(windows))]

@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
-use nlp_nms_router::embed::SharedEmbedder;
-use premium_discount_nav::hash::{page_hash, url_template};
-use premium_discount_nav::order::{FrameContext, Numbered, StickyNumberer};
-use premium_discount_nav::region::{Rect, Region, Role, Source};
+use nlp_nms_router::embed::{SharedEmbedder, TextEmbedder};
+use premium_discount_nav::{
+    page_hash, url_template, FrameContext, Numbered, Rect, Region, Role, Source, StickyNumberer,
+};
 use premium_discount_schema::envelope;
-use premium_discount_verdict::Tier;
+use zena_verdict::Tier;
 use zena_core::brief::{
     is_commit_label, is_unavailable_label, prompt_label, SlotDispatch, WebChoice, WebCoachBrief,
 };
@@ -30,6 +30,7 @@ use zena_core::reference::normalize_cc;
 use zena_sds::matrix::{double_center, exclusive_assign_by_score, ABSENT};
 
 /// Logical vector space identifier for multilingual UI label matching (`WA-09`).
+#[allow(dead_code)]
 pub const LABEL_SPACE_ID: &str = "granite-label-384d";
 /// Minimum raw score (`0.65*cos + 0.20*role + 0.15*ord`) before entering 1:1 assignment.
 pub const LABEL_MATCH_MIN: f32 = 0.72;
@@ -703,20 +704,27 @@ impl Drop for ComStaGuard {
 
 #[cfg(windows)]
 #[derive(Default)]
-struct Win32UiaScanner {
-    automation: Option<windows::Win32::UI::Accessibility::IUIAutomation>,
+struct Win32UiaScanner;
+
+#[cfg(windows)]
+thread_local! {
+    static STA_UIA: std::cell::RefCell<Option<windows::Win32::UI::Accessibility::IUIAutomation>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(windows)]
 impl Win32UiaScanner {
-    fn ensure_automation(&mut self) -> Option<&windows::Win32::UI::Accessibility::IUIAutomation> {
+    fn automation() -> Option<windows::Win32::UI::Accessibility::IUIAutomation> {
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
-        if self.automation.is_none() {
-            self.automation =
-                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() };
-        }
-        self.automation.as_ref()
+        use windows::Win32::UI::Accessibility::CUIAutomation;
+        STA_UIA.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot =
+                    unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() };
+            }
+            slot.clone()
+        })
     }
 }
 
@@ -726,13 +734,11 @@ impl BrowserScanner for Win32UiaScanner {
         use std::ffi::c_void;
         use windows::core::Interface;
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::System::Variant::VARIANT;
         use windows::Win32::UI::Accessibility::{
             IUIAutomationValuePattern, TreeScope_Descendants, UIA_ButtonControlTypeId,
-            UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId,
-            UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_HyperlinkControlTypeId,
-            UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_TabItemControlTypeId,
-            UIA_ValuePatternId,
+            UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
+            UIA_EditControlTypeId, UIA_HyperlinkControlTypeId, UIA_MenuItemControlTypeId,
+            UIA_RadioButtonControlTypeId, UIA_TabItemControlTypeId, UIA_ValuePatternId,
         };
 
         if !is_browser_exe(&req.exe) {
@@ -750,7 +756,7 @@ impl BrowserScanner for Win32UiaScanner {
             ));
         }
 
-        let uia = self.ensure_automation()?.clone();
+        let uia = Self::automation()?;
         let hwnd = HWND(req.hwnd as *mut c_void);
         let root = unsafe { uia.ElementFromHandle(hwnd).ok()? };
         let root_rect = unsafe { root.CurrentBoundingRectangle().ok()? };
@@ -761,56 +767,8 @@ impl BrowserScanner for Win32UiaScanner {
             root_rect.bottom as f32,
         ];
 
-        // 1. Try Document ValuePattern for active tab URL + exact document pane rect.
         let mut found_url: Option<String> = None;
-        if let Ok(doc_cond) =
-            unsafe { uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0 as i32)) }
-        {
-            if let Ok(doc_el) = unsafe { root.FindFirst(TreeScope_Descendants, &doc_cond) } {
-                if let Ok(r) = unsafe { doc_el.CurrentBoundingRectangle() } {
-                    if r.right > r.left && r.bottom > r.top {
-                        doc_rect = [r.left as f32, r.top as f32, r.right as f32, r.bottom as f32];
-                    }
-                }
-                if let Ok(pat) = unsafe { doc_el.GetCurrentPattern(UIA_ValuePatternId) } {
-                    if let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() {
-                        if let Ok(val) = unsafe { vp.CurrentValue() } {
-                            let s = val.to_string();
-                            if s.starts_with("http://") || s.starts_with("https://") {
-                                found_url = Some(s);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Fallback: Omnibox Edit control ValuePattern.
-        if found_url.is_none() {
-            if let Ok(edit_cond) =
-                unsafe { uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0 as i32)) }
-            {
-                if let Ok(arr) = unsafe { root.FindAll(TreeScope_Descendants, &edit_cond) } {
-                    let len = unsafe { arr.Length().unwrap_or(0) }.min(8);
-                    for i in 0..len {
-                        let Ok(el) = (unsafe { arr.GetElement(i) }) else { continue };
-                        let Ok(pat) = (unsafe { el.GetCurrentPattern(UIA_ValuePatternId) }) else { continue };
-                        let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() else { continue };
-                        let Ok(val) = (unsafe { vp.CurrentValue() }) else { continue };
-                        let s = val.to_string();
-                        if s.contains('.') && !s.contains(' ') {
-                            found_url = Some(s);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Collect interactive controls (capped at 96 to stay fast and non-blocking).
-        let doc_w = (doc_rect[2] - doc_rect[0]).max(1.0);
-        let doc_h = (doc_rect[3] - doc_rect[1]).max(1.0);
-        let mut regions = Vec::new();
+        let mut raw_controls: Vec<(i32, Role, [f32; 4], String, String, bool, bool)> = Vec::new();
         let control_roles = [
             (UIA_ButtonControlTypeId.0, Role::Button),
             (UIA_HyperlinkControlTypeId.0, Role::Link),
@@ -822,15 +780,52 @@ impl BrowserScanner for Win32UiaScanner {
             (UIA_RadioButtonControlTypeId.0, Role::Button),
         ];
 
+        // Single pass over descendants (capped at 256 nodes) extracts Document rect+URL, Omnibox URL,
+        // and up to 96 interactive controls without blocking or requiring VARIANT/Ole features.
         if let Ok(true_cond) = unsafe { uia.CreateTrueCondition() } {
             if let Ok(all) = unsafe { root.FindAll(TreeScope_Descendants, &true_cond) } {
                 let len = unsafe { all.Length().unwrap_or(0) }.min(256);
                 for i in 0..len {
-                    if regions.len() >= 96 {
-                        break;
-                    }
                     let Ok(el) = (unsafe { all.GetElement(i) }) else { continue };
                     let Ok(ct) = (unsafe { el.CurrentControlType() }) else { continue };
+
+                    if ct == UIA_DocumentControlTypeId {
+                        if let Ok(r) = unsafe { el.CurrentBoundingRectangle() } {
+                            if r.right > r.left && r.bottom > r.top {
+                                doc_rect = [r.left as f32, r.top as f32, r.right as f32, r.bottom as f32];
+                            }
+                        }
+                        if found_url.is_none() {
+                            if let Ok(pat) = unsafe { el.GetCurrentPattern(UIA_ValuePatternId) } {
+                                if let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() {
+                                    if let Ok(val) = unsafe { vp.CurrentValue() } {
+                                        let s = val.to_string();
+                                        if s.starts_with("http://") || s.starts_with("https://") {
+                                            found_url = Some(s);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if ct == UIA_EditControlTypeId && found_url.is_none() {
+                        if let Ok(pat) = unsafe { el.GetCurrentPattern(UIA_ValuePatternId) } {
+                            if let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() {
+                                if let Ok(val) = unsafe { vp.CurrentValue() } {
+                                    let s = val.to_string();
+                                    if s.contains('.') && !s.contains(' ') {
+                                        found_url = Some(s);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if raw_controls.len() >= 96 {
+                        continue;
+                    }
                     let Some((_, role)) = control_roles.iter().find(|(id, _)| *id == ct.0) else {
                         continue;
                     };
@@ -838,39 +833,48 @@ impl BrowserScanner for Win32UiaScanner {
                     if br.right <= br.left || br.bottom <= br.top {
                         continue;
                     }
-                    let rx = (br.left as f32 - doc_rect[0]) / doc_w;
-                    let ry = (br.top as f32 - doc_rect[1]) / doc_h;
-                    let rw = (br.right - br.left) as f32 / doc_w;
-                    let rh = (br.bottom - br.top) as f32 / doc_h;
-                    let Some(rect) = Rect::new(rx, ry, rw, rh) else { continue };
                     let name = unsafe { el.CurrentName().map(|b| b.to_string()).unwrap_or_default() };
                     let auto_id =
                         unsafe { el.CurrentAutomationId().map(|b| b.to_string()).unwrap_or_default() };
                     let enabled = unsafe { el.CurrentIsEnabled().map(|b| b.as_bool()).unwrap_or(true) };
                     let sensitive =
                         unsafe { el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) };
-                    let anchor = if !auto_id.trim().is_empty() {
-                        format!("uia:{}:{auto_id}", ct.0)
-                    } else {
-                        format!(
-                            "uia:{}:{}:{:.2},{:.2}",
-                            ct.0,
-                            prompt_label(&name),
-                            rect.x,
-                            rect.y
-                        )
-                    };
-                    regions.push(UiaInteractiveRegion {
-                        anchor,
-                        label: name,
-                        role: *role,
-                        rect,
+                    raw_controls.push((
+                        ct.0,
+                        *role,
+                        [br.left as f32, br.top as f32, br.right as f32, br.bottom as f32],
+                        name,
+                        auto_id,
                         enabled,
                         sensitive,
-                        is_sticky_chrome: false,
-                    });
+                    ));
                 }
             }
+        }
+
+        let doc_w = (doc_rect[2] - doc_rect[0]).max(1.0);
+        let doc_h = (doc_rect[3] - doc_rect[1]).max(1.0);
+        let mut regions = Vec::with_capacity(raw_controls.len());
+        for (ct_id, role, br, name, auto_id, enabled, sensitive) in raw_controls {
+            let rx = (br[0] - doc_rect[0]) / doc_w;
+            let ry = (br[1] - doc_rect[1]) / doc_h;
+            let rw = (br[2] - br[0]) / doc_w;
+            let rh = (br[3] - br[1]) / doc_h;
+            let Some(rect) = Rect::new(rx, ry, rw, rh) else { continue };
+            let anchor = if !auto_id.trim().is_empty() {
+                format!("uia:{ct_id}:{auto_id}")
+            } else {
+                format!("uia:{ct_id}:{}:{:.2},{:.2}", prompt_label(&name), rect.x, rect.y)
+            };
+            regions.push(UiaInteractiveRegion {
+                anchor,
+                label: name,
+                role,
+                rect,
+                enabled,
+                sensitive,
+                is_sticky_chrome: false,
+            });
         }
 
         Some(BrowserTabSnapshot::from_raw(

@@ -31,19 +31,15 @@ use crate::pd_bridge::{
 };
 use crate::watcher::{ScreenFrame, ScreenObservation};
 use nlp_nms_router::{Caught, Hit, NlpNmsRouter, RouterInput};
-use premium_discount_nav::behavior::{
-    BehaviorParams, Event as NavEvent, FrictionAlertStage, FrictionBaselines, LiveEpisodeWindow,
-    Signal as NavSignal,
-};
-use premium_discount_nav::order::StickyNumberer;
-use premium_discount_nav::privacy::{evaluate_privacy, PrivacyProbeInput, PrivacyShield};
-use premium_discount_nav::resume::{
-    payment_route, receipt_finish_page, PrivacyStateMachine, SurfaceSignature, ZeroPixelProbe,
+use premium_discount_nav::{
+    evaluate_privacy, payment_route, receipt_finish_page, BehaviorParams, Event as NavEvent,
+    FrictionAlertStage, FrictionBaselines, LiveEpisodeWindow, PrivacyProbeInput, PrivacyShield,
+    PrivacyStateMachine, PrivacyTrigger, Signal as NavSignal, StickyNumberer, SurfaceSignature,
+    ZeroPixelProbe,
 };
 use premium_discount_schema::envelope;
 use premium_discount_sensor::naflex::bgra_to_rgb;
 use premium_discount_sensor::{extract_rois, LogLumSensor, PurgableSensor, RoiTracker};
-use premium_discount_verdict::Tier;
 use premium_discount_window::{
     assess_surfaces, foreground_window, visible_windows_intersecting, PxRect,
 };
@@ -63,7 +59,7 @@ use zena_core::coach::{
 use zena_core::cues::{cue, cue_for_reason, CuePlayer};
 use zena_core::exposure::{ExposureLedger, ExposureRole};
 use zena_core::geometry::{FlowDirection, ScreenGeometry};
-use zena_core::ingress_guard::{zeroize_string, IngressPiiScrubber, IngressVerdict};
+use zena_core::ingress_guard::{IngressPiiScrubber, IngressVerdict};
 use zena_core::nav_target::SpokenSlotLock;
 use zena_core::prompt::{build_fast_path_prompt, Dialogue, Situation};
 use zena_core::reaction::{Observation, ReactionLevel, ReactionRouter};
@@ -76,7 +72,7 @@ use zena_core::tools::{
 };
 use zena_lexicon::{Action, Express, ExpressLevel, Lexicon, VisionKind};
 use zena_verdict::{
-    AttributionCandidate, CreditTargetKind, FeedbackContext, FeedbackToken, UserPin,
+    AttributionCandidate, CreditTargetKind, FeedbackContext, FeedbackToken, Tier, UserPin,
 };
 
 /// Actions sent from the overlay UI thread back to the pipeline worker.
@@ -116,8 +112,11 @@ pub enum OverlayAction {
 pub enum AvatarCmd {
     /// Lv1: look toward an event, no speech.
     Gaze(GazeTarget),
-    /// 0 ms immediate pre-think pose while the 600 ms RAG race runs (CR-05).
-    PreThink { epoch: u64 },
+    /// 0 ms immediate pre-think pose when an interactive question arrives (CR-05).
+    PreThink {
+        #[cfg_attr(not(test), allow(dead_code))]
+        epoch: u64,
+    },
     /// Lv2/Lv3: a whole reaction — expression with optional speech and its viseme timeline (replaces what Zena was
     /// saying).
     Act {
@@ -835,24 +834,22 @@ pub fn run(
                     bottom: (h * 4) as i32,
                 };
                 if let Some(fg) = foreground_window() {
-                    let fg_cc = envelope::normalize_cc(&fg.app_uri())
+                    let fg_exe = fg.exe_name.as_deref().unwrap_or_default();
+                    let fg_cc = fg
+                        .app_uri()
+                        .as_deref()
+                        .and_then(|u| envelope::normalize_cc(u).ok())
                         .map(|c| c.cc)
-                        .unwrap_or_else(|_| normalize_cc(&fg.exe));
-                    let route_or_title = format!("{}|{}", fg.exe, fg.title);
-                    active_surface = SurfaceSignature::new(fg.pid as isize, &route_or_title);
-                    if is_browser_exe(&fg.exe) {
+                        .unwrap_or_else(|| normalize_cc(fg_exe));
+                    let route_or_title = format!("{fg_exe}|{}", fg.title);
+                    active_surface = SurfaceSignature::new(fg.hwnd, &route_or_title);
+                    if is_browser_exe(fg_exe) {
                         if let Some(worker) = &browser_worker {
                             if now.saturating_sub(last_uia_scan_ms) >= 1_000 {
                                 last_uia_scan_ms = now;
-                                // Pass visible hwnd when available
-                                let fg_hwnd = visible_windows_intersecting(monitor)
-                                    .into_iter()
-                                    .find(|e| e.info.pid == fg.pid)
-                                    .map(|e| e.hwnd)
-                                    .unwrap_or(fg.pid as isize);
                                 worker.request_scan(ScanRequest {
-                                    hwnd: fg_hwnd,
-                                    exe: fg.exe.clone(),
+                                    hwnd: fg.hwnd,
+                                    exe: fg_exe.to_string(),
                                     title: fg.title.clone(),
                                     now_ms: now_i64,
                                 });
@@ -864,32 +861,23 @@ pub fn run(
                         progress_advanced = true;
                     }
                     in_pay_flow = payment_route(&fg.title);
-                    receipt_hash = receipt_finish_page(&fg.title, None);
+                    receipt_hash = receipt_finish_page(&fg.title);
                 }
 
                 let raw_windows = visible_windows_intersecting(monitor);
                 let filtered_windows = filter_dormant_game_overlays(raw_windows);
                 let surface_verdict = assess_surfaces(&filtered_windows, monitor);
                 let notif_rects: Vec<premium_discount_nav::Rect> = surface_verdict
-                    .notification_zones
+                    .redact_zones
                     .iter()
-                    .filter_map(|r| {
-                        let mw = (monitor.width().max(1)) as f32;
-                        let mh = (monitor.height().max(1)) as f32;
-                        premium_discount_nav::Rect::new(
-                            (r.left - monitor.left) as f32 / mw,
-                            (r.top - monitor.top) as f32 / mh,
-                            r.width() as f32 / mw,
-                            r.height() as f32 / mh,
-                        )
-                    })
+                    .filter_map(|&(rx, ry, rw, rh)| premium_discount_nav::Rect::new(rx, ry, rw, rh))
                     .collect();
                 let seed_in_title = foreground_window()
                     .is_some_and(|w| detect_seed_phrase_checked(&w.title).is_some());
                 let shield = evaluate_privacy(&PrivacyProbeInput {
                     regions: &[],
-                    os_capture_protected: surface_verdict.capture_protected,
-                    os_overlay_payment_detected: surface_verdict.payment_overlay,
+                    os_capture_protected: surface_verdict.capture_protected(),
+                    os_overlay_payment_detected: surface_verdict.overlay_payment(),
                     os_notification_zones: &notif_rects,
                     vision_privacy_hit,
                     seed_phrase_detected: seed_in_title,
@@ -972,9 +960,7 @@ pub fn run(
                         now_ms: now_i64,
                         active_cc: active_cc.clone(),
                         surface: active_surface,
-                        unoccluded_trigger: Some(
-                            premium_discount_nav::privacy::PrivacyTrigger::VisionPrivacyDomain,
-                        ),
+                        unoccluded_trigger: Some(PrivacyTrigger::VisionPrivacyDomain),
                         in_payment_flow: false,
                         receipt_finish_page_hash: None,
                     };
@@ -1097,12 +1083,11 @@ pub fn run(
         let mut inputs: Vec<RouterInput> = Vec::new();
         let mut allow_lexicon_learn = true;
         for mut raw_text in utterances.try_iter() {
-            match scrubber.inspect(&raw_text) {
-                IngressVerdict::HardBlock { .. } => {
-                    zeroize_string(&mut raw_text);
+            match scrubber.inspect_and_scrub(&mut raw_text) {
+                IngressVerdict::HardBlocked { kind } => {
                     out.send(
                         plain_line_cmd(
-                            IngressPiiScrubber::block_reaction(),
+                            kind.warning_line(),
                             EmotionState::Worried,
                             BodyMotion::HideCrouch,
                             ReactionLevel::Lv2Cached,
@@ -1111,15 +1096,17 @@ pub fn run(
                         &mut proactive,
                     )?;
                 }
-                IngressVerdict::Scrubbed { clean, .. } => {
-                    zeroize_string(&mut raw_text);
-                    allow_lexicon_learn = false;
+                IngressVerdict::Scrubbed {
+                    sanitized_text,
+                    allow_lexicon_learn: allow,
+                } => {
+                    allow_lexicon_learn = allow;
                     // Promote recent ephemeral proactive offer into Dialogue if user responded within 45 s (PF-11).
                     if let Some(promoted) = fatigue.on_user_utterance(&active_cc, now) {
                         dialogue.push_turn(promoted);
                     }
                     inputs.push(RouterInput::Utterance {
-                        text: clean,
+                        text: sanitized_text,
                         t_ms: now,
                     });
                 }
@@ -1186,16 +1173,17 @@ pub fn run(
                     .last()
                     .map(|e| e.record_id.clone())
                     .unwrap_or_else(|| active_cc.clone());
-                let extracted = pd_bridge.verdicts.apply_spoken_feedback(
+                if let Some(extracted) = pd_bridge.verdicts.apply_spoken_feedback(
                     &target_id,
                     &fb.utterance,
                     &toks,
                     &fb_ctx,
                     1.0,
                     wall_ms,
-                );
-                if extracted.shield_defeat_outcome {
-                    defeat_shielded_until_ms = now + 15_000;
+                ) {
+                    if extracted.shield_defeat_outcome {
+                        defeat_shielded_until_ms = now + 15_000;
+                    }
                 }
             }
         }
@@ -1815,6 +1803,7 @@ mod tests {
     use crate::llm::{LlmBackend, OnDone, TemplateBackend};
     use std::sync::mpsc::channel;
     use std::time::Duration;
+    use zena_core::ingress_guard::SecretKind;
     use zena_core::tools::{AssetAction, AvatarTrack, BodyMotion, EmotionState};
 
     #[test]
@@ -2178,7 +2167,7 @@ mod tests {
                 if args
                     .speech_text
                     .as_deref()
-                    .is_some_and(|s| s == IngressPiiScrubber::block_reaction())
+                    .is_some_and(|s| s == SecretKind::WalletSeedPhrase.warning_line())
                 {
                     got_block_reaction = true;
                 }
