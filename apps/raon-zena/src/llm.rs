@@ -219,6 +219,7 @@ pub struct LlmWorker {
 
 impl LlmWorker {
     /// A backend that stays loaded.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(backend: Box<dyn LlmBackend>, handler: impl JobHandler) -> Self {
         Self::spawn_with_epoch(backend, handler, Arc::new(AtomicU64::new(0)))
     }
