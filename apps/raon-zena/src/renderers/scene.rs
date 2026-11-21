@@ -81,8 +81,7 @@ pub struct EmoteShow {
 
 use crate::browser_uia::NavBadge;
 use crate::pd_bridge::DrawerItem;
-use premium_discount_verdict::Tier;
-use zena_verdict::UserPin;
+use zena_verdict::{Tier, UserPin};
 
 /// Clickable `[▲]` / `[▼]` hit regions for one Stage 2 drawer row (window pixel coordinates).
 #[derive(Debug, Clone)]

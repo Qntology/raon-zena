@@ -9,7 +9,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use zena_core::window::{Hotkey, WindowState};
+use zena_core::window::Hotkey;
 
 const HOTKEY_DRAWER_ID: i32 = 100;
 
@@ -23,10 +23,6 @@ pub enum HotkeyEvent {
 
 pub fn hwnd_from_raw(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
-}
-
-pub fn apply_style(hwnd: HWND, st: &WindowState) {
-    apply_style_ex(hwnd, st.ex_style(), st.topmost);
 }
 
 /// Applies an arbitrary computed extended window style (e.g. `PrivacyEtiquette::ex_style` or
