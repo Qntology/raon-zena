@@ -27,8 +27,14 @@ pub const MAX_PITCH: f32 = 25.0;
 /// Gaze from the avatar's head toward an event given in player-centred polar coordinates.
 pub fn look_at_event(screen: &ScreenGeometry, place: &AvatarPlacement, target: Polar) -> LookAt {
     let (tx, ty) = screen.from_polar(target);
-    let dx = tx - place.head_x;
-    let dy = place.head_y - ty;
+    look_at_point(place, tx, ty)
+}
+
+/// Gaze from the avatar's head toward a desktop point `(x, y)` in px (y down), e.g. a numbered target inside
+/// another app's window (`nav_target::NavTargetProjector`).
+pub fn look_at_point(place: &AvatarPlacement, x: f32, y: f32) -> LookAt {
+    let dx = x - place.head_x;
+    let dy = place.head_y - y;
     LookAt {
         yaw_deg: dx.atan2(place.viewer_depth_px).to_degrees().clamp(-MAX_YAW, MAX_YAW),
         pitch_deg: dy.atan2(place.viewer_depth_px).to_degrees().clamp(-MAX_PITCH, MAX_PITCH),

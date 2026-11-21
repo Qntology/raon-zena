@@ -1,14 +1,16 @@
 [package]
 name = "zena-verdict"
-description = "PD-Verdict (premium / discount, 추천 / 비추천) for Raon Zena's local recommendations: premium-discount-verdict re-exported, plus Zena's spoken feedback and how she talks about verdicts"
+description = "PD-Verdict (premium / discount, 추천 / 비추천) for Raon Zena's local recommendations: premium-discount-verdict re-exported, plus Zena's spoken feedback, credit attribution and how she talks about verdicts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 premium-discount-verdict.workspace = true
+# Credit attribution (`credit`): double centering, tie shapes and the confusion ledger (ScopeStat) are SDS's.
+premium-discount-sds.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
-serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

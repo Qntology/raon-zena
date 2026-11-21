@@ -1,8 +1,19 @@
 //! Play-session state for the character chat: what the screen has shown and for how long, win / loss streaks,
 //! how close Zena and the player are, how tense the moment is — summarised into [`SessionContext`] for Lv3
-//! prompts — and when Zena should speak up on her own ([`ProactiveTimer`]).
+//! prompts — and when Zena should speak up on her own ([`ProactiveTimer`], gated by [`InterruptSignals`]).
+//!
+//! The proactive-coaching state machines (interrupt gates, the pending coach hook, refusal fatigue, ephemeral
+//! offers) live in [`crate::coach`] and the 5-minute exposure ledger in [`crate::exposure`]; both are re-exported
+//! here.
 
 use crate::prompt::SessionContext;
+
+pub use crate::coach::{
+    interrupt_gate, route_proactive, AcceptedOffer, CachedCoachLine, CoachDeliveryMode, CoachEvidence, CoachingFatigueController,
+    EphemeralOffer, FatigueState, GateVerdict, HoldReason, InterruptSignals, PendingCoach, PendingCoachHook, ProactiveRoute, RouteCancel,
+    SpeechPriority,
+};
+pub use crate::exposure::{ExposedRecord, ExposureLedger, ExposureRole};
 
 /// Collects session signals; everything decays or resets on its own, nothing is stored.
 #[derive(Debug, Clone)]
@@ -84,13 +95,13 @@ impl SessionTracker {
     pub fn snapshot(&mut self, now_ms: u64) -> SessionContext {
         self.decay(now_ms);
         SessionContext {
-            verdicts: Vec::new(),
             scene: self.scene.as_ref().map(|(_, s, _)| s.clone()),
             scene_secs: self.scene_ms(now_ms) / 1000,
             defeat_streak: self.defeat_streak,
             victory_streak: self.victory_streak,
             affinity: self.affinity,
             tension: self.tension,
+            ..Default::default()
         }
     }
 }
@@ -159,6 +170,13 @@ impl ProactiveTimer {
         self.last_activity = now_ms;
         Some(kind)
     }
+
+    /// [`ProactiveTimer::due`] with the interrupt gates in place of the single `quiet` flag: no unprompted line
+    /// while the screen is private or the avatar hidden, the player is typing / dragging / talking, a fight is
+    /// tense, or Zena's speech channel is busy.
+    pub fn due_gated(&mut self, now_ms: u64, scene_ms: u64, sig: &InterruptSignals) -> Option<Proactive> {
+        self.due(now_ms, scene_ms, sig.blocks_proactive())
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +216,24 @@ mod tests {
         assert_eq!(p.due(300_000, 60 * 60_000, false), Some(Proactive::Break));
         assert_eq!(p.due(500_000, 70 * 60_000, false), Some(Proactive::Chatter), "one break per period");
         assert_eq!(ProactiveTimer::new(0).due(10_000_000, 0, false), None, "disabled");
+    }
+
+    #[test]
+    fn gated_chatter_waits_for_every_gate_to_open() {
+        let mut p = ProactiveTimer::new(60_000);
+        let mut sig = InterruptSignals {
+            now_ms: 61_000,
+            user_composing: true,
+            ..Default::default()
+        };
+        assert_eq!(p.due_gated(61_000, 0, &sig), None, "typing");
+        sig.user_composing = false;
+        sig.high_tension_combat = true;
+        assert_eq!(p.due_gated(61_000, 0, &sig), None, "tense fight");
+        sig.high_tension_combat = false;
+        sig.speech_channel_busy = true;
+        assert_eq!(p.due_gated(61_000, 0, &sig), None, "Zena is talking");
+        sig.speech_channel_busy = false;
+        assert_eq!(p.due_gated(61_000, 0, &sig), Some(Proactive::Chatter));
     }
 }

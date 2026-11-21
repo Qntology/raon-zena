@@ -18,6 +18,12 @@
 //! and never form a domain. `vision` nodes (noto-sandbox `world_lexicon.json` style) carry English prompts for the
 //! SigLIP2 text tower and `link` to the text node whose expression Zena plays when the screen shows them;
 //! `vision_prompting` holds the prompt-ensembling templates and the background phrases.
+//!
+//! `feedback_rules` (reserved, optional) extends the pragmatic vocabulary of `zena_verdict::feedback` (an object of
+//! phrase lists: `recommend`, `not_recommend`, `request`, `retraction`, `self_blame`, …; see
+//! `zena_verdict::FeedbackLexicon`). It is no group of nodes: it travels inside [`Lexicon::meta`] (so the LanceDB
+//! store, which keeps `meta`, keeps it too), [`Lexicon::feedback_rules`] reads it, and [`Lexicon::to_json`] writes it
+//! back at the top level.
 
 use crate::phrase::{join_phrases, split_phrase_list, weighted_phrases, Phrase};
 use anyhow::{anyhow, bail, Context, Result};
@@ -29,7 +35,9 @@ use zena_core::tools::{BodyMotion, CharacterEmote, EmotionState, SystemCommand, 
 /// The bundled dictionary (`data/zena_lexicon.json`).
 pub const BUNDLED_JSON: &str = include_str!("../../../data/zena_lexicon.json");
 
-const RESERVED: &[&str] = &["version", "meta", "vision", "vision_prompting"];
+const RESERVED: &[&str] = &["version", "meta", "vision", "vision_prompting", FEEDBACK_RULES];
+/// The reserved key of the pragmatic feedback vocabulary (see the module docs).
+pub const FEEDBACK_RULES: &str = "feedback_rules";
 pub const FUNCTION_GROUP: &str = "function";
 pub const PROACTIVE_GROUP: &str = "proactive";
 
@@ -433,15 +441,33 @@ impl Lexicon {
             },
             None => VisionPrompting::default(),
         };
+        let mut meta = obj.get("meta").cloned().unwrap_or(Value::Null);
+        if let Some(rules) = obj.get(FEEDBACK_RULES) {
+            if !rules.is_object() {
+                bail!("{FEEDBACK_RULES} must be an object of phrase lists");
+            }
+            if meta.is_null() {
+                meta = Value::Object(Map::new());
+            }
+            let Value::Object(m) = &mut meta else {
+                bail!("meta must be an object to carry {FEEDBACK_RULES}");
+            };
+            m.insert(FEEDBACK_RULES.into(), rules.clone());
+        }
         let lex = Lexicon {
             version: obj.get("version").and_then(Value::as_u64).unwrap_or(1),
-            meta: obj.get("meta").cloned().unwrap_or(Value::Null),
+            meta,
             nodes,
             vision,
             prompting,
         };
         lex.validate()?;
         Ok(lex)
+    }
+
+    /// The `feedback_rules` section (phrase lists for `zena_verdict::FeedbackLexicon`), if the dictionary has one.
+    pub fn feedback_rules(&self) -> Option<&Value> {
+        self.meta.get(FEEDBACK_RULES)
     }
 
     /// The dictionary shipped in the binary.
@@ -571,6 +597,22 @@ impl Lexicon {
         if let Some(t) = self.prompting.templates.iter().find(|t| !t.contains("{}")) {
             problems.push(format!("vision_prompting template '{t}' has no {{}}"));
         }
+        match self.feedback_rules() {
+            None => {}
+            Some(Value::Object(rules)) => {
+                for (k, v) in rules {
+                    let phrases = match v {
+                        Value::String(_) => true,
+                        Value::Array(a) => a.iter().all(Value::is_string),
+                        _ => false,
+                    };
+                    if !phrases {
+                        problems.push(format!("{FEEDBACK_RULES}.{k} must be a phrase list"));
+                    }
+                }
+            }
+            Some(_) => problems.push(format!("{FEEDBACK_RULES} must be an object of phrase lists")),
+        }
         if !problems.is_empty() {
             bail!("invalid lexicon:\n  {}", problems.join("\n  "));
         }
@@ -581,8 +623,15 @@ impl Lexicon {
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
         root.insert("version".into(), json!(self.version));
-        if !self.meta.is_null() {
-            root.insert("meta".into(), self.meta.clone());
+        // `feedback_rules` rides in `meta` in memory and goes back to the top level in the file.
+        let mut meta = self.meta.clone();
+        let rules = meta.as_object_mut().and_then(|m| m.remove(FEEDBACK_RULES));
+        let only_rules = rules.is_some() && meta.as_object().is_some_and(|m| m.is_empty());
+        if !meta.is_null() && !only_rules {
+            root.insert("meta".into(), meta);
+        }
+        if let Some(r) = rules {
+            root.insert(FEEDBACK_RULES.into(), r);
         }
         for n in &self.nodes {
             root.entry(n.group.clone()).or_insert_with(|| Value::Object(Map::new()))[&n.name] = node_json(n);
@@ -699,6 +748,37 @@ mod tests {
         assert_eq!(lex.proactive(Some("react.nowhere"), false).unwrap().0, "proactive.idle");
         assert_eq!(lex.proactive(None, false).unwrap().0, "proactive.idle");
         assert!(lex.text_nodes().all(|n| n.group != PROACTIVE_GROUP));
+    }
+
+    #[test]
+    fn feedback_rules_is_reserved_and_carried_in_meta() {
+        let node = r#""e": {"x": {"bias": "a", "express": {"emotion": "JOY", "motion": "NOD", "lines": ["hi"]}}}"#;
+        let raw = format!(
+            r#"{{"version": 3, "meta": {{"note": "x"}}, "feedback_rules": {{"recommend": ["개꿀"], "retraction": "취소, 정정"}}, {node}}}"#
+        );
+        let lex = Lexicon::from_json(&raw).unwrap();
+        assert_eq!(lex.nodes.len(), 1, "feedback_rules is no group of nodes");
+        assert!(lex.nodes.iter().all(|n| n.group != FEEDBACK_RULES));
+        assert_eq!(lex.feedback_rules().unwrap()["recommend"][0], "개꿀");
+        assert_eq!(lex.meta["note"], "x");
+        let out = lex.to_json();
+        assert_eq!(out[FEEDBACK_RULES]["retraction"], "취소, 정정", "written back at the top level");
+        assert!(out["meta"].get(FEEDBACK_RULES).is_none());
+        assert_eq!(Lexicon::from_json(&out.to_string()).unwrap(), lex);
+
+        let bare = Lexicon::from_json(&format!(r#"{{"feedback_rules": {{"recommend": ["굿"]}}, {node}}}"#)).unwrap();
+        assert_eq!(bare.feedback_rules().unwrap()["recommend"][0], "굿");
+        assert!(bare.to_json().get("meta").is_none(), "no meta of its own");
+        assert_eq!(Lexicon::from_json(&bare.to_json().to_string()).unwrap(), bare);
+
+        assert!(Lexicon::from_json(r#"{"feedback_rules": ["x"]}"#).is_err());
+        let bad_list = Lexicon::from_json(r#"{"feedback_rules": {"recommend": 3}}"#).unwrap_err();
+        assert!(
+            format!("{bad_list:#}").contains("feedback_rules.recommend must be a phrase list"),
+            "{bad_list:#}"
+        );
+        assert!(Lexicon::from_json(r#"{"meta": "text", "feedback_rules": {}}"#).is_err());
+        assert!(Lexicon::bundled().feedback_rules().is_none());
     }
 
     #[test]
