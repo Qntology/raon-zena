@@ -18,7 +18,7 @@ pub mod domain;
 pub mod router;
 
 pub use domain::{DomainBank, Hit, LexiconBank};
-pub use router::{Caught, NlpNmsRouter, RouterInput, RouterOutput};
+pub use router::{Caught, FeedbackCatch, FeedbackSpan, FeedbackWord, NlpNmsRouter, RouterInput, RouterOutput};
 
 /// Where the granite model is installed (tests and diagnostics).
 #[cfg(feature = "neural")]

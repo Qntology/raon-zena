@@ -3,11 +3,16 @@
 //! The user's words are caught into the expression domains of the word dictionary (`zena-lexicon`); each kept
 //! domain becomes what its node says: a system command, a dictionary expression Zena plays at once (no LLM), or a
 //! request for Raon-1-nano.
+//!
+//! A negated span is held back ("앱 끄지 마" runs nothing), except for feedback: a `feedback.*` span is kept with its
+//! negation count in a channel of its own ([`Catch::feedback`], [`RouterOutput::feedback`]), because a negated
+//! recommendation is the opposite recommendation ("추천 안 해" = −1, "나쁘지 않았어" = +1 weak) and must reach
+//! `zena_verdict::feedback` instead of vanishing.
 
 use crate::analyze::{Analyzer, NoAnalyzer, RuleAnalyzer};
 use crate::domain::{DomainBank, Hit, LexiconBank};
 use crate::embed::{HashedNgramEmbedder, SharedEmbedder, TextEmbedder};
-use crate::normalize::{normalize, Normalized};
+use crate::normalize::{normalize, Normalized, Role, Word};
 use crate::semantic::{Decision, Item, SemanticNms, Source};
 use crate::span::{span_assign, span_nms, AssignConfig, SpanHit};
 use crate::spatial::{select_target, BoxCand};
@@ -19,6 +24,200 @@ use zena_lexicon::{Action, Lexicon};
 
 /// The dictionary node an utterance is answered with when Zena is addressed but no domain is caught.
 pub const SMALL_TALK: &str = "chitchat.small_talk";
+
+/// Dictionary keys of feedback about a recommendation (`feedback.recommend`, `feedback.not_recommend`): negated,
+/// they are the opposite feedback, not a command to hold back.
+pub const FEEDBACK_PREFIX: &str = "feedback.";
+
+/// A `feedback.*` span of one utterance, kept whether or not it is negated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackSpan {
+    /// Dictionary key (`feedback.recommend` …).
+    pub key: String,
+    /// The words that named the domain, and their range in the utterance's words.
+    pub span: String,
+    pub start: usize,
+    pub end: usize,
+    pub score: f32,
+    pub hit: Hit,
+    /// Negators acting on the span's predicate, saturating at 2: the analyzer's negations plus the long form
+    /// "-지 않- / -지 못하-", the copula "아니-" and "추천 못해", which the rule analyzer does not tag. An odd count
+    /// flips the feedback ([`FeedbackSpan::negated`]); two cancel into a hedged feedback.
+    pub negation_count: u8,
+    /// A request auxiliary or request ending follows ("추천해 **줘**"): probably a request, not feedback.
+    pub request: bool,
+}
+
+impl FeedbackSpan {
+    /// An odd number of negators: the feedback flips its sign.
+    pub fn negated(&self) -> bool {
+        self.negation_count % 2 == 1
+    }
+}
+
+/// One word of a feedback utterance with the flags `zena_verdict::feedback::FeedbackToken` takes (field for field;
+/// this crate does not depend on zena-verdict).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackWord {
+    pub surface: String,
+    pub lemma: String,
+    pub is_auxiliary_request: bool,
+    pub is_negation: bool,
+    pub negated_in_clause: bool,
+    pub is_subject_or_topic: bool,
+}
+
+/// The feedback of one utterance ([`RouterOutput::feedback`]): hand `utterance`, `words` and the context to
+/// `zena_verdict::feedback::extract_pragmatic_feedback`, which decides the vote (requests, questions, adversative
+/// clauses, retractions, sarcasm).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackCatch {
+    /// The utterance as said (punctuation kept: "?" makes a question).
+    pub utterance: String,
+    pub t_ms: u64,
+    pub words: Vec<FeedbackWord>,
+    pub spans: Vec<FeedbackSpan>,
+}
+
+/// Negating adverbs (the rule analyzer tags them too; listed for the v1 router, which runs no analyzer).
+const NEG_ADVERBS: &[&str] = &[
+    "안", "못", "not", "never", "dont", "didnt", "isnt", "wasnt", "doesnt", "cant", "wont",
+];
+/// The long-form negation after a "-지" word ("나쁘지 않았어", "추천하지 못해").
+const LONG_NEGATION: &[&str] = &["않", "못하", "못해", "못했", "못한", "못함"];
+const FUSED_LONG_NEGATION: &[&str] = &["지않", "지못하", "지못해", "지못했", "지못한"];
+/// The copula negation ("추천은 아니야", "나쁜 건 아니야").
+const COPULA_NEGATION: &[&str] = &["아니", "아냐", "아닌", "아님"];
+/// A negating adverb fused to the light verb after a noun ("추천 못해", "추천 안함").
+const FUSED_NEGATED_LIGHT_VERBS: &[&str] = &[
+    "못하", "못해", "못했", "못한", "못함", "안하", "안해", "안했", "안한", "안함", "안돼", "안됐", "안되", "안된",
+];
+const LIGHT_VERBS: &[&str] = &["하", "해", "했", "한", "할", "합", "되", "돼", "됐", "된", "될"];
+const NOMINALIZERS: &[&str] = &["건", "거", "게", "것", "것은", "것도", "거는"];
+/// Request auxiliaries after the evaluated word, and request endings fused to it.
+const REQUEST_WORDS: &[&str] = &[
+    "줘",
+    "줘요",
+    "주세요",
+    "줄래",
+    "줄래요",
+    "주라",
+    "달라",
+    "봐",
+    "봐줘",
+    "볼래",
+    "볼래요",
+    "please",
+];
+const REQUEST_ENDINGS: &[&str] = &[
+    "해줘",
+    "해줘요",
+    "해주세요",
+    "해줄래",
+    "해줄래요",
+    "해달라",
+    "해봐",
+    "해볼래",
+    "해주라",
+];
+
+/// English contractions split by normalisation ("don't" → "don" "t").
+const CONTRACTED: &[&str] = &[
+    "don", "didn", "doesn", "isn", "wasn", "aren", "weren", "can", "won", "couldn", "wouldn", "shouldn",
+];
+
+fn starts_any(s: &str, list: &[&str]) -> bool {
+    list.iter().any(|p| s.starts_with(p))
+}
+
+/// A negating adverb before the predicate: "안", "못", "not", "never", "don't" (normalised to "don t").
+fn negating_adverb(words: &[Word], i: usize) -> bool {
+    let s = words[i].surface.as_str();
+    NEG_ADVERBS.contains(&s) || (s == "t" && i > 0 && CONTRACTED.contains(&words[i - 1].surface.as_str()))
+}
+
+/// Whether `words[i]` negates: the analyzer's negation role, a negating adverb, the long form after a "-지" word,
+/// the copula negation, or a negation fused into the word.
+fn is_negator(words: &[Word], i: usize) -> bool {
+    let s = words[i].surface.as_str();
+    words[i].role == Role::Negation
+        || negating_adverb(words, i)
+        || (i > 0 && words[i - 1].surface.ends_with('지') && starts_any(s, LONG_NEGATION))
+        || (i > 0 && (starts_any(s, COPULA_NEGATION) || starts_any(s, FUSED_NEGATED_LIGHT_VERBS)))
+        || (s.chars().count() > 2 && FUSED_LONG_NEGATION.iter().any(|t| s.contains(t)))
+}
+
+/// A connective that ends a clause ("했는데", "와서", "가면").
+fn ends_clause(s: &str) -> bool {
+    s.chars().count() >= 2 && (s.ends_with('고') || s.ends_with('서') || s.ends_with("는데") || s.ends_with("지만") || s.ends_with('면'))
+}
+
+/// Negators acting on the predicate of `words[start..end]`, saturating at 2: inside the span, a negating adverb just
+/// before it, and after it through light verbs and nominalisers ("추천 안 해", "나쁘지 않았어", "추천은 하지 않아",
+/// "나쁜 건 아니야"); the analyzer's own scope counts when nothing else did.
+fn feedback_negations(words: &[Word], start: usize, end: usize) -> u8 {
+    let mut n = (start..end).filter(|&i| is_negator(words, i)).count();
+    if start > 0 && negating_adverb(words, start - 1) {
+        n += 1;
+    }
+    let mut j = end;
+    while j < words.len() {
+        let s = words[j].surface.as_str();
+        if negating_adverb(words, j) {
+            // "추천 안 해" negates the light verb of 추천하다; "별로 안 좋아" negates 좋다, not the span.
+            if words.get(j + 1).is_some_and(|w| starts_any(&w.surface, LIGHT_VERBS)) {
+                n += 1;
+                j += 2;
+                continue;
+            }
+            break;
+        }
+        if is_negator(words, j) {
+            n += 1;
+        } else if !(starts_any(s, LIGHT_VERBS) || NOMINALIZERS.contains(&s)) {
+            break;
+        }
+        j += 1;
+        if ends_clause(s) {
+            break;
+        }
+    }
+    if n == 0 && words[start..end].iter().any(|w| w.negated) {
+        n = 1;
+    }
+    n.min(2) as u8
+}
+
+/// A request ending on the span's last word ("추천해줘") or a request word later in the utterance ("추천해 줘").
+fn is_request(words: &[Word], end: usize) -> bool {
+    let last = words[end - 1].surface.as_str();
+    let fused = last.chars().count() > 2 && REQUEST_ENDINGS.iter().any(|e| last.ends_with(e));
+    fused
+        || words[end..]
+            .iter()
+            .any(|w| w.role == Role::Auxiliary || REQUEST_WORDS.contains(&w.surface.as_str()) || w.surface.starts_with("알려"))
+}
+
+/// The words of an utterance as [`FeedbackWord`]s.
+fn feedback_words(words: &[Word]) -> Vec<FeedbackWord> {
+    (0..words.len())
+        .map(|i| {
+            let w = &words[i];
+            let negation = is_negator(words, i);
+            // The "-지" word before a long-form negation, or the word before "아니-", is negated too.
+            let negated_by_next = i + 1 < words.len() && is_negator(words, i + 1) && !negating_adverb(words, i + 1);
+            let topic = w.lemma != w.surface && ["은", "는", "이", "가"].iter().any(|j| w.surface.ends_with(j));
+            FeedbackWord {
+                surface: w.surface.clone(),
+                lemma: w.lemma.clone(),
+                is_auxiliary_request: w.role == Role::Auxiliary || (i > 0 && REQUEST_WORDS.contains(&w.surface.as_str())),
+                is_negation: negation,
+                negated_in_clause: w.negated || negation || negated_by_next,
+                is_subject_or_topic: matches!(w.deprel.as_str(), "nsubj" | "nsubj:pass" | "csubj" | "dislocated") || topic,
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub enum RouterInput {
@@ -60,6 +259,8 @@ pub struct RouterOutput {
     /// Alerts that survived NMS: (label, polar, score).
     pub events: Vec<(String, Polar, f32)>,
     pub decisions: Vec<Decision>,
+    /// Utterances with `feedback.*` spans, negated ones included (no temporal NMS: each is a vote to judge).
+    pub feedback: Vec<FeedbackCatch>,
 }
 
 /// How spans become domains.
@@ -173,10 +374,13 @@ pub const GRANITE_BASE_TAU: f32 = 0.85;
 #[derive(Debug, Clone, Default)]
 pub struct Catch {
     pub normalized: Option<Normalized>,
-    /// Kept spans: (bank index, span text, score, hit).
+    /// Kept spans: (bank index, span text, score, hit). A feedback span is here only when it is neither negated nor
+    /// followed by a request (it then acts as its node says, e.g. Zena's thanks).
     pub hits: Vec<(usize, String, f32, Hit)>,
-    /// Spans dropped because they were negated ("앱 끄지 마").
+    /// Spans dropped because they were negated ("앱 끄지 마"); never a feedback span.
     pub negated: Vec<(usize, String)>,
+    /// Every `feedback.*` span, negated or not.
+    pub feedback: Vec<FeedbackSpan>,
 }
 
 pub struct NlpNmsRouter {
@@ -286,13 +490,30 @@ impl NlpNmsRouter {
         let mut out = Catch::default();
         for h in spans {
             let negated = n.words[h.start..h.end].iter().any(|w| w.negated);
-            if negated {
+            let key = &self.bank.entry(h.index).key;
+            if key.starts_with(FEEDBACK_PREFIX) {
+                let negation_count = feedback_negations(&n.words, h.start, h.end);
+                let request = is_request(&n.words, h.end);
+                if negation_count == 0 && !request {
+                    out.hits.push((h.index, h.text.clone(), h.score, h.hit));
+                }
+                out.feedback.push(FeedbackSpan {
+                    key: key.clone(),
+                    span: h.text,
+                    start: h.start,
+                    end: h.end,
+                    score: h.score,
+                    hit: h.hit,
+                    negation_count,
+                    request,
+                });
+            } else if negated {
                 out.negated.push((h.index, h.text));
             } else {
                 out.hits.push((h.index, h.text, h.score, h.hit));
             }
         }
-        if out.hits.is_empty() && out.negated.is_empty() && n.addressed {
+        if out.hits.is_empty() && out.negated.is_empty() && out.feedback.is_empty() && n.addressed {
             if let Some(i) = self.bank.index_of(SMALL_TALK) {
                 out.hits.push((i, n.text.clone(), 0.5, Hit::Vector));
             }
@@ -304,6 +525,7 @@ impl NlpNmsRouter {
     pub fn route(&mut self, inputs: Vec<RouterInput>, now_ms: u64) -> RouterOutput {
         let mut items = Vec::new();
         let mut caught: HashMap<u64, Caught> = HashMap::new();
+        let mut feedback = Vec::new();
         for inp in inputs {
             match inp {
                 RouterInput::Utterance { text, t_ms } => {
@@ -311,6 +533,14 @@ impl NlpNmsRouter {
                     let Some(n) = c.normalized else { continue };
                     for (i, span) in &c.negated {
                         eprintln!("[nlp] negated, not acted on: {} ('{span}')", self.bank.entry(*i).key);
+                    }
+                    if !c.feedback.is_empty() {
+                        feedback.push(FeedbackCatch {
+                            utterance: text.clone(),
+                            t_ms,
+                            words: feedback_words(&n.words),
+                            spans: c.feedback,
+                        });
                     }
                     let hits = c.hits;
                     let full_vec = self.bank.embedder.embed(&n.text);
@@ -409,6 +639,7 @@ impl NlpNmsRouter {
         out.expressions.sort_by(|a, b| b.score.total_cmp(&a.score));
         out.queries.sort_by(|a, b| b.score.total_cmp(&a.score));
         out.decisions = decisions;
+        out.feedback = feedback;
         out
     }
 
@@ -696,6 +927,133 @@ mod tests {
             out.expressions.first().and_then(|c| c.action.express()).map(|x| x.motion),
             Some(BodyMotion::WaveGoodbye)
         );
+    }
+
+    /// The bundled dictionary plus feedback nodes (it has none yet).
+    fn feedback_lexicon() -> Lexicon {
+        let mut root: serde_json::Value = serde_json::from_str(zena_lexicon::model::BUNDLED_JSON).unwrap();
+        root["feedback"] = serde_json::json!({
+            "recommend": {
+                "semantic": "The user recommends what Zena suggested.",
+                "exact_match": ["추천", "강추"],
+                "express": {"emotion": "JOY", "motion": "NOD", "lines": ["기억해 둘게!"]}
+            },
+            "not_recommend": {
+                "semantic": "The user advises against what Zena suggested.",
+                "exact_match": ["비추", "별로", "나쁘", "나쁜"],
+                "express": {"emotion": "WORRIED", "motion": "NOD", "lines": ["다음엔 다른 길로 가 보자."]}
+            }
+        });
+        Lexicon::from_json(&root.to_string()).unwrap()
+    }
+
+    #[test]
+    fn fc01_negated_feedback_is_kept_in_its_own_channel() {
+        let lex = feedback_lexicon();
+        for models in [Models::v1(), Models::rules()] {
+            let label = models.label.clone();
+            let r = NlpNmsRouter::with_models(&lex, models);
+            let feedback_hit = |c: &Catch| c.hits.iter().any(|h| r.bank.entry(h.0).key.starts_with(FEEDBACK_PREFIX));
+            let span = |c: &Catch, key: &str| {
+                c.feedback
+                    .iter()
+                    .find(|f| f.key == key)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{label}: no {key} in {:?}", c.feedback))
+            };
+
+            // The long form "-지 않-" (untagged by the pinned rule analyzer): kept, one negator → a weak recommendation.
+            let c = r.catch("우회하긴 했는데 나쁘지 않았어");
+            let f = span(&c, "feedback.not_recommend");
+            assert_eq!(
+                (f.span.as_str(), f.negation_count, f.negated(), f.request),
+                ("나쁘지", 1, true, false),
+                "{label}"
+            );
+            assert!(c.negated.is_empty(), "{label}: not dropped as a negated command");
+            assert!(!feedback_hit(&c), "{label}: a negated feedback does not act as its plain node");
+
+            let c = r.catch("그거 추천 안 해");
+            assert_eq!(span(&c, "feedback.recommend").negation_count, 1, "{label}: 추천 + 안 해");
+            assert!(c.negated.is_empty() && !feedback_hit(&c), "{label}");
+            assert_eq!(
+                span(&r.catch("추천은 하지 않아"), "feedback.recommend").negation_count,
+                1,
+                "{label}"
+            );
+            assert_eq!(
+                span(&r.catch("나쁜 건 아니야"), "feedback.not_recommend").negation_count,
+                1,
+                "{label}"
+            );
+            assert_eq!(
+                span(&r.catch("별로 안 좋아"), "feedback.not_recommend").negation_count,
+                0,
+                "{label}: 안 negates 좋아"
+            );
+
+            // A request is kept for the extractor but not acted on as feedback.
+            let c = r.catch("다른 공략 추천해 줘");
+            let f = span(&c, "feedback.recommend");
+            assert_eq!((f.request, f.negation_count), (true, 0), "{label}");
+            assert!(!feedback_hit(&c), "{label}");
+
+            // Plain feedback acts as its node says and is reported too.
+            let c = r.catch("이거 추천");
+            assert!(feedback_hit(&c), "{label}");
+            assert_eq!(span(&c, "feedback.recommend").negation_count, 0, "{label}");
+        }
+        // Commands are held back as before (the rule analyzer marks the prohibition).
+        let r = NlpNmsRouter::with_models(&lex, Models::rules());
+        let c = r.catch("앱 끄지 마");
+        assert!(c.feedback.is_empty() && c.hits.is_empty(), "{:?}", c.hits);
+    }
+
+    #[test]
+    fn route_passes_feedback_through_with_its_words() {
+        let mut r = NlpNmsRouter::with_models(&feedback_lexicon(), Models::rules());
+        let text = "제나야 우회하긴 했는데 나쁘지 않았어";
+        let out = r.route(
+            vec![RouterInput::Utterance {
+                text: text.into(),
+                t_ms: 5,
+            }],
+            5,
+        );
+        assert_eq!(out.feedback.len(), 1, "{:?}", out.feedback);
+        let fc = &out.feedback[0];
+        assert_eq!((fc.utterance.as_str(), fc.t_ms), (text, 5));
+        let surfaces: Vec<&str> = fc.words.iter().map(|w| w.surface.as_str()).collect();
+        assert_eq!(surfaces, ["우회하긴", "했는데", "나쁘지", "않았어"]);
+        let w = |s: &str| fc.words.iter().find(|w| w.surface == s).unwrap();
+        assert!(w("않았어").is_negation && w("나쁘지").negated_in_clause);
+        assert!(!w("우회하긴").negated_in_clause && !w("했는데").is_negation);
+        assert!(
+            out.queries.iter().all(|q| q.key != SMALL_TALK),
+            "addressed feedback is no small talk"
+        );
+        assert!(
+            out.expressions.iter().all(|e| !e.key.starts_with(FEEDBACK_PREFIX)),
+            "no expression for a negated span"
+        );
+
+        let out = r.route(
+            vec![RouterInput::Utterance {
+                text: "이거 추천".into(),
+                t_ms: 10_000,
+            }],
+            10_000,
+        );
+        assert!(
+            out.expressions.iter().any(|e| e.key == "feedback.recommend"),
+            "{:?}",
+            out.expressions
+        );
+        assert_eq!(out.feedback[0].spans[0].negation_count, 0);
+        let topic = feedback_words(&normalize("공략은 맞는데").words);
+        assert!(topic[0].is_subject_or_topic && !topic[1].is_subject_or_topic);
+        let req = feedback_words(&normalize("추천해 줘").words);
+        assert!(req[1].is_auxiliary_request);
     }
 
     #[test]

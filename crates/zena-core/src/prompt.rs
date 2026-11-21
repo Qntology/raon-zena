@@ -6,11 +6,26 @@
 //!
 //! Multi-turn memory and the session summary go into the **user** turn ([`Situation::history`],
 //! [`Situation::session`]), never into the system prompt: the backend prefills the system + tools prefix once and
-//! clones its state per request, so that prefix must stay byte-identical for every request.
+//! clones its state per request, so that prefix must stay byte-identical for every request. The same holds for
+//! the per-request coaching slots of [`SessionContext`] — the course, friction, web and analytic briefs
+//! ([`crate::brief`]) and the packed verdict slots ([`crate::claims`]).
 
+use crate::claims::{PackedVerdictSlot, MAX_VERDICT_SLOTS};
 use crate::geometry::{FlowDirection, Polar};
 use crate::tools::tool_definitions;
 use std::collections::VecDeque;
+
+pub use crate::brief::{
+    is_commit_label, is_unavailable_label, prompt_label, split_phrase, AnalyticBrief, CourseBrief, CourseSync, FrictionBrief, NextStepHint,
+    PublicRef, SlotDispatch, WebChoice, WebCoachBrief, ANALYTIC_ANSWER_MAX_CHARS, MIN_FUNNEL_SESSIONS, SPLIT_DEADBAND_MS,
+};
+
+/// Where the dynamic part of every prompt starts: everything before it (and including it) is the cached prefix.
+pub const USER_TURN: &str = "<|im_start|>user\n";
+/// The end of every prompt: the user turn closes and the assistant turn opens with an empty think block.
+pub const ASSISTANT_PREFILL: &str = "<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n";
+/// The one scene line while a privacy lock is on and the player asks anyway (BlindAssist).
+pub const BLIND_ASSIST_LINE: &str = "[보안 화면 보호 중 — 화면 픽셀과 입력칸은 보지 않고 질문 텍스트만으로 답함]";
 
 /// One exchange remembered for the next prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +66,11 @@ impl Dialogue {
             capacity,
             max_chars: 60,
         }
+    }
+
+    /// Pushes a whole turn (e.g. a promoted proactive offer, `CoachingFatigueController::on_user_utterance`).
+    pub fn push_turn(&mut self, turn: DialogueTurn) {
+        self.push(turn.user.as_deref(), &turn.zena);
     }
 
     pub fn push(&mut self, user: Option<&str>, zena: &str) {
@@ -99,12 +119,28 @@ pub struct SessionContext {
     /// Recommendations for what is on screen: one line per record (at most 3), each saying the local and the
     /// global verdict side by side (`zena_verdict::Stance::line`). Empty: nothing to recommend.
     pub verdicts: Vec<String>,
+    /// The packed verdict slots (`claims::VerdictSlotPacker`). When present they are the one verdict channel and
+    /// replace the `verdicts` lines (which are rendered under a fixed `[추천]` header).
+    pub verdict_slots: Vec<PackedVerdictSlot>,
+    /// Time-trial ghost splits and the next step (at most two lines).
+    pub course_brief: Option<CourseBrief>,
+    /// The proactive friction tip of an Lv3 coaching call (two lines).
+    pub friction_brief: Option<FrictionBrief>,
+    /// Shopping-page coaching with the CommitGuard.
+    pub web_coach: Option<WebCoachBrief>,
+    /// A site operator's funnel report.
+    pub analytic: Option<AnalyticBrief>,
+    /// A privacy lock is on (BlindAssist): the scene, the verdicts and the screen briefs are left out and
+    /// [`BLIND_ASSIST_LINE`] says that Zena answers from the question alone.
+    pub privacy_locked: bool,
 }
 
 impl SessionContext {
     pub fn render(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(s) = &self.scene {
+        if self.privacy_locked {
+            // Nothing that came from the screen.
+        } else if let Some(s) = &self.scene {
             let m = self.scene_secs / 60;
             parts.push(if m > 0 {
                 format!("화면: {s} ({m}분째)")
@@ -129,12 +165,38 @@ impl SessionContext {
         if self.tension >= 0.5 {
             parts.push("긴장도 높음".into());
         }
-        let mut s = format!("[세션] {}\n", parts.join(" / "));
+        let mut s = String::new();
+        if self.privacy_locked {
+            s.push_str(BLIND_ASSIST_LINE);
+            s.push('\n');
+        }
+        s.push_str(&format!("[세션] {}\n", parts.join(" / ")));
         if let Some(t) = self.tone() {
             s.push_str(&format!("[말투] {t}\n"));
         }
-        for v in self.verdicts.iter().take(3) {
-            s.push_str(&format!("[추천] {v}\n"));
+        let mut lines: Vec<String> = Vec::new();
+        if !self.privacy_locked {
+            if self.verdict_slots.is_empty() {
+                lines.extend(self.verdicts.iter().take(3).map(|v| format!("[추천] {v}")));
+            } else {
+                lines.extend(self.verdict_slots.iter().take(MAX_VERDICT_SLOTS).map(|v| v.line.clone()));
+            }
+            if let Some(b) = &self.course_brief {
+                lines.extend(b.to_prompt_lines().into_iter().take(CourseBrief::MAX_LINES));
+            }
+            if let Some(b) = &self.friction_brief {
+                lines.extend(b.to_prompt_lines());
+            }
+            if let Some(b) = &self.web_coach {
+                lines.extend(b.to_prompt_lines());
+            }
+        }
+        if let Some(b) = &self.analytic {
+            lines.extend(b.to_prompt_lines());
+        }
+        for l in lines {
+            s.push_str(&l);
+            s.push('\n');
         }
         s
     }
@@ -178,6 +240,11 @@ pub struct Situation {
 fn direction_ko(theta: f32) -> &'static str {
     const NAMES: [&str; 8] = ["오른쪽", "오른쪽 위", "위", "왼쪽 위", "왼쪽", "왼쪽 아래", "아래", "오른쪽 아래"];
     NAMES[(((theta + 22.5) % 360.0) / 45.0) as usize % 8]
+}
+
+/// The eight direction words the prompt uses for an azimuth (0° right, 90° up; any angle is normalised).
+pub fn direction_label(theta_deg: f32) -> &'static str {
+    direction_ko(if theta_deg.is_finite() { theta_deg.rem_euclid(360.0) } else { 0.0 })
 }
 
 impl Situation {
@@ -235,8 +302,8 @@ impl Situation {
     }
 }
 
-/// Full prompt string in Raon-1-nano's chat format, ending with the pre-filled empty think block.
-pub fn build_fast_path_prompt(sit: &Situation) -> String {
+/// The cached prefix every prompt starts with: system + tools + persona, up to and including [`USER_TURN`].
+pub fn system_prefix() -> String {
     let mut p = String::from("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
     for t in tool_definitions().as_array().expect("array") {
         p.push('\n');
@@ -244,9 +311,16 @@ pub fn build_fast_path_prompt(sit: &Situation) -> String {
     }
     p.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n");
     p.push_str(SYSTEM_PERSONA);
-    p.push_str("<|im_end|>\n<|im_start|>user\n");
+    p.push_str("<|im_end|>\n");
+    p.push_str(USER_TURN);
+    p
+}
+
+/// Full prompt string in Raon-1-nano's chat format, ending with the pre-filled empty think block.
+pub fn build_fast_path_prompt(sit: &Situation) -> String {
+    let mut p = system_prefix();
     p.push_str(sit.render().trim_end());
-    p.push_str("<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n");
+    p.push_str(ASSISTANT_PREFILL);
     p
 }
 
@@ -323,5 +397,68 @@ mod tests {
         assert!(s.contains("[추천] 공략 3:"));
         assert!(!s.contains("공략 4"), "at most three");
         assert!(!SessionContext::default().render().contains("[추천]"));
+    }
+
+    #[test]
+    fn every_prompt_is_the_cached_prefix_plus_the_user_turn_plus_the_prefill() {
+        let prefix = system_prefix();
+        assert!(prefix.ends_with(USER_TURN));
+        assert_eq!(prefix.matches(SYSTEM_PERSONA).count(), 1);
+        let full = SessionContext {
+            scene: Some("결제 페이지".into()),
+            course_brief: Some(CourseBrief::default()),
+            friction_brief: Some(FrictionBrief {
+                bottleneck_label: None,
+                cause_summary: "입력 재시도 반복".into(),
+                verified_alternative: None,
+                trap_warning: None,
+                delivery: crate::coach::CoachDeliveryMode::Immediate,
+            }),
+            web_coach: Some(WebCoachBrief::default()),
+            analytic: Some(AnalyticBrief::default()),
+            ..Default::default()
+        };
+        for sit in [
+            Situation::default(),
+            Situation {
+                user_query: Some("여기서 뭐 눌러?".into()),
+                session: Some(full),
+                ..Default::default()
+            },
+        ] {
+            let p = build_fast_path_prompt(&sit);
+            assert!(p.starts_with(&prefix) && p.ends_with(ASSISTANT_PREFILL));
+            assert_eq!(p.matches(USER_TURN).count(), 1, "briefs never open another turn");
+        }
+    }
+
+    #[test]
+    fn a_privacy_lock_leaves_out_everything_from_the_screen() {
+        let ctx = SessionContext {
+            scene: Some("은행 로그인".into()),
+            defeat_streak: 1,
+            verdicts: vec!["공략: 모두 추천".into()],
+            course_brief: Some(CourseBrief::default()),
+            web_coach: Some(WebCoachBrief {
+                host: "bank.example.com".into(),
+                ..Default::default()
+            }),
+            privacy_locked: true,
+            ..Default::default()
+        };
+        let s = ctx.render();
+        assert!(s.starts_with(BLIND_ASSIST_LINE), "{s}");
+        assert!(s.contains("연속 패배 1회"));
+        for leaked in ["은행 로그인", "[추천]", "[주행 기록", "bank.example.com"] {
+            assert!(!s.contains(leaked), "{leaked} in {s}");
+        }
+    }
+
+    #[test]
+    fn direction_labels_normalise_any_angle() {
+        assert_eq!(direction_label(-30.0), "오른쪽 아래");
+        assert_eq!(direction_label(720.0 + 90.0), "위");
+        assert_eq!(direction_label(f32::NAN), "오른쪽");
+        assert_eq!(direction_label(180.0), "왼쪽");
     }
 }
