@@ -1,25 +1,35 @@
 //! The periodic screen watcher: every few seconds the pipeline hands it one downscaled frame; it skips the frame when
-//! the screen has not changed, otherwise runs the Raon-VisionEncoder vision tower (full or perforated pass) and scores
-//! the dictionary's screen domains. Only the winning domain's key, its score and one gaze cell leave this thread.
+//! the screen has not changed (checked with `LumaThumb` + `WakeRule` so small corner login modals wake it too),
+//! otherwise runs the Raon-VisionEncoder vision tower via `read_guarded` (`PassGuard` with `EpochWatch` and
+//! `redact_rgb_for_naflex` notification masking) and scores the dictionary's screen domains.
 //!
-//! Privacy: frames live in memory only — never written, never logged — and are zeroed when dropped; the patches are
-//! dropped after the encoder ran; nothing about the pixels is kept but a 32 × 18 luma thumbnail for change detection.
-//! A screen the dictionary marks `privacy` (login, banking, payment, personal chat) gets no comment, and the watcher
-//! stops looking for a while.
+//! Privacy: frames live in memory only — never written, never logged — and are zeroed when dropped; the patches and
+//! 32 × 18 luma thumbnail are wiped immediately if `privacy_epoch` changes mid-pass or a `VisionKind::Privacy` screen
+//! is detected. Fixed 60 s blind backoff is gone: the pipeline's `PrivacyStateMachine` governs lock and resume.
 
-use raon_vision::{Acceptance, AnchorBank, LexiconAnchors, ScreenConfig, ScreenEncoder, WeightFormat};
+use premium_discount_sensor::naflex::{patchify_frame_with, redact_rgb_for_naflex};
+use premium_discount_sensor::thumb::{LumaThumb, WakeRule};
+use raon_vision::{
+    Acceptance, AnchorBank, EpochWatch, LexiconAnchors, PassGuard, ScreenConfig, ScreenEncoder, WeightFormat,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zena_lexicon::{Lexicon, VisionKind};
-use premium_discount_sensor::naflex::patchify_frame_with;
 
 /// One frame for the watcher (RGB8). Zeroed when dropped.
 pub struct ScreenFrame {
     pub rgb: Vec<u8>,
     pub w: usize,
     pub h: usize,
+    /// `privacy_epoch` read right before capture; if the epoch advances before or during encoding,
+    /// the pass aborts and wipes every buffer (PS-07).
+    pub captured_epoch: u64,
+    /// Normalised `(x, y, w, h)` notification toast zones to black out on patch boundaries (PS-05).
+    pub redact_zones: Vec<(f32, f32, f32, f32)>,
 }
 
 impl ScreenFrame {
@@ -72,11 +82,10 @@ pub struct WatcherConfig {
     pub screen: ScreenConfig,
     /// Perforated pass only when the encoder runs on the CPU (noto's finding: on a GPU it saves little).
     pub perforate_on_cpu_only: bool,
-    /// Mean absolute luma change (0–255) of the thumbnail under which a frame counts as unchanged.
-    pub change_min: f32,
+    /// Global + 3×3 local-block wake rule (PS-04: wakes on small corner login modals).
+    pub wake_rule: WakeRule,
     /// When a reading counts (best cosine per kind, lead over the runner-up).
     pub accept: Acceptance,
-    pub privacy_backoff: Duration,
 }
 
 impl WatcherConfig {
@@ -87,38 +96,21 @@ impl WatcherConfig {
             format: None,
             screen: ScreenConfig::default(),
             perforate_on_cpu_only: true,
-            change_min: 3.0,
+            wake_rule: WakeRule::default(),
             accept: Acceptance::default(),
-            privacy_backoff: Duration::from_secs(60),
         }
     }
-}
-
-/// 32 × 18 mean-luma thumbnail.
-fn thumbnail(f: &ScreenFrame) -> Vec<f32> {
-    let (tw, th) = (32usize, 18usize);
-    let mut out = vec![0f32; tw * th];
-    let mut cnt = vec![0u32; tw * th];
-    for y in 0..f.h {
-        let ty = y * th / f.h.max(1);
-        for x in 0..f.w {
-            let tx = x * tw / f.w.max(1);
-            let p = &f.rgb[(y * f.w + x) * 3..(y * f.w + x) * 3 + 3];
-            out[ty * tw + tx] += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
-            cnt[ty * tw + tx] += 1;
-        }
-    }
-    out.iter_mut().zip(&cnt).for_each(|(v, c)| *v /= (*c).max(1) as f32);
-    out
-}
-
-fn changed(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len().max(1) as f32
 }
 
 /// Starts the watcher thread. It loads the vision tower first (and keeps it: it is the always-on part, ~0.4 B
 /// parameters), then waits for frames and dictionary updates.
-pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receiver<AnchorsUpdate>, out: Sender<ScreenObservation>) {
+pub fn spawn(
+    cfg: WatcherConfig,
+    frames: Receiver<ScreenFrame>,
+    updates: Receiver<AnchorsUpdate>,
+    out: Sender<ScreenObservation>,
+    privacy_epoch: Arc<AtomicU64>,
+) {
     std::thread::Builder::new()
         .name("zena-screen".into())
         .spawn(move || {
@@ -127,7 +119,9 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                 Err(e) => return eprintln!("[screen] no device: {e:#}"),
             };
             let gpu = !dev.is_cpu();
-            let format = cfg.format.unwrap_or(if gpu { WeightFormat::F16 } else { WeightFormat::F32 });
+            let format = cfg
+                .format
+                .unwrap_or(if gpu { WeightFormat::F16 } else { WeightFormat::F32 });
             let mut screen = cfg.screen;
             if gpu && cfg.perforate_on_cpu_only {
                 screen.perforation = None;
@@ -135,25 +129,44 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
             let t = Instant::now();
             let (tower, scale, bias) = match raon_vision::load_vision(&cfg.model, &dev, format) {
                 Ok(x) => x,
-                Err(e) => return eprintln!("[screen] vision tower not loaded ({}): {e:#}", cfg.model.display()),
+                Err(e) => {
+                    return eprintln!(
+                        "[screen] vision tower not loaded ({}): {e:#}",
+                        cfg.model.display()
+                    )
+                }
             };
             eprintln!(
                 "[screen] Raon-VisionEncoder vision tower ({format:?}) on {} in {:.1}s; {} patches, {} pass",
                 raon_infer::device::describe(&dev),
                 t.elapsed().as_secs_f32(),
                 screen.max_patches,
-                screen.perforation.map(|p| p.tag()).unwrap_or_else(|| "full".into())
+                screen
+                    .perforation
+                    .map(|p| p.tag())
+                    .unwrap_or_else(|| "full".into())
             );
             let enc = ScreenEncoder::new(tower, screen);
             let fingerprint = raon_vision::fingerprint(&cfg.model);
             // Raon-VE: CLIP mean / std, bicubic; google's SigLIP2: 0.5 / 0.5, bilinear (preprocessor_config.json).
             let preprocess = raon_vision::preprocess_for(&cfg.model);
             let mut bank = AnchorBank::empty(scale, bias);
-            let mut last_thumb: Option<Vec<f32>> = None;
-            let mut paused_until: Option<Instant> = None;
+            let mut last_thumb: Option<LumaThumb> = None;
+            let mut seen_epoch = privacy_epoch.load(Ordering::Acquire);
             let mut warned = false;
             loop {
+                let cur_epoch = privacy_epoch.load(Ordering::Acquire);
+                if cur_epoch != seen_epoch {
+                    seen_epoch = cur_epoch;
+                    if let Some(t) = &mut last_thumb {
+                        t.wipe();
+                    }
+                    last_thumb = None;
+                }
                 for u in updates.try_iter() {
+                    if let Some(t) = &mut last_thumb {
+                        t.wipe();
+                    }
                     last_thumb = None;
                     if !u.anchors.is_empty() && u.model != fingerprint {
                         bank = AnchorBank::empty(scale, bias);
@@ -166,7 +179,7 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                     bank = AnchorBank::build(&u.lexicon, &u.anchors, scale, bias);
                     eprintln!("[screen] {} screen domains anchored", bank.domains.len());
                 }
-                let frame = match frames.recv_timeout(Duration::from_millis(500)) {
+                let mut frame = match frames.recv_timeout(Duration::from_millis(500)) {
                     Ok(f) => f,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => return,
@@ -178,42 +191,86 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
                     }
                     continue;
                 }
-                if paused_until.is_some_and(|t| Instant::now() < t) {
+                if frame.captured_epoch != privacy_epoch.load(Ordering::Acquire) {
+                    if let Some(t) = &mut last_thumb {
+                        t.wipe();
+                    }
+                    last_thumb = None;
                     continue;
                 }
-                let thumb = thumbnail(&frame);
-                if last_thumb.as_ref().is_some_and(|l| changed(l, &thumb) < cfg.change_min) {
+                let masked = if frame.redact_zones.is_empty() {
+                    Vec::new()
+                } else {
+                    redact_rgb_for_naflex(
+                        &mut frame.rgb,
+                        frame.w,
+                        frame.h,
+                        &frame.redact_zones,
+                        enc.cfg.max_patches,
+                        &preprocess,
+                    )
+                };
+                let mut thumb = LumaThumb::from_rgb(&frame.rgb, frame.w, frame.h);
+                if !cfg.wake_rule.check(last_thumb.as_ref(), &thumb).wakes() {
+                    thumb.wipe();
                     continue;
                 }
-                let grid = patchify_frame_with(&frame.rgb, frame.w, frame.h, enc.cfg.max_patches, &preprocess);
+                let captured_epoch = frame.captured_epoch;
+                let mut grid = patchify_frame_with(
+                    &frame.rgb,
+                    frame.w,
+                    frame.h,
+                    enc.cfg.max_patches,
+                    &preprocess,
+                );
                 drop(frame);
-                let reading = match enc.read(&grid, &bank) {
-                    Ok(r) => r,
+                let guard = PassGuard {
+                    epoch: Some(EpochWatch::new(&privacy_epoch, captured_epoch)),
+                    masked: &masked,
+                };
+                let reading = match enc.read_guarded(&mut grid, &bank, &guard) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        // Privacy lock interrupted the pass mid-flight: wipe every residue and emit nothing.
+                        thumb.wipe();
+                        if let Some(t) = &mut last_thumb {
+                            t.wipe();
+                        }
+                        last_thumb = None;
+                        continue;
+                    }
                     Err(e) => {
+                        thumb.wipe();
                         eprintln!("[screen] encoder failed: {e:#}");
                         continue;
                     }
                 };
                 drop(grid);
-                last_thumb = Some(thumb);
-                let Some(top) = cfg.accept.accept(&reading.scores) else { continue };
+                let Some(top) = cfg.accept.accept(&reading.scores) else {
+                    last_thumb = Some(thumb);
+                    continue;
+                };
                 if top.kind == VisionKind::Privacy {
-                    paused_until = Some(Instant::now() + cfg.privacy_backoff);
+                    thumb.wipe();
+                    if let Some(t) = &mut last_thumb {
+                        t.wipe();
+                    }
+                    last_thumb = None;
+                } else {
+                    last_thumb = Some(thumb);
                 }
-                {
-                    let _ = out.send(ScreenObservation {
-                        key: top.key.clone(),
-                        kind: top.kind,
-                        link: top.link.clone(),
-                        score: top.score,
-                        cos: top.cos,
-                        peak: reading.peak,
-                        cooldown_s: top.cooldown_s,
-                        encode_ms: reading.encode_ms,
-                        tokens: reading.report.tokens_run,
-                        cells: reading.report.cells,
-                    });
-                }
+                let _ = out.send(ScreenObservation {
+                    key: top.key.clone(),
+                    kind: top.kind,
+                    link: top.link.clone(),
+                    score: top.score,
+                    cos: top.cos,
+                    peak: reading.peak,
+                    cooldown_s: top.cooldown_s,
+                    encode_ms: reading.encode_ms,
+                    tokens: reading.report.tokens_run,
+                    cells: reading.report.cells,
+                });
             }
         })
         .expect("spawn screen watcher");
@@ -222,27 +279,37 @@ pub fn spawn(cfg: WatcherConfig, frames: Receiver<ScreenFrame>, updates: Receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use premium_discount_sensor::thumb::Wake;
 
     #[test]
-    fn frames_are_zeroed_when_dropped_and_change_is_measured_on_a_thumbnail() {
-        let f = ScreenFrame {
+    fn frames_are_zeroed_when_dropped_and_change_wakes_on_global_or_local_corner() {
+        let mut f = ScreenFrame {
             rgb: vec![200; 64 * 36 * 3],
             w: 64,
             h: 36,
+            captured_epoch: 0,
+            redact_zones: vec![],
         };
-        let a = thumbnail(&f);
-        assert_eq!(a.len(), 32 * 18);
-        assert!((a[0] - 200.0).abs() < 1e-3);
+        let a = LumaThumb::from_rgb(&f.rgb, f.w, f.h);
+        assert!((a.values()[0] - 200.0).abs() < 1e-3);
+        let rule = WakeRule::default();
+        assert_eq!(rule.check(Some(&a), &a), Wake::Still);
+
         let mut g = ScreenFrame {
             rgb: vec![200; 64 * 36 * 3],
             w: 64,
             h: 36,
+            captured_epoch: 0,
+            redact_zones: vec![],
         };
-        assert_eq!(changed(&a, &thumbnail(&g)), 0.0);
         g.rgb[..64 * 18 * 3].iter_mut().for_each(|b| *b = 0);
-        assert!(changed(&a, &thumbnail(&g)) > 50.0);
-        let mut f = f;
+        let b = LumaThumb::from_rgb(&g.rgb, g.w, g.h);
+        assert_eq!(rule.check(Some(&a), &b), Wake::Global);
+
         f.wipe();
-        assert!(f.rgb.iter().all(|&b| b == 0), "what Drop does before the buffer is freed");
+        assert!(
+            f.rgb.iter().all(|&b| b == 0),
+            "what Drop does before the buffer is freed"
+        );
     }
 }

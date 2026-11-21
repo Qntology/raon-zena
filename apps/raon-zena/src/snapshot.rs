@@ -281,6 +281,11 @@ pub fn run(dir: &Path, font: Option<&Path>, vrm: Option<&Path>) -> Result<()> {
             }),
             bubble: m.bubble.map(|b| (b, 1.0)),
             input: m.input.map(|(t, p)| (t, p, true)),
+            sync_pill: None,
+            rejection_chip: None,
+            drawer: None,
+            badges: &[],
+            drop_hint: None,
         };
         let missing = scene.missing(&stage);
         if !missing.is_empty() {

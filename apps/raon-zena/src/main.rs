@@ -31,10 +31,12 @@
 //! stdin (voice input is not wired yet).
 
 mod assets;
+mod browser_uia;
 mod capture;
 mod lexicon;
 mod llm;
 mod overlay;
+mod pd_bridge;
 mod pipeline;
 mod renderers;
 mod snapshot;
@@ -46,11 +48,12 @@ use anyhow::{bail, Result};
 use raon_quant::gguf::GgufFile;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use winit::event_loop::EventLoop;
 use zena_core::geometry::ScreenGeometry;
+use zena_core::nav_target::SpokenSlotLock;
 
 struct Args {
     synthetic: bool,
@@ -85,6 +88,8 @@ struct Args {
     asset_cache: PathBuf,
     font: Option<PathBuf>,
     snapshot: Option<PathBuf>,
+    pd_mcp: Option<PathBuf>,
+    share_outcomes: bool,
 }
 
 fn parse_track(s: &str) -> zena_core::tools::AvatarTrack {
@@ -131,6 +136,8 @@ fn args() -> Args {
         asset_cache: assets::default_cache(),
         font: None,
         snapshot: None,
+        pd_mcp: pd_bridge::find_pd_mcp(),
+        share_outcomes: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -178,6 +185,9 @@ fn args() -> Args {
             "--asset-cache" => a.asset_cache = it.next().map(PathBuf::from).unwrap_or_else(assets::default_cache),
             "--font" => a.font = it.next().map(PathBuf::from),
             "--snapshot" => a.snapshot = it.next().map(PathBuf::from),
+            "--pd-mcp" => a.pd_mcp = it.next().map(PathBuf::from),
+            "--no-pd-mcp" => a.pd_mcp = None,
+            "--share-outcomes" => a.share_outcomes = true,
             _ => eprintln!("ignoring argument {x}"),
         }
     }
@@ -295,6 +305,12 @@ fn main() -> Result<()> {
         loaded.lexicon.vision.len()
     );
 
+    // Shared epochs & spoken badge slot lock across watcher, LLM worker, RAG coordinator, pipeline and overlay.
+    let ask_epoch = Arc::new(AtomicU64::new(0));
+    let privacy_epoch = Arc::new(AtomicU64::new(0));
+    let spoken_lock = Arc::new(Mutex::new(SpokenSlotLock::default()));
+    let (action_tx, action_rx) = mpsc::channel::<pipeline::OverlayAction>();
+
     // The periodic screen watcher (Raon-VisionEncoder vision tower only; anchors come from the dictionary).
     let (frame_tx, frame_rx) = mpsc::sync_channel::<watcher::ScreenFrame>(1);
     let (obs_tx, obs_rx) = mpsc::channel::<watcher::ScreenObservation>();
@@ -323,26 +339,25 @@ fn main() -> Result<()> {
             anchors: loaded.anchors.clone(),
             model: loaded.anchors_model.clone(),
         })?;
-        watcher::spawn(cfg, frame_rx, anchor_rx, obs_tx);
+        watcher::spawn(cfg, frame_rx, anchor_rx, obs_tx, privacy_epoch.clone());
     }
     let (lex_tx, lex_rx) = mpsc::channel();
     let learn_tx = a
         .lexicon_db
         .clone()
         .map(|db| {
-            // A screen model whose anchors are missing or were computed by another checkpoint gets them recomputed
-            // by the dictionary service (needs the model's tokenizer.json).
             let reanchor = a.screen.as_deref().and_then(|m| lexicon::Reanchor::find(m, a.screen_tokenizer.as_deref()));
             lexicon::spawn_service(db, Duration::from_secs(3), 3, lex_tx, screen_on.then_some(anchor_tx), reanchor)
         });
 
-    // Lv3 backend: Raon-1-nano when a model is given (CPU / CUDA / ROCm / Vulkan / Metal through the
-    // candle-rocm-vulkan fork, chosen by --llm-device), loaded on demand and dropped when idle; otherwise the
-    // template stub.
-    // The completion is parsed while it streams: the expression is shown as soon as its parameters close and the
-    // line is spoken sentence by sentence; the answer goes back to the pipeline's dialogue memory.
+    // Lv3 backend: guarded by `ask_epoch` (CR-06 / PS-12) and updates `spoken_lock` while streaming (CN-12).
     let (reply_tx, reply_rx) = mpsc::channel::<pipeline::Reply>();
-    let on_done = pipeline::StreamToAvatar::new(ctx.clone(), Some(reply_tx));
+    let on_done = pipeline::StreamToAvatar::with_guards(
+        ctx.clone(),
+        Some(reply_tx),
+        ask_epoch.clone(),
+        spoken_lock.clone(),
+    );
     let worker = match &a.model {
         Some(model) => {
             let tok = a.tokenizer.clone().unwrap_or_else(|| {
@@ -372,12 +387,18 @@ fn main() -> Result<()> {
                 )?) as Box<dyn llm::LlmBackend>)
             });
             if a.llm_idle == 0 {
-                llm::LlmWorker::spawn(loader()?, on_done)
+                llm::LlmWorker::spawn_with_epoch(loader()?, on_done, ask_epoch.clone())
             } else {
-                llm::LlmWorker::spawn_lazy("raon-1-nano", loader, Duration::from_secs(a.llm_idle), on_done)
+                llm::LlmWorker::spawn_lazy_with_epoch(
+                    "raon-1-nano",
+                    loader,
+                    Duration::from_secs(a.llm_idle),
+                    on_done,
+                    ask_epoch.clone(),
+                )
             }
         }
-        None => llm::LlmWorker::spawn(Box::new(llm::TemplateBackend), on_done),
+        None => llm::LlmWorker::spawn_with_epoch(Box::new(llm::TemplateBackend), on_done, ask_epoch.clone()),
     };
     {
         let running = running.clone();
@@ -390,6 +411,10 @@ fn main() -> Result<()> {
             screen_frames: screen_on.then_some(frame_tx),
             screen: screen_on.then_some(obs_rx),
             replies: Some(reply_rx),
+            actions: Some(action_rx),
+            ask_epoch: ask_epoch.clone(),
+            privacy_epoch: privacy_epoch.clone(),
+            spoken_lock: spoken_lock.clone(),
         };
         let cfg = pipeline::PipelineConfig {
             screen_interval_ms: (a.screen_every * 1000.0) as u64,
@@ -397,6 +422,9 @@ fn main() -> Result<()> {
             proactive_silence_ms: a.proactive_s * 1000,
             history_turns: a.history,
             nlp: a.nlp,
+            pd_mcp: a.pd_mcp.clone(),
+            consent_share_outcomes: a.share_outcomes,
+            enable_host_probes: cfg!(windows) && !a.synthetic,
             ..Default::default()
         };
         let lexicon = loaded.lexicon;
@@ -422,8 +450,13 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     {
         let proxy = proxy.clone();
-        win32::spawn_hotkeys(move |h| {
-            let _ = proxy.send_event(overlay::UserEvent::Hotkey(h));
+        win32::spawn_hotkeys(move |ev| match ev {
+            win32::HotkeyEvent::Core(h) => {
+                let _ = proxy.send_event(overlay::UserEvent::Hotkey(h));
+            }
+            win32::HotkeyEvent::DrawerToggle => {
+                let _ = proxy.send_event(overlay::UserEvent::DrawerToggle);
+            }
         });
     }
     // Dual-track assets: SolidCraft (Track A) and zena-subculture-mcp (Track B) over MCP in the background, built
@@ -435,8 +468,6 @@ fn main() -> Result<()> {
             subculture_mcp: if a.subculture_mcp { assets::sibling_server() } else { None },
             vrm_path: a.vrm.clone(),
             chibi_kit: a.chibi_kit.clone(),
-            // Without --vrm the 3D track downloads the catalog's default model (pinned, SHA-256 checked) instead of
-            // falling back to the procedural face.
             catalog: a.avatar_download.then(|| a.asset_cache.clone()),
             stamp_frames: 8,
         },
@@ -452,6 +483,7 @@ fn main() -> Result<()> {
         a.asset_cache.display()
     );
     let mut app = overlay::Overlay::new(running, screen, utx)
+        .with_pipeline_links(action_tx, ask_epoch)
         .with_assets(assets, a.track)
         .with_font(a.font.clone());
     event_loop.run_app(&mut app)?;

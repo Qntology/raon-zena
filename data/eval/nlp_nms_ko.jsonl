@@ -70,6 +70,12 @@
 {"id":"ribbon-pa","kind":"para","text":"머리에 리본 하나 해 줘","expect":["avatar.ribbon"]}
 {"id":"off-ex","kind":"exact","text":"액세서리 다 빼 줘","expect":["avatar.take_off"]}
 {"id":"off-pa","kind":"para","text":"장식 전부 벗어","expect":["avatar.take_off"]}
+{"id":"fb-rec-ex","kind":"exact","text":"이거 추천","expect":["feedback.recommend"]}
+{"id":"fb-rec-pa","kind":"para","text":"이 공략 완전 강추야","expect":["feedback.recommend"]}
+{"id":"fb-nrec-ex","kind":"exact","text":"이거 비추야","expect":["feedback.not_recommend"]}
+{"id":"fb-nrec-pa","kind":"para","text":"이 공략 별로야","expect":["feedback.not_recommend"]}
+{"id":"ana-ex","kind":"exact","text":"이번 주 전환율 어때","expect":["analytic.report"]}
+{"id":"ana-pa","kind":"para","text":"결제 이탈 원인이 뭐야","expect":["analytic.report"]}
 {"id":"multi-1","kind":"multi","text":"맨 앞으로 나와서 보스 패턴 알려 줘","expect":["system.topmost_on","coach.game_tip"]}
 {"id":"multi-2","kind":"multi","text":"안경이랑 헤드셋 써 봐","expect":["avatar.glasses","avatar.headset"]}
 {"id":"multi-3","kind":"multi","text":"고마워 덕분에 이겼어","expect":["emotion.thanks","emotion.celebrate"]}
