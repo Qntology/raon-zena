@@ -198,7 +198,7 @@ fn run(st: &SafeTensors, plan: Plan, common: &Common, cfg: &PyramidConfig, extra
     }
     let report = pyramid::convert(st, &plan, cfg, &common.out, extra, imat.as_ref())?;
     let rp = common.report.clone().unwrap_or_else(|| common.out.with_extension("report.json"));
-    std::fs::write(&rp, serde_json::to_string_pretty(&report)?)?;
+    raon_quant::cache::write_atomic(&rp, serde_json::to_string_pretty(&report)?.as_bytes())?;
     eprintln!(
         "\nwrote {} ({:.1} MiB) in {:.0}s; report {}",
         report.out,

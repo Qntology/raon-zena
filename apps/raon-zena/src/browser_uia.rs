@@ -372,23 +372,68 @@ pub fn project_web_tiers_onto_uia(
 }
 
 /// Cosine similarity helper over a `SharedEmbedder` (granite 384d `LABEL_SPACE` when installed).
+#[allow(dead_code)]
 pub fn embedder_similarity(embedder: &SharedEmbedder, a: &str, b: &str) -> f32 {
     let va = embedder.embed(a);
     let vb = embedder.embed(b);
+    cosine_unit_or_raw(&va, &vb)
+}
+
+#[inline]
+fn cosine_unit_or_raw(va: &[f32], vb: &[f32]) -> f32 {
     if va.is_empty() || va.len() != vb.len() {
         return 0.0;
     }
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (&x, &y) in va.iter().zip(&vb) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
+    let dot = raon_cpu_kernels::dot_f32_simd(va, vb);
+    let na = raon_cpu_kernels::dot_f32_simd(va, va);
+    let nb = raon_cpu_kernels::dot_f32_simd(vb, vb);
     let denom = (na * nb).sqrt();
     if denom > 1e-8 {
         (dot / denom).clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+/// Pre-embeds all unique labels across `web_rows` and `uia_regions` in a single `embed_batch` call
+/// (`M + N` embeddings instead of `2 * M * N` repeated neural passes inside `project_web_tiers_onto_uia`).
+pub fn precompute_label_similarity(
+    embedder: &SharedEmbedder,
+    web_rows: &[WebAnalyticTierRow],
+    uia_regions: &[UiaInteractiveRegion],
+) -> impl Fn(&str, &str) -> f32 {
+    let mut unique: Vec<&str> = Vec::with_capacity(web_rows.len() + uia_regions.len());
+    let mut seen = std::collections::HashSet::with_capacity(web_rows.len() + uia_regions.len());
+    for row in web_rows {
+        if !row.label.trim().is_empty() && seen.insert(row.label.as_str()) {
+            unique.push(row.label.as_str());
+        }
+    }
+    for reg in uia_regions {
+        if !reg.label.trim().is_empty() && !reg.sensitive && seen.insert(reg.label.as_str()) {
+            unique.push(reg.label.as_str());
+        }
+    }
+    let mut vecs: HashMap<String, Vec<f32>> = HashMap::with_capacity(unique.len());
+    if !unique.is_empty() {
+        let embedded = embedder.embed_batch(&unique);
+        for (label, mut v) in unique.into_iter().zip(embedded) {
+            let n = raon_cpu_kernels::dot_f32_simd(&v, &v).sqrt();
+            if n > 1e-8 {
+                for x in &mut v {
+                    *x /= n;
+                }
+            }
+            vecs.insert(label.to_string(), v);
+        }
+    }
+    move |a: &str, b: &str| -> f32 {
+        match (vecs.get(a), vecs.get(b)) {
+            (Some(va), Some(vb)) if !va.is_empty() && va.len() == vb.len() => {
+                raon_cpu_kernels::dot_f32_simd(va, vb).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        }
     }
 }
 

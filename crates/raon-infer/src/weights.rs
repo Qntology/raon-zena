@@ -76,7 +76,7 @@ pub mod imatrix {
                 b.extend(((s / (*n).max(1) as f64) as f32).to_le_bytes());
             }
         }
-        std::fs::write(path, b)?;
+        crate::device::write_file_atomic(path, &b)?;
         Ok(acc.len())
     }
 }
@@ -136,6 +136,27 @@ pub struct Linear {
 }
 
 impl Linear {
+    pub(crate) fn inner(&self) -> &QMatMul {
+        &self.inner
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_qmatmul(
+        inner: QMatMul,
+        exact: bool,
+        name: &str,
+        out_features: usize,
+        in_features: usize,
+    ) -> Self {
+        Self {
+            inner,
+            exact,
+            name: name.to_string(),
+            out_features,
+            in_features,
+        }
+    }
+
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = x.contiguous()?;
         imatrix::record(&self.name, &x)?;
@@ -316,6 +337,7 @@ impl Weights {
                 self.src = Source::Gguf(GgufFile::open(&path)?);
             }
         }
+        crate::device::trim_process_working_set();
         Ok(())
     }
 

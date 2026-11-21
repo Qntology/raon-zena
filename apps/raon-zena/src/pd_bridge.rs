@@ -1047,12 +1047,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
     }
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
+    let dot = raon_cpu_kernels::dot_f32_simd(a, b);
+    let na = raon_cpu_kernels::dot_f32_simd(a, a);
+    let nb = raon_cpu_kernels::dot_f32_simd(b, b);
     let denom = (na * nb).sqrt();
     if denom > 1e-8 {
         dot / denom
@@ -1515,9 +1512,7 @@ pub fn save_quarantine(path: &Path, ledger: &QuarantineLedger) -> anyhow::Result
             sync_state: e.sync_state.as_str().to_string(),
         })
         .collect();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&rows)?)?;
-    std::fs::rename(&tmp, path)?;
+    raon_infer::device::write_file_atomic(path, &serde_json::to_vec_pretty(&rows)?)?;
     Ok(())
 }
 

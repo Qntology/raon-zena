@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/zena-core",
+    "crates/raon-cpu-kernels",
     "crates/raon-quant",
     "crates/nlp-nms-router",
     "crates/raon-infer",
@@ -21,6 +22,7 @@ license = "Apache-2.0"
 repository = "https://github.com/sungu-che/raon-zena"
 
 [workspace.dependencies]
+raon-cpu-kernels = { path = "crates/raon-cpu-kernels" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
@@ -56,7 +58,8 @@ premium-discount-vision = { git = "https://github.com/Qntology/premium-discount"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# zena-avatar-mcp (mesh/service) and raon-infer accel_check use catch_unwind to isolate panics cleanly.
+panic = "unwind"
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -69,14 +72,18 @@ debug = false
 # so both workspaces build one candle. To build against a local checkout, swap the git lines for
 # `path = "../candle-rocm-vulkan/candle-core"` etc.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
 
 [profile.dev.package.candle-core]
 opt-level = 3
 [profile.dev.package.candle-nn]
 opt-level = 3
 [profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.raon-cpu-kernels]
+opt-level = 3
+[profile.dev.package.raon-infer]
 opt-level = 3
 [profile.dev.package.raon-quant]
 opt-level = 3

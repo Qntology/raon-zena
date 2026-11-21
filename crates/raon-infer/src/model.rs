@@ -10,7 +10,8 @@ use crate::weights::{Linear, Weights};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::ops::{rms_norm, sigmoid, softmax_last_dim};
-use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Opt-in phase profiler (`RAON_PROFILE=1`): accumulated milliseconds per phase.
 pub mod profile {
@@ -109,7 +110,15 @@ impl Config {
 }
 
 fn rms(x: &Tensor, w: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
-    rms_norm(&x.contiguous()?, w, eps as f32)
+    let xc = x.contiguous()?;
+    if !xc.device().is_cpu()
+        && crate::device::accel_op_ok(xc.device(), crate::device::AccelOp::RmsNorm)
+    {
+        if let Ok(y) = candle_core::decoder_ops::rmsnorm_fused(&xc, w, eps as f32, false) {
+            return Ok(y);
+        }
+    }
+    rms_norm(&xc, w, eps as f32)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,6 +140,7 @@ fn helmert(n: usize) -> Vec<f32> {
 
 struct MhcConsts {
     q: Tensor,   // [n, n-1]
+    q_t: Tensor, // [n-1, n] precomputed transpose
     b: Tensor,   // [n, n]  (I + 11ᵀ/n)/2
     eye: Tensor, // [n, n]
 }
@@ -144,10 +154,12 @@ struct Mhc {
     b_post: Tensor,
     b_z: Tensor,
     gamma: f64,
+    /// Precomputed `(1 - gamma) * eye` `[n, n]` (avoids scaling `eye` 48x per token).
+    eye_res: Tensor,
 }
 
 impl Mhc {
-    fn load(w: &Weights, p: &str) -> Result<Self> {
+    fn load(w: &Weights, p: &str, consts: &MhcConsts) -> Result<Self> {
         let sel = Tensor::cat(
             &[
                 w.tensor(&format!("{p}.phi_pre"), None)?,
@@ -157,6 +169,8 @@ impl Mhc {
             0,
         )?;
         let eta = w.scalar(&format!("{p}.res.eta"))? as f64;
+        let gamma = 1.0 / (1.0 + (-eta).exp());
+        let eye_res = (&consts.eye * (1.0 - gamma))?;
         Ok(Self {
             sel: sel.t()?.contiguous()?,
             alpha_pre: w.scalar(&format!("{p}.alpha_pre"))? as f64,
@@ -165,7 +179,8 @@ impl Mhc {
             b_pre: w.tensor(&format!("{p}.b_pre"), None)?,
             b_post: w.tensor(&format!("{p}.b_post"), None)?,
             b_z: w.tensor(&format!("{p}.res.b_z"), None)?,
-            gamma: 1.0 / (1.0 + (-eta).exp()),
+            gamma,
+            eye_res,
         })
     }
 
@@ -181,13 +196,19 @@ impl Mhc {
         let tz = z
             .narrow(1, 2 * n, m * m)?
             .affine(self.alpha_z, 0.0)?
-            .broadcast_add(&self.b_z)?
-            .reshape((t, m, m))?;
-        let q = k.q.unsqueeze(0)?.broadcast_as((t, n, m))?.contiguous()?;
-        let e = q.matmul(&tz)?.matmul(&q.transpose(1, 2)?.contiguous()?)?; // [T, n, n]
+            .broadcast_add(&self.b_z)?;
+        // e = Q · tz · Qᵀ -> compute tz · Qᵀ first as 2D matmul (zero broadcast of Qᵀ),
+        // and for single-token decode (t == 1) avoid broadcasting Q as well.
+        let tz_qt = tz.reshape((t * m, m))?.matmul(&k.q_t)?;
+        let e = if t == 1 {
+            k.q.matmul(&tz_qt)?.unsqueeze(0)?
+        } else {
+            let tz_qt = tz_qt.reshape((t, m, n))?;
+            k.q.unsqueeze(0)?.broadcast_as((t, n, m))?.contiguous()?.matmul(&tz_qt)?
+        };
         let rho = e.neg()?.broadcast_div(&k.b)?.reshape((t, n * n))?.max_keepdim(1)?.relu()?; // [T, 1]
         let phi = e.broadcast_div(&(rho.affine(1.0, 1.0)?.unsqueeze(2)?))?.broadcast_add(&k.b)?;
-        let h_res = (phi * self.gamma)?.broadcast_add(&(&k.eye * (1.0 - self.gamma))?)?;
+        let h_res = (phi * self.gamma)?.broadcast_add(&self.eye_res)?;
         Ok((h_pre, h_post, h_res))
     }
 }
@@ -237,50 +258,11 @@ struct Rda {
     o: Linear,
 }
 
-/// Token-serial V-first delta rule on the host (rayon over heads): fp32, exact reference order.
+/// Token-serial V-first delta rule on the host (zero-alloc SIMD AVX2+FMA / rayon over heads).
 #[allow(clippy::too_many_arguments)]
 fn host_scan(q: &[f32], k: &[f32], v: &[f32], la: &[f32], beta: &[f32], state: &mut [f32], t: usize, h: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0f32; t * h * d];
-    let hd = d * d;
-    let outs: Vec<Vec<f32>> = state
-        .par_chunks_mut(hd)
-        .enumerate()
-        .map(|(hi, s)| {
-            let mut o = vec![0f32; t * d];
-            let mut pred = vec![0f32; d];
-            for ti in 0..t {
-                let base = (ti * h + hi) * d;
-                let (qt, kt, vt, at) = (&q[base..base + d], &k[base..base + d], &v[base..base + d], &la[base..base + d]);
-                let bt = beta[ti * h + hi];
-                let decay: Vec<f32> = at.iter().map(|x| x.exp()).collect();
-                // S[v][k] *= exp(la[k]); pred[v] = Σ_k S[v][k] k[k]
-                for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                    let mut acc = 0f32;
-                    for ki in 0..d {
-                        row[ki] *= decay[ki];
-                        acc += row[ki] * kt[ki];
-                    }
-                    pred[vi] = acc;
-                }
-                // S += β (v − pred) kᵀ; out = S q
-                for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                    let e = bt * (vt[vi] - pred[vi]);
-                    let mut acc = 0f32;
-                    for ki in 0..d {
-                        row[ki] += e * kt[ki];
-                        acc += row[ki] * qt[ki];
-                    }
-                    o[ti * d + vi] = acc;
-                }
-            }
-            o
-        })
-        .collect();
-    for (hi, o) in outs.into_iter().enumerate() {
-        for ti in 0..t {
-            out[(ti * h + hi) * d..(ti * h + hi + 1) * d].copy_from_slice(&o[ti * d..(ti + 1) * d]);
-        }
-    }
+    raon_cpu_kernels::rda_host_scan_f32(q, k, v, la, beta, state, t, h, d, &mut out);
     out
 }
 
@@ -421,13 +403,115 @@ impl Rda {
 }
 
 // ---------------------------------------------------------------------------------------------
-// MLA (NoPE, gated)
+// MLA (NoPE, gated) with CoW pre-allocated KV cache + CPU 64-key streaming MLA attention
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
+/// Pre-allocated doubling-capacity KV cache with Copy-on-Write (`Arc::strong_count == 1`) safety.
+///
+/// Cloning `State` from a cached `prefix_state` shares the backing buffers via `Arc`; the first
+/// `append` on a cloned state copies into a freshly owned buffer so the shared prefix is NEVER
+/// mutated, and every subsequent decode token appends in O(T) via `slice_set` (zero O(L²) cat
+/// copies and zero per-token full-K transpose on GPU!).
+#[derive(Clone)]
 pub struct KvState {
-    pub k: Option<Tensor>, // [H, L, 192]
-    pub v: Option<Tensor>, // [H, L, 128]
+    pub k: Option<Tensor>,   // [H, cap, dq]
+    pub v: Option<Tensor>,   // [H, cap, dv]
+    k_t: Option<Tensor>,     // [H, dq, cap] (maintained incrementally on GPU)
+    pub len: usize,
+    cap: usize,
+    share: Arc<()>,
+}
+
+impl Default for KvState {
+    fn default() -> Self {
+        Self {
+            k: None,
+            v: None,
+            k_t: None,
+            len: 0,
+            cap: 0,
+            share: Arc::new(()),
+        }
+    }
+}
+
+impl KvState {
+    /// Appends `new_k [H, T, dq]` and `new_v [H, T, dv]`, returning zero-copy valid views
+    /// `(k [H, L, dq], v [H, L, dv], k_t Option<[H, dq, L]>)`.
+    fn append(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        store_kt: bool,
+    ) -> candle_core::Result<(Tensor, Tensor, Option<Tensor>)> {
+        let (h, t, dq) = new_k.dims3()?;
+        let dv = new_v.dim(2)?;
+        let needed = self.len + t;
+        let can_reuse = self.k.is_some()
+            && self.v.is_some()
+            && (!store_kt || self.k_t.is_some())
+            && Arc::strong_count(&self.share) == 1
+            && needed <= self.cap;
+
+        if can_reuse {
+            let k_buf = self.k.as_ref().unwrap();
+            let v_buf = self.v.as_ref().unwrap();
+            k_buf.slice_set(new_k, 1, self.len)?;
+            v_buf.slice_set(new_v, 1, self.len)?;
+            if store_kt {
+                let kt_buf = self.k_t.as_ref().unwrap();
+                let new_kt = new_k.transpose(1, 2)?.contiguous()?;
+                kt_buf.slice_set(&new_kt, 2, self.len)?;
+            }
+            self.len = needed;
+        } else {
+            let new_cap = needed.next_power_of_two().max(256);
+            let dev = new_k.device();
+            let dtype = new_k.dtype();
+            let k_buf = Tensor::zeros((h, new_cap, dq), dtype, dev)?;
+            let v_buf = Tensor::zeros((h, new_cap, dv), dtype, dev)?;
+            let kt_buf = if store_kt {
+                Some(Tensor::zeros((h, dq, new_cap), dtype, dev)?)
+            } else {
+                None
+            };
+            if self.len > 0 {
+                if let (Some(old_k), Some(old_v)) = (&self.k, &self.v) {
+                    let prev_k = old_k.narrow(1, 0, self.len)?.contiguous()?;
+                    let prev_v = old_v.narrow(1, 0, self.len)?.contiguous()?;
+                    k_buf.slice_set(&prev_k, 1, 0)?;
+                    v_buf.slice_set(&prev_v, 1, 0)?;
+                    if let Some(ref kt) = kt_buf {
+                        let prev_kt = match &self.k_t {
+                            Some(old_kt) => old_kt.narrow(2, 0, self.len)?.contiguous()?,
+                            None => prev_k.transpose(1, 2)?.contiguous()?,
+                        };
+                        kt.slice_set(&prev_kt, 2, 0)?;
+                    }
+                }
+            }
+            k_buf.slice_set(new_k, 1, self.len)?;
+            v_buf.slice_set(new_v, 1, self.len)?;
+            if let Some(ref kt) = kt_buf {
+                let new_kt = new_k.transpose(1, 2)?.contiguous()?;
+                kt.slice_set(&new_kt, 2, self.len)?;
+            }
+            self.k = Some(k_buf);
+            self.v = Some(v_buf);
+            self.k_t = kt_buf;
+            self.cap = new_cap;
+            self.len = needed;
+            self.share = Arc::new(());
+        }
+
+        let k_view = self.k.as_ref().unwrap().narrow(1, 0, self.len)?;
+        let v_view = self.v.as_ref().unwrap().narrow(1, 0, self.len)?;
+        let kt_view = match &self.k_t {
+            Some(kt) if store_kt => Some(kt.narrow(2, 0, self.len)?),
+            _ => None,
+        };
+        Ok((k_view, v_view, kt_view))
+    }
 }
 
 struct Mla {
@@ -439,6 +523,7 @@ struct Mla {
     kv_b: Linear,
     g: Linear,
     o: Linear,
+    mask_cache: Mutex<HashMap<(usize, usize), Tensor>>,
 }
 
 impl Mla {
@@ -452,7 +537,25 @@ impl Mla {
             kv_b: w.linear(&format!("{p}.kv_b_proj.weight"))?,
             g: w.linear(&format!("{p}.g_proj.weight"))?,
             o: w.linear(&format!("{p}.o_proj.weight"))?,
+            mask_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn causal_mask(&self, t: usize, l: usize, dev: &Device) -> candle_core::Result<Tensor> {
+        if let Some(m) = self.mask_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(t, l)) {
+            return Ok(m.clone());
+        }
+        let off = l - t;
+        let mask: Vec<f32> = (0..t)
+            .flat_map(|i| (0..l).map(move |j| if j > i + off { f32::NEG_INFINITY } else { 0.0 }))
+            .collect();
+        let tensor = Tensor::from_vec(mask, (1, t, l), dev)?;
+        let mut cache = self.mask_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert((t, l), tensor.clone());
+        Ok(tensor)
     }
 
     fn forward(&self, x: &Tensor, st: &mut KvState, cfg: &Config) -> Result<Tensor> {
@@ -472,32 +575,50 @@ impl Mla {
             .kv_b
             .forward(&rms(&lat, &self.kv_a_norm, cfg.mla_eps)?)?
             .reshape((t, h, dn + dv))?;
-        let key = Tensor::cat(&[kv.narrow(2, 0, dn)?, pe.unsqueeze(1)?.broadcast_as((t, h, dp))?.contiguous()?], 2)?
+        let new_k = Tensor::cat(&[kv.narrow(2, 0, dn)?, pe.unsqueeze(1)?.broadcast_as((t, h, dp))?.contiguous()?], 2)?
             .transpose(0, 1)?
             .contiguous()?;
-        let val = kv.narrow(2, dn, dv)?.transpose(0, 1)?.contiguous()?;
-        let key = match st.k.take() {
-            Some(p) => Tensor::cat(&[p, key], 1)?,
-            None => key,
-        };
-        let val = match st.v.take() {
-            Some(p) => Tensor::cat(&[p, val], 1)?,
-            None => val,
-        };
-        st.k = Some(key.clone());
-        st.v = Some(val.clone());
-        let l = key.dim(1)?;
+        let new_v = kv.narrow(2, dn, dv)?.transpose(0, 1)?.contiguous()?;
+        let on_gpu = !x.device().is_cpu();
+        let (key, val, key_t) = st.append(&new_k, &new_v, on_gpu)?;
+        let l = st.len;
         let scale = (dq as f64).powf(-0.5);
-        let mut scores = (q.matmul(&key.t()?.contiguous()?)? * scale)?; // [H, T, L]
-        if t > 1 {
-            let off = l - t;
-            let mask: Vec<f32> = (0..t)
-                .flat_map(|i| (0..l).map(move |j| if j > i + off { f32::NEG_INFINITY } else { 0.0 }))
-                .collect();
-            scores = scores.broadcast_add(&Tensor::from_vec(mask, (1, t, l), x.device())?)?;
-        }
-        let ctx = softmax_last_dim(&scores)?.matmul(&val)?; // [H, T, dv]
-        let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((t, h * dv))?;
+
+        let ctx = if !on_gpu && q.dtype() == DType::F32 {
+            // CPU F32: 64-key streaming MLA attention directly supporting dq=192, dv=128 with
+            // zero [H, T, L] score matrix allocation and zero K^T copy.
+            let qv = q.flatten_all()?.to_vec1::<f32>()?;
+            let kv_vec = key.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let vv = val.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0.0f32; t * h * dv];
+            raon_cpu_kernels::stream_attention_mla_hsd_f32(
+                &qv,
+                &kv_vec,
+                &vv,
+                h,
+                t,
+                l,
+                dq,
+                dv,
+                scale as f32,
+                t > 1,
+                l - t,
+                &mut out,
+            );
+            Tensor::from_vec(out, (t, h * dv), x.device())?
+        } else {
+            let kt = match key_t {
+                Some(kt) => kt,
+                None => key.t()?.contiguous()?,
+            };
+            let mut scores = (q.matmul(&kt)? * scale)?; // [H, T, L]
+            if t > 1 {
+                let mask = self.causal_mask(t, l, x.device())?;
+                scores = scores.broadcast_add(&mask)?;
+            }
+            let ctx = softmax_last_dim(&scores)?.matmul(&val)?; // [H, T, dv]
+            ctx.transpose(0, 1)?.contiguous()?.reshape((t, h * dv))?
+        };
         let ctx = ctx.mul(&sigmoid(&self.g.forward(x)?)?)?;
         Ok(self.o.forward(&ctx)?)
     }
@@ -533,7 +654,15 @@ impl Mlp {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let a = self.gate.forward(x)?.silu()?.mul(&self.up.forward(x)?)?;
+        let g = self.gate.forward(x)?;
+        let u = self.up.forward(x)?;
+        let a = if !x.device().is_cpu()
+            && crate::device::accel_op_ok(x.device(), crate::device::AccelOp::DecoderOps)
+        {
+            candle_core::decoder_ops::silu_mul(&g, &u).or_else(|_| g.silu()?.mul(&u))?
+        } else {
+            g.silu()?.mul(&u)?
+        };
         Ok(self.down.forward(&a)?)
     }
 }
@@ -562,7 +691,7 @@ struct Layer {
 }
 
 impl Layer {
-    fn load(w: &Weights, i: usize, cfg: &Config, rda: bool) -> Result<Self> {
+    fn load(w: &Weights, i: usize, cfg: &Config, rda: bool, consts: &MhcConsts) -> Result<Self> {
         let p = format!("model.layers.{i}");
         let ple = if w.has(&format!("{p}.per_layer_input_gate.gate")) {
             Some(PleGate {
@@ -581,8 +710,8 @@ impl Layer {
             } else {
                 Attn::Mla(Box::new(Mla::load(w, &format!("{p}.self_attn"))?))
             },
-            attn_mhc: Mhc::load(w, &format!("{p}.self_attn_raon_mhc"))?,
-            mlp_mhc: Mhc::load(w, &format!("{p}.mlp_raon_mhc"))?,
+            attn_mhc: Mhc::load(w, &format!("{p}.self_attn_raon_mhc"), consts)?,
+            mlp_mhc: Mhc::load(w, &format!("{p}.mlp_raon_mhc"), consts)?,
             mlp: Mlp::load(w, &format!("{p}.mlp"))?,
             ple,
         })
@@ -655,13 +784,16 @@ impl Model {
         let dev = w.device.clone();
         let eye: Vec<f32> = (0..n * n).map(|i| if i / n == i % n { 1.0 } else { 0.0 }).collect();
         let b: Vec<f32> = eye.iter().map(|e| 0.5 * (e + 1.0 / n as f32)).collect();
+        let q = Tensor::from_vec(helmert(n), (n, n - 1), &dev)?;
+        let q_t = q.t()?.contiguous()?;
         let consts = MhcConsts {
-            q: Tensor::from_vec(helmert(n), (n, n - 1), &dev)?,
+            q,
+            q_t,
             b: Tensor::from_vec(b, (n, n), &dev)?,
             eye: Tensor::from_vec(eye, (n, n), &dev)?,
         };
         let layers = (0..cfg.layers)
-            .map(|i| Layer::load(&w, i, &cfg, cfg.rda_layer[i]).with_context(|| format!("layer {i}")))
+            .map(|i| Layer::load(&w, i, &cfg, cfg.rda_layer[i], &consts).with_context(|| format!("layer {i}")))
             .collect::<Result<Vec<_>>>()?;
         let (ple_proj, ple_norm) = if w.has("model.per_layer_inputs.embedding_projection") {
             (
@@ -800,5 +932,59 @@ mod tests {
         for (a, b) in s0.iter().zip(&s2v) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn kv_state_cow_append_and_kt_view_match_naive_cat_on_active_device() -> Result<()> {
+        let dev = crate::device::select_device(crate::device::Backend::Auto, 0)?;
+        let (h, dq, dv) = (4usize, 192usize, 128usize);
+        let mk = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect()
+        };
+        let k0 = Tensor::from_vec(mk(h * 5 * dq, 1), (h, 5, dq), &dev)?;
+        let v0 = Tensor::from_vec(mk(h * 5 * dv, 2), (h, 5, dv), &dev)?;
+        let k1 = Tensor::from_vec(mk(h * 1 * dq, 3), (h, 1, dq), &dev)?;
+        let v1 = Tensor::from_vec(mk(h * 1 * dv, 4), (h, 1, dv), &dev)?;
+        let k2 = Tensor::from_vec(mk(h * 1 * dq, 5), (h, 1, dq), &dev)?;
+        let v2 = Tensor::from_vec(mk(h * 1 * dv, 6), (h, 1, dv), &dev)?;
+        let q = Tensor::from_vec(mk(h * 1 * dq, 7), (h, 1, dq), &dev)?;
+
+        let mut prefix = KvState::default();
+        prefix.append(&k0, &v0, true)?;
+        let prefix_snap = prefix.k.as_ref().unwrap().narrow(1, 0, prefix.len)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+        // Cloned prefix must be isolated via Copy-on-Write (`Arc::strong_count == 1`).
+        let mut req1 = prefix.clone();
+        let (k_b1, v_b1, kt_b1) = req1.append(&k1, &v1, true)?;
+        assert_eq!(req1.len, 6);
+        let (k_b1_2, v_b1_2, kt_b1_2) = req1.append(&k2, &v2, true)?;
+        assert_eq!(req1.len, 7);
+
+        let prefix_after = prefix.k.as_ref().unwrap().narrow(1, 0, prefix.len)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(prefix_snap, prefix_after, "CoW violated: shared prefix was mutated!");
+
+        // Incremental k_t view matmul must match naive Tensor::cat + transpose + matmul.
+        let naive_k = Tensor::cat(&[&k0, &k1, &k2], 1)?;
+        let naive_v = Tensor::cat(&[&v0, &v1, &v2], 1)?;
+        let scale = (dq as f64).powf(-0.5);
+        let want = softmax_last_dim(&(q.matmul(&naive_k.t()?.contiguous()?)? * scale)?)?.matmul(&naive_v)?;
+        let got = softmax_last_dim(&(q.matmul(&kt_b1_2.unwrap())? * scale)?)?.matmul(&v_b1_2)?;
+        let diff = (&want.to_device(&Device::Cpu)? - &got.to_device(&Device::Cpu)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "KvState k_t matmul diff {diff}");
+        let _ = (k_b1, v_b1, kt_b1, k_b1_2);
+        if !dev.is_cpu() {
+            crate::device::trim_idle_gpu_pool(&dev);
+        }
+        Ok(())
     }
 }

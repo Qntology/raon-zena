@@ -100,10 +100,23 @@ impl Generator {
     /// Like [`Self::generate`], continuing from `st` (e.g. a cloned [`Self::prefix_state`]).
     pub fn generate_from(
         &self,
+        st: State,
+        prompt: &[u32],
+        max_new: usize,
+        on_text: impl FnMut(&str),
+    ) -> Result<(String, GenStats)> {
+        self.generate_from_cancellable(st, prompt, max_new, on_text, || false)
+    }
+
+    /// Like [`Self::generate_from`], polling `is_cancelled` before prefill and before each decode
+    /// token so rapid re-asks or privacy locks abort immediately without burning remaining tokens.
+    pub fn generate_from_cancellable(
+        &self,
         mut st: State,
         prompt: &[u32],
         max_new: usize,
         mut on_text: impl FnMut(&str),
+        is_cancelled: impl Fn() -> bool,
     ) -> Result<(String, GenStats)> {
         if prompt.is_empty() {
             anyhow::bail!("empty prompt");
@@ -112,8 +125,15 @@ impl Generator {
             prompt_tokens: prompt.len(),
             ..Default::default()
         };
+        if is_cancelled() {
+            return Ok((String::new(), stats));
+        }
         let t0 = Instant::now();
         let h = self.model.forward(prompt, &mut st)?;
+        if is_cancelled() {
+            stats.prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
+            return Ok((String::new(), stats));
+        }
         let last = h.narrow(0, prompt.len() - 1, 1)?;
         let (mut next, _, s) = self.head.argmax(&self.model.w, &last)?;
         stats.guard_rows_refined += s.rows_refined;
@@ -122,13 +142,16 @@ impl Generator {
         let mut out: Vec<u32> = Vec::new();
         let mut shown = 0usize;
         while out.len() < max_new && !self.model.cfg.eos.contains(&next) {
+            if is_cancelled() {
+                break;
+            }
             out.push(next);
             let text = self.decode(&out)?;
             if text.len() > shown && text.is_char_boundary(shown) && !text.ends_with('\u{FFFD}') {
                 on_text(&text[shown..]);
                 shown = text.len();
             }
-            if out.len() == max_new {
+            if out.len() == max_new || is_cancelled() {
                 break;
             }
             let h = self.model.forward(&[next], &mut st)?;

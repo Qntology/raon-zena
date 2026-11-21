@@ -1,21 +1,22 @@
 //! Output head (tied to `model.embed_tokens.weight`).
 //!
 //! Modes:
-//! * [`HeadMode::Full`] (default, exact): every vocabulary row is scored. On the CPU the fused
-//!   kernels read the mmap'd Q8_0 blocks directly; on a GPU the table is uploaded as a quantized
-//!   `QMatMul` (+404 MiB VRAM for the pyramid GGUF).
-//! * [`HeadMode::Kept`] (approximate): only the resident `lm_head.kept` rows (`kept_ids`) — the
-//!   PRD's sliced head; tokens outside the kept set can never be produced.
-//! * [`HeadMode::Guarded`] (exact): kept rows + the cold-row cluster bound of `raon-quant`. Measured
-//!   on real hidden states the bound prunes almost nothing (≈ 99.9 % of cold rows re-scored), so it
-//!   is slower than `Full`; kept for experiments.
+//! * [`HeadMode::Full`] (default, exact): every vocabulary row is scored.
+//!   - GPU: uses Pack A/C `candle_core::lm_head::fused_linear_argmax_cs` (Mode A dense: 0 bytes
+//!     logits materialization) or `logits_argmax_cs` (Mode B quantized: 8-byte D2H instead of 1 MiB).
+//!   - CPU: zero-allocation parallel tiled argmax over mmap'd blocks (no 1.04 MiB logits Vec).
+//! * [`HeadMode::Kept`] (approximate): only the resident `lm_head.kept` rows (`kept_ids`).
+//! * [`HeadMode::Guarded`] (exact): kept top-1 + cold-row bound refinement (`ColdGuard`).
 
+use crate::device::{accel_op_ok, AccelOp};
 use crate::weights::{Linear, Source, Weights};
 use anyhow::{bail, Context, Result};
+use candle_core::quantized::QMatMul;
 use candle_core::Tensor;
 use raon_quant::gguf::GgmlType;
 use raon_quant::kernels::{dot_row, matvec};
 use raon_quant::lmhead::{exact_argmax, ArgmaxStats, ColdGuard};
+use rayon::prelude::*;
 
 const EMBED: &str = "model.embed_tokens.weight";
 
@@ -64,6 +65,80 @@ fn table<'a>(w: &'a Weights, name: &str) -> Result<(GgmlType, &'a [u8], usize, u
     })
 }
 
+#[inline]
+fn better_pair(a: (usize, f32), b: (usize, f32)) -> (usize, f32) {
+    if a.1 > b.1 || (a.1 == b.1 && a.0 < b.0) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Zero-allocation parallel tiled argmax over packed host rows `[rows, cols]` with deterministic
+/// smallest-index tie-breaking.
+fn cpu_argmax_table(ty: GgmlType, bytes: &[u8], rows: usize, cols: usize, hv: &[f32]) -> (usize, f32) {
+    if rows == 0 {
+        return (0, f32::NEG_INFINITY);
+    }
+    #[cfg(target_endian = "little")]
+    if ty == GgmlType::F32 {
+        // SAFETY: `align_to` only yields `mid` when properly 4-byte aligned.
+        let (head, mid, tail) = unsafe { bytes.align_to::<f32>() };
+        if head.is_empty() && tail.is_empty() && mid.len() == rows * cols {
+            if let Some(best) = raon_cpu_kernels::dot_argmax_rows_f32(hv, mid, rows, cols) {
+                return best;
+            }
+        }
+    }
+    let rb = ty.row_bytes(cols);
+    let chunk = (rows / rayon::current_num_threads().max(1)).clamp(64, 2048);
+    let n_chunks = rows.div_ceil(chunk);
+    (0..n_chunks)
+        .into_par_iter()
+        .map(|c| {
+            let r0 = c * chunk;
+            let r1 = (r0 + chunk).min(rows);
+            let mut best = (usize::MAX, f32::NEG_INFINITY);
+            for r in r0..r1 {
+                let l = dot_row(ty, &bytes[r * rb..(r + 1) * rb], hv);
+                best = better_pair((r, l), best);
+            }
+            best
+        })
+        .reduce(|| (usize::MAX, f32::NEG_INFINITY), better_pair)
+}
+
+/// On-device argmax over `lin` for `h_row [1, C]`:
+/// - Mode A (`QMatMul::Tensor`): `fused_linear_argmax_cs` (0 bytes logits materialization).
+/// - Mode B (`QMatMul::QTensor`/`TensorF16`): `lin.forward` + `logits_argmax_cs` (8 bytes D2H).
+fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor) -> Result<(usize, f32)> {
+    if accel_op_ok(h_row.device(), AccelOp::LmHeadArgmax) {
+        let out = match lin.inner() {
+            QMatMul::Tensor(weight) => {
+                candle_core::lm_head::fused_linear_argmax_cs(h_row, weight, None, None, None)
+            }
+            _ => {
+                let logits = lin.forward(h_row)?;
+                candle_core::lm_head::logits_argmax_cs(&logits, None, None, None)
+            }
+        };
+        if let Ok(out) = out {
+            let idx = out.ids.to_device(&candle_core::Device::Cpu)?.to_vec1::<u32>()?[0] as usize;
+            let val = match out.max_vals {
+                Some(m) => m.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?[0],
+                None => 0.0,
+            };
+            return Ok((idx, val));
+        }
+    }
+    let y = lin.forward(h_row)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut best = (usize::MAX, f32::NEG_INFINITY);
+    for (i, &x) in y.iter().enumerate() {
+        best = better_pair((i, x), best);
+    }
+    Ok(best)
+}
+
 impl Head {
     pub fn load(w: &Weights, mode: HeadMode) -> Result<Self> {
         let sliced = w.kept_ids.is_some() && w.has("lm_head.kept");
@@ -107,40 +182,107 @@ impl Head {
         Ok(y)
     }
 
-    fn scored(&self, w: &Weights, h: &Tensor, hv: &[f32]) -> Result<Vec<f32>> {
-        if let Some(lin) = &self.dev {
-            return Ok(lin.forward(&h.reshape((1, hv.len()))?)?.flatten_all()?.to_vec1::<f32>()?);
-        }
-        let name = if self.mode == HeadMode::Full { EMBED } else { "lm_head.kept" };
-        let (ty, bytes, v, c) = table(w, name)?;
-        let mut y = vec![0f32; v];
-        matvec(ty, bytes, v, c, hv, &mut y);
-        Ok(y)
-    }
-
-    /// Greedy token for one hidden state `h [C]` → (token id, logit, guard stats).
+    /// Greedy token for one hidden state `h [C]` (or `[1, C]`) → (token id, logit, guard stats).
     pub fn argmax(&self, w: &Weights, h: &Tensor) -> Result<(u32, f32, ArgmaxStats)> {
-        let hv = h.flatten_all()?.to_vec1::<f32>()?;
-        let y = self.scored(w, h, &hv)?;
-        let (i, l) = y
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a });
+        let c = h.elem_count();
+        let h_row = h.reshape((1, c))?;
+        let (best_idx, best_logit, hv_opt) = if let Some(lin) = &self.dev {
+            let (i, l) = gpu_argmax_linear(lin, &h_row)?;
+            (i, l, None)
+        } else {
+            let hv = h.flatten_all()?.to_vec1::<f32>()?;
+            let name = if self.mode == HeadMode::Full { EMBED } else { "lm_head.kept" };
+            let (ty, bytes, v, cols) = table(w, name)?;
+            let (i, l) = cpu_argmax_table(ty, bytes, v, cols, &hv);
+            (i, l, Some(hv))
+        };
         match self.mode {
-            HeadMode::Full => Ok((i as u32, l, ArgmaxStats::default())),
-            HeadMode::Kept => Ok((self.kept_ids.as_ref().unwrap()[i], l, ArgmaxStats::default())),
+            HeadMode::Full => Ok((best_idx as u32, best_logit, ArgmaxStats::default())),
+            HeadMode::Kept => Ok((self.kept_ids.as_ref().unwrap()[best_idx], best_logit, ArgmaxStats::default())),
             HeadMode::Guarded => {
+                let hv = match hv_opt {
+                    Some(v) => v,
+                    None => h.flatten_all()?.to_vec1::<f32>()?,
+                };
                 let g = w.gguf().context("guarded head needs a GGUF")?;
                 let ty = g.tensor(EMBED)?.ty;
+                let best_kept_id = self.kept_ids.as_ref().unwrap()[best_idx];
                 let cold = |id: u32| dot_row(ty, g.row_bytes(EMBED, id as usize).unwrap(), &hv);
                 Ok(exact_argmax(
-                    &y,
-                    self.kept_ids.as_ref().unwrap(),
+                    &[best_logit],
+                    &[best_kept_id],
                     self.guard.as_ref().unwrap(),
                     &hv,
                     cold,
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::{select_device, trim_idle_gpu_pool, Backend};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::Device;
+
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cpu_zero_alloc_argmax_matches_matvec_and_tie_breaks_smallest_id() {
+        let (rows, cols) = (512usize, 64usize);
+        let mut w = det(rows * cols, 77);
+        // Make row 100 and row 200 identical winners to verify smallest-ID tie-break.
+        let h = det(cols, 88);
+        for j in 0..cols {
+            w[100 * cols + j] = h[j] * 4.0;
+            w[200 * cols + j] = h[j] * 4.0;
+        }
+        let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let (idx, val) = cpu_argmax_table(GgmlType::F32, &bytes, rows, cols, &h);
+        assert_eq!(idx, 100, "must tie-break to smallest row index");
+        let mut ref_y = vec![0.0f32; rows];
+        matvec(GgmlType::F32, &bytes, rows, cols, &h, &mut ref_y);
+        assert!((val - ref_y[100]).abs() < 1e-4, "{val} vs {}", ref_y[100]);
+    }
+
+    #[test]
+    fn lm_head_mode_a_and_mode_b_match_reference_on_active_device() -> Result<()> {
+        let dev = select_device(Backend::Auto, 0)?;
+        let (rows, cols) = (256usize, 64usize);
+        let w = Tensor::from_vec(det(rows * cols, 91), (rows, cols), &Device::Cpu)?;
+        let h = Tensor::from_vec(det(cols, 92), (1, cols), &Device::Cpu)?;
+        let ref_logits = h.matmul(&w.t()?)?.squeeze(0)?.to_vec1::<f32>()?;
+        let (want_id, want_val) = ref_logits
+            .iter()
+            .enumerate()
+            .fold((usize::MAX, f32::NEG_INFINITY), |a, (i, &x)| better_pair((i, x), a));
+
+        // Mode A: dense Tensor -> fused_linear_argmax_cs
+        let lin_dense = Linear::from_qmatmul(QMatMul::Tensor(w.to_device(&dev)?), true, "test.dense", rows, cols);
+        let (got_id, got_val) = gpu_argmax_linear(&lin_dense, &h.to_device(&dev)?)?;
+        assert_eq!(got_id, want_id);
+        assert!((got_val - want_val).abs() < 1e-3, "{got_val} vs {want_val}");
+
+        // Mode B: quantized QTensor -> forward + logits_argmax_cs
+        let qt = QTensor::quantize(&w.to_device(&dev)?, GgmlDType::Q8_0)?;
+        let lin_q = Linear::from_qmatmul(QMatMul::from_qtensor(qt)?, crate::device::exact_matmul_native(&dev), "test.q8", rows, cols);
+        let (q_id, q_val) = gpu_argmax_linear(&lin_q, &h.to_device(&dev)?)?;
+        assert_eq!(q_id, want_id);
+        assert!((q_val - want_val).abs() < 0.1, "{q_val} vs {want_val}");
+
+        if !dev.is_cpu() {
+            trim_idle_gpu_pool(&dev);
+        }
+        Ok(())
     }
 }

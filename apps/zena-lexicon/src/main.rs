@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         "export" => {
             let json = serde_json::to_string_pretty(&store.load()?.to_json())?;
             match args.first() {
-                Some(p) => std::fs::write(p, json + "\n")?,
+                Some(p) => raon_infer::device::write_file_atomic(std::path::Path::new(p), (json + "\n").as_bytes())?,
                 None => println!("{json}"),
             }
         }
@@ -263,5 +263,6 @@ fn main() -> Result<()> {
             "unknown command {other} (import, export, add, remove, search, show, candidates, history, rollback, anchors, nearest, stats)"
         ),
     }
+    raon_infer::device::rocm_exit_now_if_used(0);
     Ok(())
 }

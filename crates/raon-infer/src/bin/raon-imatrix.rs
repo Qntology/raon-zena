@@ -58,5 +58,6 @@ fn main() -> Result<()> {
     }
     let n = imatrix::write(&out)?;
     eprintln!("[raon-imatrix] wrote {n} entries to {}", out.display());
+    raon_infer::device::rocm_exit_now_if_used(0);
     Ok(())
 }

@@ -26,3 +26,33 @@ pub use router::{Caught, FeedbackCatch, FeedbackSpan, FeedbackWord, NlpNmsRouter
 pub fn __granite_dir() -> Option<std::path::PathBuf> {
     premium_discount_nms::__granite_dir()
 }
+
+/// Installs the multi-core `raon-cpu-kernels` SiLU-GLU kernel into `premium-discount-nlp::granite`
+/// (bit-identical to candle's CPU `silu(gate) * up`, zero narrow copies, falls back off-CPU).
+pub fn install_cpu_glu_kernel() -> bool {
+    #[cfg(feature = "neural")]
+    {
+        fn cpu_silu_glu(x: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+            if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 && x.is_contiguous() {
+                let dims = x.dims();
+                if let Some(&last) = dims.last() {
+                    if last > 0 && last % 2 == 0 {
+                        let half = last / 2;
+                        let src = x.flatten_all()?.to_vec1::<f32>()?;
+                        let mut out = vec![0.0f32; src.len() / 2];
+                        raon_cpu_kernels::silu_mul_halves(&src, half, &mut out);
+                        let mut out_dims = dims.to_vec();
+                        *out_dims.last_mut().unwrap() = half;
+                        return candle_core::Tensor::from_vec(out, out_dims, x.device());
+                    }
+                }
+            }
+            premium_discount_nlp::granite::silu_glu(x)
+        }
+        premium_discount_nlp::granite::set_glu_kernel(cpu_silu_glu)
+    }
+    #[cfg(not(feature = "neural"))]
+    {
+        false
+    }
+}

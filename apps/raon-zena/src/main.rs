@@ -239,19 +239,22 @@ fn main() -> Result<()> {
     if let Some(dir) = &a.snapshot {
         return snapshot::run(dir, a.font.as_deref(), a.vrm.as_deref());
     }
+    // Wire multi-core SIMD SiLU-GLU kernel for granite embeddings (when `nlp` feature is active).
+    let _ = nlp_nms_router::install_cpu_glu_kernel();
     // PRD §3.5: verify the fused kernels before enabling them.
     let checks = raon_quant::kernels::verify_kernels(1e-3);
     if checks.iter().any(|c| !c.ok) {
         bail!("kernel self-test failed: {checks:?}");
     }
-    // Report residency of pre-quantized GGUFs; a safetensors directory is quantized while the
-    // LLM backend loads it.
-    let _models: Vec<GgufFile> = [a.model.as_ref(), a.vision.as_ref()]
+    // Report residency of pre-quantized GGUFs, then immediately drop the temporary mmap handles
+    // so idle LLM unloads actually release file pages.
+    for p in [a.model.as_ref(), a.vision.as_ref()]
         .into_iter()
         .flatten()
         .filter(|p| p.is_file())
-        .map(|p| open_model(p))
-        .collect::<Result<_>>()?;
+    {
+        let _ = open_model(p)?;
+    }
 
     let (src, screen): (Box<dyn capture::FrameSource>, ScreenGeometry) = {
         #[cfg(windows)]
@@ -487,5 +490,6 @@ fn main() -> Result<()> {
         .with_assets(assets, a.track)
         .with_font(a.font.clone());
     event_loop.run_app(&mut app)?;
+    raon_infer::device::rocm_exit_now_if_used(0);
     Ok(())
 }
