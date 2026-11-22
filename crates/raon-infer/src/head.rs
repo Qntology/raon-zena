@@ -110,10 +110,10 @@ fn cpu_argmax_table(ty: GgmlType, bytes: &[u8], rows: usize, cols: usize, hv: &[
 
 /// On-device argmax over `lin` for `h_row [M, C]`:
 /// - Mode A (`QMatMul::Tensor`): `fused_linear_argmax_cs` (0-byte logits materialization).
-/// - Quantized Mode A (ROCm + `QMatMul::QTensor` + `Q8_0|Q4_0|Q4K|Q5K|Q6K`):
-///   `fused_quant_argmax_cs` (0-byte `[M, V]` logits materialization, automatically chunking `M > 8` on candle@708b2f2).
+/// - Quantized Mode A (CUDA / ROCm + `QMatMul::QTensor` + `Q8_0|Q4_0|Q4K|Q5K|Q6K`):
+///   `fused_quant_argmax_cs` (0-byte `[M, V]` logits materialization, automatically chunking `M > 8`).
 /// - Mode B (Vulkan / other `QTensor` / `TensorF16`): `lin.forward` + `logits_argmax_cs` (8 bytes D2H).
-fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor) -> Result<Vec<(usize, f32)>> {
+fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor, need_val: bool) -> Result<Vec<(usize, f32)>> {
     use candle_core::quantized::GgmlDType;
     let dev = h_row.device();
     let m = h_row.dim(0)?;
@@ -123,7 +123,7 @@ fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor) -> Result<Vec<(usize, f
                 candle_core::lm_head::fused_linear_argmax_cs(h_row, weight, None, None, None)
             }
             QMatMul::QTensor(qweight)
-                if crate::device::is_rocm(dev)
+                if (crate::device::is_rocm(dev) || dev.is_cuda())
                     && matches!(
                         qweight.dtype(),
                         GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
@@ -143,9 +143,13 @@ fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor) -> Result<Vec<(usize, f
         };
         if let Ok(out) = out {
             let (ids, _) = out.download_ids_and_mask()?;
-            let vals = match out.max_vals {
-                Some(mv) => mv.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?,
-                None => vec![0.0; ids.len()],
+            let vals = if need_val {
+                match out.max_vals {
+                    Some(mv) => mv.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?,
+                    None => vec![0.0; ids.len()],
+                }
+            } else {
+                vec![0.0; ids.len()]
             };
             return Ok(ids
                 .into_iter()
@@ -168,8 +172,8 @@ fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor) -> Result<Vec<(usize, f
     Ok(out)
 }
 
-fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor) -> Result<(usize, f32)> {
-    Ok(gpu_argmax_linear_batch(lin, h_row)?[0])
+fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor, need_val: bool) -> Result<(usize, f32)> {
+    Ok(gpu_argmax_linear_batch(lin, h_row, need_val)?[0])
 }
 
 impl Head {
@@ -217,10 +221,21 @@ impl Head {
 
     /// Greedy token for one hidden state `h [C]` (or `[1, C]`) → (token id, logit, guard stats).
     pub fn argmax(&self, w: &Weights, h: &Tensor) -> Result<(u32, f32, ArgmaxStats)> {
+        self.argmax_inner(w, h, true)
+    }
+
+    /// Greedy token ID for one hidden state `h [C]` (or `[1, C]`), skipping the extra `max_vals`
+    /// D2H sync in `HeadMode::Full`/`HeadMode::Kept` when only the winning token ID is needed.
+    pub fn argmax_id(&self, w: &Weights, h: &Tensor) -> Result<(u32, ArgmaxStats)> {
+        let (id, _, stats) = self.argmax_inner(w, h, self.mode == HeadMode::Guarded)?;
+        Ok((id, stats))
+    }
+
+    fn argmax_inner(&self, w: &Weights, h: &Tensor, need_val: bool) -> Result<(u32, f32, ArgmaxStats)> {
         let c = h.elem_count();
         let h_row = h.reshape((1, c))?;
         let (best_idx, best_logit, hv_opt) = if let Some(lin) = &self.dev {
-            let (i, l) = gpu_argmax_linear(lin, &h_row)?;
+            let (i, l) = gpu_argmax_linear(lin, &h_row, need_val)?;
             (i, l, None)
         } else {
             let hv = h.flatten_all()?.to_vec1::<f32>()?;
@@ -302,11 +317,11 @@ mod tests {
 
         // Mode A: dense Tensor -> fused_linear_argmax_cs
         let lin_dense = Linear::from_qmatmul(QMatMul::Tensor(w.to_device(&dev)?), true, "test.dense", rows, cols);
-        let (got_id, got_val) = gpu_argmax_linear(&lin_dense, &h.to_device(&dev)?)?;
+        let (got_id, got_val) = gpu_argmax_linear(&lin_dense, &h.to_device(&dev)?, true)?;
         assert_eq!(got_id, want_id);
         assert!((got_val - want_val).abs() < 1e-3, "{got_val} vs {want_val}");
 
-        // Quantized Mode A (ROCm fused_quant_argmax_cs, M=12 > 8 chunking) / Mode B (Vulkan GpuQuant + logits_argmax_cs)
+        // Quantized Mode A (CUDA/ROCm fused_quant_argmax_cs, M=12 > 8 chunking) / Mode B (Vulkan GpuQuant + logits_argmax_cs)
         let w_dev = w.to_device(&dev)?;
         let h_batch = Tensor::from_vec(det(12 * cols, 93), (12, cols), &Device::Cpu)?;
         let h_batch_dev = h_batch.to_device(&dev)?;
@@ -334,7 +349,7 @@ mod tests {
                 rows,
                 cols,
             );
-            let got = gpu_argmax_linear_batch(&lin_q, &h_batch_dev)?;
+            let got = gpu_argmax_linear_batch(&lin_q, &h_batch_dev, true)?;
             assert_eq!(got.len(), 12);
             for (r, &(q_id, q_val)) in got.iter().enumerate() {
                 let (q_want_id, q_want_val) = q_ref_flat[r * rows..(r + 1) * rows]

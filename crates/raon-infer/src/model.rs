@@ -411,12 +411,12 @@ impl Rda {
 /// Cloning `State` from a cached `prefix_state` shares the backing buffers via `Arc`; the first
 /// `append` on a cloned state copies into a freshly owned buffer so the shared prefix is NEVER
 /// mutated, and every subsequent decode token appends in O(T) via `slice_set` (zero O(L²) cat
-/// copies and zero per-token full-K transpose on GPU!).
+/// copies and zero-copy transposed K view `k_view.transpose(1, 2)` accepted directly by cuBLAS /
+/// rocBLAS / Vulkan / CPU without maintaining a duplicate `k_t` buffer).
 #[derive(Clone)]
 pub struct KvState {
     pub k: Option<Tensor>,   // [H, cap, dq]
     pub v: Option<Tensor>,   // [H, cap, dv]
-    k_t: Option<Tensor>,     // [H, dq, cap] (maintained incrementally on GPU)
     pub len: usize,
     cap: usize,
     planned_cap: usize,
@@ -436,7 +436,6 @@ impl KvState {
         Self {
             k: None,
             v: None,
-            k_t: None,
             len: 0,
             cap: 0,
             planned_cap,
@@ -463,7 +462,6 @@ impl KvState {
         let needed = self.len + t;
         let can_reuse = self.k.is_some()
             && self.v.is_some()
-            && (!store_kt || self.k_t.is_some())
             && Arc::strong_count(&self.share) == 1
             && needed <= self.cap;
 
@@ -472,11 +470,6 @@ impl KvState {
             let v_buf = self.v.as_ref().unwrap();
             k_buf.slice_set(new_k, 1, self.len)?;
             v_buf.slice_set(new_v, 1, self.len)?;
-            if store_kt {
-                let kt_buf = self.k_t.as_ref().unwrap();
-                let new_kt = new_k.transpose(1, 2)?.contiguous()?;
-                kt_buf.slice_set(&new_kt, 2, self.len)?;
-            }
             self.len = needed;
         } else {
             let new_cap = needed.max(self.planned_cap).next_power_of_two().max(256);
@@ -484,35 +477,18 @@ impl KvState {
             let dtype = new_k.dtype();
             let k_buf = Tensor::zeros((h, new_cap, dq), dtype, dev)?;
             let v_buf = Tensor::zeros((h, new_cap, dv), dtype, dev)?;
-            let kt_buf = if store_kt {
-                Some(Tensor::zeros((h, dq, new_cap), dtype, dev)?)
-            } else {
-                None
-            };
             if self.len > 0 {
                 if let (Some(old_k), Some(old_v)) = (&self.k, &self.v) {
                     let prev_k = old_k.narrow(1, 0, self.len)?.contiguous()?;
                     let prev_v = old_v.narrow(1, 0, self.len)?.contiguous()?;
                     k_buf.slice_set(&prev_k, 1, 0)?;
                     v_buf.slice_set(&prev_v, 1, 0)?;
-                    if let Some(ref kt) = kt_buf {
-                        let prev_kt = match &self.k_t {
-                            Some(old_kt) => old_kt.narrow(2, 0, self.len)?.contiguous()?,
-                            None => prev_k.transpose(1, 2)?.contiguous()?,
-                        };
-                        kt.slice_set(&prev_kt, 2, 0)?;
-                    }
                 }
             }
             k_buf.slice_set(new_k, 1, self.len)?;
             v_buf.slice_set(new_v, 1, self.len)?;
-            if let Some(ref kt) = kt_buf {
-                let new_kt = new_k.transpose(1, 2)?.contiguous()?;
-                kt.slice_set(&new_kt, 2, self.len)?;
-            }
             self.k = Some(k_buf);
             self.v = Some(v_buf);
-            self.k_t = kt_buf;
             self.cap = new_cap;
             self.len = needed;
             self.share = Arc::new(());
@@ -520,9 +496,12 @@ impl KvState {
 
         let k_view = self.k.as_ref().unwrap().narrow(1, 0, self.len)?;
         let v_view = self.v.as_ref().unwrap().narrow(1, 0, self.len)?;
-        let kt_view = match &self.k_t {
-            Some(kt) if store_kt => Some(kt.narrow(2, 0, self.len)?),
-            _ => None,
+        // `k_view.transpose(1, 2)` has shape [H, dq, L] with stride [cap*dq, 1, dq] — zero-copy
+        // CUBLAS_OP_T / rocblas_operation_transpose without a duplicate `[H, dq, cap]` buffer.
+        let kt_view = if store_kt {
+            Some(k_view.transpose(1, 2)?)
+        } else {
+            None
         };
         Ok((k_view, v_view, kt_view))
     }

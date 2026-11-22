@@ -137,7 +137,7 @@ impl Generator {
             return Ok((String::new(), stats));
         }
         let last = h.narrow(0, prompt.len() - 1, 1)?;
-        let (mut next, _, s) = self.head.argmax(&self.model.w, &last)?;
+        let (mut next, s) = self.head.argmax_id(&self.model.w, &last)?;
         stats.guard_rows_refined += s.rows_refined;
         stats.prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = Instant::now();
@@ -157,7 +157,7 @@ impl Generator {
                 break;
             }
             let h = self.model.forward(&[next], &mut st)?;
-            let (n, _, s) = self.head.argmax(&self.model.w, &h)?;
+            let (n, s) = self.head.argmax_id(&self.model.w, &h)?;
             stats.guard_rows_refined += s.rows_refined;
             next = n;
         }

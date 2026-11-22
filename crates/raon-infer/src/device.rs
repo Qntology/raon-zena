@@ -120,19 +120,25 @@ fn open_best_vulkan(ordinal: usize) -> Result<Device> {
     if count <= 1 {
         return Ok(Device::new_vulkan(0)?);
     }
-    let mut best_hw: Option<(u64, Device)> = None;
-    let mut best_cpu: Option<(u64, Device)> = None;
+    // Prefer discrete > integrated > virtual > other > CPU renderers, breaking ties by free VRAM.
+    let mut best: Option<((u8, u64), Device)> = None;
     for id in 0..count {
         if let Ok(d) = Device::new_vulkan(id) {
+            let tier: u8 = match d.as_vulkan_device().map(|v| v.device_type()) {
+                Ok("discrete") => 4,
+                Ok("integrated") => 3,
+                Ok("virtual") => 2,
+                Ok("other") => 1,
+                _ => 0,
+            };
             let free = d.mem_info().ok().flatten().map_or(0, |(f, _)| f as u64);
-            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
-            let slot = if is_cpu { &mut best_cpu } else { &mut best_hw };
-            if slot.as_ref().is_none_or(|(b, _)| free > *b) {
-                *slot = Some((free, d));
+            let rank = (tier, free);
+            if best.as_ref().is_none_or(|(b, _)| rank > *b) {
+                best = Some((rank, d));
             }
         }
     }
-    match best_hw.or(best_cpu) {
+    match best {
         Some((_, d)) => Ok(d),
         None => Ok(Device::new_vulkan(0)?),
     }
@@ -261,22 +267,34 @@ pub fn exact_matmul_native(d: &Device) -> bool {
     d.is_cuda() || is_rocm(d) || d.is_metal()
 }
 
-/// Conservatively trims idle GPU memory pools between turns without dropping the ROCm hot pool.
+/// Conservatively trims idle GPU memory pools between turns without dropping the CUDA/ROCm hot pool.
 ///
-/// On ROCm, trims down to a 256 MiB hot pool only when `pool_idle_bytes() >= 320 MiB`, avoiding
-/// `hipMallocAsync`/`hipFreeAsync` pipeline stalls between inference requests.
+/// On CUDA and ROCm, trims down to a 256 MiB hot pool only when `pool_idle_bytes() >= 320 MiB`,
+/// avoiding allocator pipeline stalls between inference requests.
 pub fn trim_idle_gpu_pool(d: &Device) {
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    const HIGH_WATER: usize = 320 << 20;
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    const KEEP_HOT: usize = 256 << 20;
     match d {
         #[cfg(feature = "rocm")]
         Device::Rocm(rd) => {
-            const HIGH_WATER: usize = 320 << 20;
-            const KEEP_HOT: usize = 256 << 20;
             if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
                 let _ = rd.trim_memory_pool_to(KEEP_HOT);
             }
         }
-        Device::Cuda(_) | Device::Vulkan(_) => {
-            let _ = d.trim_memory_pool(0);
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cd) => {
+            if cd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = cd.trim_memory_pool(KEEP_HOT);
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vd) => {
+            const VK_HIGH_WATER: usize = 64 << 20;
+            if vd.pooled_bytes() >= VK_HIGH_WATER {
+                let _ = vd.trim_memory_pool();
+            }
         }
         _ => {}
     }
@@ -511,21 +529,25 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
                 None,
                 None,
             )?;
-            if want.ids.to_vec1::<u32>()? != got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+            let (want_ids, _) = want.download_ids_and_mask()?;
+            let (got_ids, _) = got.download_ids_and_mask()?;
+            if want_ids != got_ids {
                 return Ok(f32::INFINITY);
             }
             let e_fused = rel_err_f32(got.max_vals.as_ref().unwrap(), want.max_vals.as_ref().unwrap())?;
             let l = Tensor::from_vec(det_vec(2 * 128, 15), (2, 128), &Device::Cpu)?;
             let want_l = candle_core::lm_head::logits_argmax_cs(&l, None, None, None)?;
             let got_l = candle_core::lm_head::logits_argmax_cs(&l.to_device(device)?, None, None, None)?;
-            if want_l.ids.to_vec1::<u32>()? != got_l.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+            let (want_l_ids, _) = want_l.download_ids_and_mask()?;
+            let (got_l_ids, _) = got_l.download_ids_and_mask()?;
+            if want_l_ids != got_l_ids {
                 return Ok(f32::INFINITY);
             }
             let e_logits = rel_err_f32(got_l.max_vals.as_ref().unwrap(), want_l.max_vals.as_ref().unwrap())?;
             let mut worst = e_fused.max(e_logits);
-            if is_rocm(device) {
+            if is_rocm(device) || device.is_cuda() {
                 use candle_core::quantized::{GgmlDType, QTensor};
-                // M=12 (> 8) exercises candle@708b2f2 chunked ROCm Mode A across Q8_0 / Q4_0 / Q4K / Q5K / Q6K.
+                // M=12 (> 8) exercises chunked CUDA/ROCm Quantized Mode A across Q8_0 / Q4_0 / Q4K / Q5K / Q6K.
                 let hq = Tensor::from_vec(det_vec(12 * 256, 18), (12, 256), &Device::Cpu)?;
                 let wq = Tensor::from_vec(det_vec(64 * 256, 19), (64, 256), &Device::Cpu)?;
                 let hq_dev = hq.to_device(device)?;
