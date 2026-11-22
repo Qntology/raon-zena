@@ -117,12 +117,18 @@ pub fn patchify_norm_hwc_u8_f32(
     let patch_dim = patch_size * patch_size * 3;
     assert_eq!(out.len(), gh * gw * patch_dim);
 
-    let scale = [
+    let mut scale = [
         1.0 / (255.0 * std[0]),
         1.0 / (255.0 * std[1]),
         1.0 / (255.0 * std[2]),
     ];
     let bias = [-mean[0] / std[0], -mean[1] / std[1], -mean[2] / std[2]];
+    for c in 0..3 {
+        let hi = (1.0 - mean[c]) / std[c];
+        if 255.0f32.mul_add(scale[c], bias[c]) > hi {
+            scale[c] = f32::from_bits(scale[c].to_bits().saturating_sub(1));
+        }
+    }
     let row_bytes = width * 3;
     let patch_row_floats = patch_size * 3;
 

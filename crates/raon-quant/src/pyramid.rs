@@ -103,7 +103,7 @@ impl PyramidConfig {
     /// * `prd`  — the PRD v3.0 pyramid as written (T4 Q4_K for MLP and the PLE table).
     /// * `zena` — the measured quality recipe for Raon-1-nano: MLP Q5_K, the 6 MLPs after the
     ///   front edge Q6_K, PLE table Q8_0 (disk-gathered). Use with an imatrix.
-    /// * `q8`   — every quantized tensor Q8_0 (Vulkan runs only Q8_0 on the GPU).
+    /// * `q8`   — every quantized tensor Q8_0 (uniform highest-precision quantized baseline).
     pub fn preset(name: &str) -> Result<Self> {
         let d = Self::default();
         Ok(match name {

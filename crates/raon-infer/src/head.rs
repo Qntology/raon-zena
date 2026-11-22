@@ -108,14 +108,33 @@ fn cpu_argmax_table(ty: GgmlType, bytes: &[u8], rows: usize, cols: usize, hv: &[
         .reduce(|| (usize::MAX, f32::NEG_INFINITY), better_pair)
 }
 
-/// On-device argmax over `lin` for `h_row [1, C]`:
-/// - Mode A (`QMatMul::Tensor`): `fused_linear_argmax_cs` (0 bytes logits materialization).
-/// - Mode B (`QMatMul::QTensor`/`TensorF16`): `lin.forward` + `logits_argmax_cs` (8 bytes D2H).
-fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor) -> Result<(usize, f32)> {
-    if accel_op_ok(h_row.device(), AccelOp::LmHeadArgmax) {
+/// On-device argmax over `lin` for `h_row [M, C]`:
+/// - Mode A (`QMatMul::Tensor`): `fused_linear_argmax_cs` (0-byte logits materialization).
+/// - Quantized Mode A (ROCm + `QMatMul::QTensor` + `Q8_0|Q4_0|Q4K|Q5K|Q6K`):
+///   `fused_quant_argmax_cs` (0-byte `[M, V]` logits materialization, automatically chunking `M > 8` on candle@708b2f2).
+/// - Mode B (Vulkan / other `QTensor` / `TensorF16`): `lin.forward` + `logits_argmax_cs` (8 bytes D2H).
+fn gpu_argmax_linear_batch(lin: &Linear, h_row: &Tensor) -> Result<Vec<(usize, f32)>> {
+    use candle_core::quantized::GgmlDType;
+    let dev = h_row.device();
+    let m = h_row.dim(0)?;
+    if accel_op_ok(dev, AccelOp::LmHeadArgmax) {
         let out = match lin.inner() {
             QMatMul::Tensor(weight) => {
                 candle_core::lm_head::fused_linear_argmax_cs(h_row, weight, None, None, None)
+            }
+            QMatMul::QTensor(qweight)
+                if crate::device::is_rocm(dev)
+                    && matches!(
+                        qweight.dtype(),
+                        GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+                    )
+                    && h_row.dim(1).unwrap_or(0).is_multiple_of(qweight.dtype().block_size()) =>
+            {
+                candle_core::lm_head::fused_quant_argmax_cs(h_row, qweight, None, None, None)
+                    .or_else(|_| {
+                        let logits = lin.forward(h_row)?;
+                        candle_core::lm_head::logits_argmax_cs(&logits, None, None, None)
+                    })
             }
             _ => {
                 let logits = lin.forward(h_row)?;
@@ -123,20 +142,34 @@ fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor) -> Result<(usize, f32)> {
             }
         };
         if let Ok(out) = out {
-            let idx = out.ids.to_device(&candle_core::Device::Cpu)?.to_vec1::<u32>()?[0] as usize;
-            let val = match out.max_vals {
-                Some(m) => m.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?[0],
-                None => 0.0,
+            let (ids, _) = out.download_ids_and_mask()?;
+            let vals = match out.max_vals {
+                Some(mv) => mv.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?,
+                None => vec![0.0; ids.len()],
             };
-            return Ok((idx, val));
+            return Ok(ids
+                .into_iter()
+                .zip(vals)
+                .map(|(id, v)| (id as usize, v))
+                .collect());
         }
     }
-    let y = lin.forward(h_row)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut best = (usize::MAX, f32::NEG_INFINITY);
-    for (i, &x) in y.iter().enumerate() {
-        best = better_pair((i, x), best);
+    let logits = lin.forward(h_row)?.to_device(&candle_core::Device::Cpu)?;
+    let vocab = logits.dim(1)?;
+    let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+    let mut out = Vec::with_capacity(m);
+    for row in flat.chunks_exact(vocab) {
+        let mut best = (usize::MAX, f32::NEG_INFINITY);
+        for (i, &x) in row.iter().enumerate() {
+            best = better_pair((i, x), best);
+        }
+        out.push(best);
     }
-    Ok(best)
+    Ok(out)
+}
+
+fn gpu_argmax_linear(lin: &Linear, h_row: &Tensor) -> Result<(usize, f32)> {
+    Ok(gpu_argmax_linear_batch(lin, h_row)?[0])
 }
 
 impl Head {
@@ -223,7 +256,7 @@ impl Head {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{select_device, trim_idle_gpu_pool, Backend};
+    use crate::device::{drain_gpu_pool, select_device, Backend};
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::Device;
 
@@ -258,7 +291,7 @@ mod tests {
     #[test]
     fn lm_head_mode_a_and_mode_b_match_reference_on_active_device() -> Result<()> {
         let dev = select_device(Backend::Auto, 0)?;
-        let (rows, cols) = (256usize, 64usize);
+        let (rows, cols) = (256usize, 256usize);
         let w = Tensor::from_vec(det(rows * cols, 91), (rows, cols), &Device::Cpu)?;
         let h = Tensor::from_vec(det(cols, 92), (1, cols), &Device::Cpu)?;
         let ref_logits = h.matmul(&w.t()?)?.squeeze(0)?.to_vec1::<f32>()?;
@@ -273,15 +306,48 @@ mod tests {
         assert_eq!(got_id, want_id);
         assert!((got_val - want_val).abs() < 1e-3, "{got_val} vs {want_val}");
 
-        // Mode B: quantized QTensor -> forward + logits_argmax_cs
-        let qt = QTensor::quantize(&w.to_device(&dev)?, GgmlDType::Q8_0)?;
-        let lin_q = Linear::from_qmatmul(QMatMul::from_qtensor(qt)?, crate::device::exact_matmul_native(&dev), "test.q8", rows, cols);
-        let (q_id, q_val) = gpu_argmax_linear(&lin_q, &h.to_device(&dev)?)?;
-        assert_eq!(q_id, want_id);
-        assert!((q_val - want_val).abs() < 0.1, "{q_val} vs {want_val}");
+        // Quantized Mode A (ROCm fused_quant_argmax_cs, M=12 > 8 chunking) / Mode B (Vulkan GpuQuant + logits_argmax_cs)
+        let w_dev = w.to_device(&dev)?;
+        let h_batch = Tensor::from_vec(det(12 * cols, 93), (12, cols), &Device::Cpu)?;
+        let h_batch_dev = h_batch.to_device(&dev)?;
+        for dt in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            let exact = crate::device::exact_matmul_native(&dev);
+            let qt_cpu = QTensor::quantize(&w, dt)?;
+            let q_ref_flat = if exact || dev.is_vulkan() {
+                qt_cpu.forward_exact(&h_batch)?
+            } else {
+                candle_core::Module::forward(&QMatMul::from_qtensor(qt_cpu)?, &h_batch)?
+            }
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+            let qt = QTensor::quantize(&w_dev, dt)?;
+            let lin_q = Linear::from_qmatmul(
+                QMatMul::from_qtensor(qt)?,
+                exact,
+                "test.quant",
+                rows,
+                cols,
+            );
+            let got = gpu_argmax_linear_batch(&lin_q, &h_batch_dev)?;
+            assert_eq!(got.len(), 12);
+            for (r, &(q_id, q_val)) in got.iter().enumerate() {
+                let (q_want_id, q_want_val) = q_ref_flat[r * rows..(r + 1) * rows]
+                    .iter()
+                    .enumerate()
+                    .fold((usize::MAX, f32::NEG_INFINITY), |a, (i, &x)| better_pair((i, x), a));
+                assert_eq!(q_id, q_want_id, "{dt:?} row={r} argmax mismatch");
+                assert!((q_val - q_want_val).abs() < 0.1, "{dt:?} row={r}: {q_val} vs {q_want_val}");
+            }
+        }
 
         if !dev.is_cpu() {
-            trim_idle_gpu_pool(&dev);
+            drain_gpu_pool(&dev);
         }
         Ok(())
     }

@@ -141,7 +141,6 @@ pub fn rda_host_scan_f32(
 
     let run_head = |(hi, s): (usize, &mut [f32])| {
         let out_ptr = &out_ptr;
-        let mut pred = vec![0f32; d];
         let mut decay = vec![0f32; d];
         for ti in 0..t {
             let base = (ti * h + hi) * d;
@@ -154,31 +153,29 @@ pub fn rda_host_scan_f32(
                 decay[ki] = at[ki].exp();
             }
 
+            // Single L1-hot pass per state row `vi`: each row `S[vi, 0..d]` is independent of
+            // other `v` rows, so fusing decay+predict with update+query halves L2/DRAM traffic
+            // on the 64 KiB `[128, 128]` per-head state while remaining bit-exact.
             if avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                        pred[vi] = decay_and_dot_avx2(row.as_mut_ptr(), decay.as_ptr(), kt.as_ptr(), d);
-                    }
                     let dst = std::slice::from_raw_parts_mut(out_ptr.0.add(base), d);
                     for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                        let e = bt * (vt[vi] - pred[vi]);
+                        let pred_vi = decay_and_dot_avx2(row.as_mut_ptr(), decay.as_ptr(), kt.as_ptr(), d);
+                        let e = bt * (vt[vi] - pred_vi);
                         dst[vi] = update_and_dot_avx2(row.as_mut_ptr(), e, kt.as_ptr(), qt.as_ptr(), d);
                     }
                 }
             } else {
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add(base), d) };
                 for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                    let mut acc = 0f32;
+                    let mut pred_vi = 0f32;
                     for ki in 0..d {
                         let rv = row[ki] * decay[ki];
                         row[ki] = rv;
-                        acc = rv.mul_add(kt[ki], acc);
+                        pred_vi = rv.mul_add(kt[ki], pred_vi);
                     }
-                    pred[vi] = acc;
-                }
-                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add(base), d) };
-                for (vi, row) in s.chunks_exact_mut(d).enumerate() {
-                    let e = bt * (vt[vi] - pred[vi]);
+                    let e = bt * (vt[vi] - pred_vi);
                     let mut acc = 0f32;
                     for ki in 0..d {
                         let rv = e.mul_add(kt[ki], row[ki]);

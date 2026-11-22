@@ -49,7 +49,7 @@ cargo build --release -p raon-zena --features vulkan
 |---|---|---|
 | CUDA | `QMatMul::forward_exact`: 활성값을 양자화하지 않습니다. 디코드는 블록을 커널 안에서 f32로 풀어 f32로 누산하고, 프리필은 타일 단위 역양자화 후 cuBLAS GEMM을 씁니다. | Q8_0 / Q4_K / Q5_K / Q6_K 모두 GPU |
 | ROCm | `forward_exact`(f32 mat-vec 또는 rocBLAS) | 모두 GPU |
-| Vulkan | `forward`. **Q8_0만** VRAM GEMV/GEMM 커널을 쓰고, K-quant는 매핑된 블록에서 CPU 커널로 돕니다. | Vulkan에서는 `--tier3 q8_0 --tier4 q8_0` 레시피를 권장 |
+| Vulkan | `forward` (`GpuQuant` VRAM GEMV/GEMM 셰이더). `candle@b90b12c` 부터 Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K 모두 장치 VRAM 에서 직접 계산합니다. | Q8_0 / Q4_K / Q5_K / Q6_K 모두 GPU |
 | Metal / CPU | `forward`(활성값을 Q8_K로 양자화하는 SIMD k-quant 커널). 이 장치에서 `forward_exact`는 호출마다 가중치 전체를 역양자화하므로 쓰지 않습니다. logis-center와 같은 정책입니다. | 모두 |
 
 ## 모델 구현

@@ -419,23 +419,37 @@ pub struct KvState {
     k_t: Option<Tensor>,     // [H, dq, cap] (maintained incrementally on GPU)
     pub len: usize,
     cap: usize,
+    planned_cap: usize,
     share: Arc<()>,
 }
 
 impl Default for KvState {
     fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
+impl KvState {
+    /// Creates an empty KV state that reserves at least `planned_cap` tokens on its first
+    /// allocation, avoiding power-of-two reallocations when prompt + `max_new` is known upfront.
+    pub fn with_capacity(planned_cap: usize) -> Self {
         Self {
             k: None,
             v: None,
             k_t: None,
             len: 0,
             cap: 0,
+            planned_cap,
             share: Arc::new(()),
         }
     }
-}
 
-impl KvState {
+    pub fn plan_capacity(&mut self, planned_cap: usize) {
+        if planned_cap > self.planned_cap {
+            self.planned_cap = planned_cap;
+        }
+    }
+
     /// Appends `new_k [H, T, dq]` and `new_v [H, T, dv]`, returning zero-copy valid views
     /// `(k [H, L, dq], v [H, L, dv], k_t Option<[H, dq, L]>)`.
     fn append(
@@ -465,7 +479,7 @@ impl KvState {
             }
             self.len = needed;
         } else {
-            let new_cap = needed.next_power_of_two().max(256);
+            let new_cap = needed.max(self.planned_cap).next_power_of_two().max(256);
             let dev = new_k.device();
             let dtype = new_k.dtype();
             let k_buf = Tensor::zeros((h, new_cap, dq), dtype, dev)?;
@@ -767,6 +781,18 @@ pub struct State {
     pub pos: usize,
 }
 
+impl State {
+    /// Reserves planned total sequence capacity (`prompt + max_new`) on all MLA KV layers so the
+    /// next allocation sizes buffers once without doubling reallocs.
+    pub fn plan_capacity(&mut self, planned_cap: usize) {
+        for layer in &mut self.layers {
+            if let LayerState::Mla(kv) = layer {
+                kv.plan_capacity(planned_cap);
+            }
+        }
+    }
+}
+
 pub struct Model {
     pub cfg: Config,
     pub w: Weights,
@@ -823,6 +849,10 @@ impl Model {
     }
 
     pub fn new_state(&self) -> State {
+        self.new_state_with_capacity(0)
+    }
+
+    pub fn new_state_with_capacity(&self, planned_cap: usize) -> State {
         let layers = self
             .cfg
             .rda_layer
@@ -834,7 +864,7 @@ impl Model {
                         rec: RecState::Empty,
                     })
                 } else {
-                    LayerState::Mla(KvState::default())
+                    LayerState::Mla(KvState::with_capacity(planned_cap))
                 }
             })
             .collect();
@@ -985,6 +1015,19 @@ mod tests {
         if !dev.is_cpu() {
             crate::device::trim_idle_gpu_pool(&dev);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn kv_state_with_capacity_preallocates_without_doubling() -> Result<()> {
+        let dev = Device::Cpu;
+        let (h, dq, dv) = (2usize, 16usize, 8usize);
+        let mut kv = KvState::with_capacity(300);
+        let k0 = Tensor::zeros((h, 4, dq), DType::F32, &dev)?;
+        let v0 = Tensor::zeros((h, 4, dv), DType::F32, &dev)?;
+        kv.append(&k0, &v0, false)?;
+        assert_eq!(kv.cap, 512, "planned_cap=300 should pre-allocate next_power_of_two(300)=512");
+        assert_eq!(kv.len, 4);
         Ok(())
     }
 }
