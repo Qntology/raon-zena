@@ -157,6 +157,27 @@ fn main() -> Result<()> {
                 println!("{h:>3}  {d:<26} {t}");
             }
         }
+        "scoped" => {
+            let cc = args.first().map(String::as_str);
+            for b in store.scoped_bindings(cc)? {
+                let status = if b.promoted { "promoted" } else { "pending" };
+                println!(
+                    "{:<22} {:<24} {:<10} sessions={} rejects={} {}",
+                    b.cc,
+                    b.domain,
+                    status,
+                    b.sessions.len(),
+                    b.rejects,
+                    b.text
+                );
+            }
+        }
+        "audit" => {
+            let limit: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(20);
+            for r in store.audit_log(limit)? {
+                println!("{:>5}  {}  {}", r.revision, r.updated_ms, r.note);
+            }
+        }
         "history" => {
             for r in store.history()? {
                 println!("{:>5}  {}  {}", r.revision, r.updated_ms, r.note);

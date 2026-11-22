@@ -50,20 +50,25 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zena_core::avatar::viseme_timeline;
-use zena_core::brief::WebCoachBrief;
+use zena_core::brief::{
+    arbitrate_rag_with_telemetry, CourseBrief, NextStepHint, TelemetryTier, WebCoachBrief,
+};
 use zena_core::claims::PackedVerdictSlot;
 use zena_core::coach::{
-    route_proactive, CoachEvidence, CoachingFatigueController, EphemeralOffer, InterruptSignals,
-    PendingCoach, PendingCoachHook, ProactiveRoute,
+    route_proactive_with_reflex, CoachEvidence, CoachingFatigueController, EphemeralOffer,
+    InterruptSignals, PendingCoach, PendingCoachHook, ProactiveRoute, ReflexCompiler,
 };
 use zena_core::cues::{cue, cue_for_reason, CuePlayer};
-use zena_core::exposure::{ExposureLedger, ExposureRole};
+use zena_core::exposure::{ExposureLedger, ExposureRole, ExposureTargetKind};
 use zena_core::geometry::{FlowDirection, ScreenGeometry};
 use zena_core::ingress_guard::{IngressPiiScrubber, IngressVerdict};
 use zena_core::nav_target::SpokenSlotLock;
 use zena_core::prompt::{build_fast_path_prompt, Dialogue, Situation};
 use zena_core::reaction::{Observation, ReactionLevel, ReactionRouter};
-use zena_core::reference::{normalize_cc, ScreenAnchorSnapshot, TopicTracker};
+use zena_core::reference::{
+    normalize_cc, CoalesceOutcome, FocusedRegion, ScreenAnchorSnapshot, SpeechCoalescer,
+    TopicTracker,
+};
 use zena_core::session::{Proactive, ProactiveTimer, SessionTracker};
 use zena_core::stream::{StreamEvent, ToolCallStream};
 use zena_core::tools::{
@@ -522,11 +527,20 @@ pub fn run(
     let behavior_params = BehaviorParams::default();
     let mut coach_hook = PendingCoachHook::default();
     let mut fatigue = CoachingFatigueController::default();
+    let reflex_compiler = ReflexCompiler::default();
+    let mut speech_coalescer = SpeechCoalescer::new();
     let mut topic_tracker = TopicTracker::default().with_hasher(topic_hash_id);
     let mut exposure_ledger = ExposureLedger::default();
     let mut sticky_numberer = StickyNumberer::default();
     let mut permanent_web_tiers: HashMap<String, Tier> = HashMap::new();
     let mut browser_tracker = BrowserSessionTracker::default();
+    #[cfg(windows)]
+    if cfg.enable_host_probes && crate::win32::is_screen_reader_active() {
+        fatigue.set_screen_reader_mode(true);
+        if let Ok(mut sl) = spoken_lock.lock() {
+            sl.set_screen_reader_mode(true);
+        }
+    }
     let browser_worker = cfg
         .enable_host_probes
         .then(AsyncBrowserUiaWorker::spawn_platform);
@@ -536,6 +550,8 @@ pub fn run(
     let mut active_screen_key = "screen:init".to_string();
     let mut active_surface = SurfaceSignature::default();
     let mut active_web_brief: Option<WebCoachBrief> = None;
+    let mut active_course_brief: Option<CourseBrief> = None;
+    let mut active_defeat_trap: Option<String> = None;
     let mut active_nav_overlay: Option<NavBadgeOverlay> = None;
     let mut last_screen: Option<(String, f32)> = None;
     let mut last_frame_sent: Option<u64> = None;
@@ -760,6 +776,7 @@ pub fn run(
                 match browser_tracker.observe(&snap) {
                     TabTransition::IncognitoBlocked => {
                         active_web_brief = None;
+                        active_course_brief = None;
                         active_nav_overlay = None;
                         sticky_numberer.reset();
                         let _ = out.send(
@@ -793,10 +810,14 @@ pub fn run(
                             .map(|s| s.mask(now))
                             .unwrap_or(0);
                         let embedder = router.models.embedder.clone();
-                        let label_sim = precompute_label_similarity(&embedder, &[], &snap.regions);
+                        // Phase 4 Part 3 + Phase 6 Part 3 (`CN2-55`, `CN2-78`):
+                        // 빈 `&[]` 대신 3-소스 병합 라이브 `WebAnalyticTierRow` 를 투입한다!
+                        let live_web_rows = pd_bridge.live_web_rows_for_cc(&cc, wall_ms);
+                        let label_sim =
+                            precompute_label_similarity(&embedder, &live_web_rows, &snap.regions);
                         if let Some((badge_ov, web_brief)) = build_web_nav_overlay(
                             &snap,
-                            &[],
+                            &live_web_rows,
                             &mut permanent_web_tiers,
                             &mut sticky_numberer,
                             locked_mask,
@@ -809,6 +830,7 @@ pub fn run(
                                     m.register_label(&b.anchor, &b.label);
                                 }
                             }
+                            active_course_brief = build_course_brief_from_overlay(&badge_ov);
                             active_web_brief = Some(web_brief);
                             active_nav_overlay = Some(badge_ov.clone());
                             let _ = out.send(AvatarCmd::NavBadges(badge_ov), now, &mut proactive);
@@ -1014,8 +1036,18 @@ pub fn run(
                             session.defeat(now);
                             last_defeat_ms = Some(now);
                             just_defeated = true;
+                            // Phase 7 Part 3 (AC-05): 사용자가 자책/설명을 입력 중이면 패배 방패 창을 보류·연장
+                            if user_typing {
+                                defeat_shielded_until_ms = defeat_shielded_until_ms.max(now + 15_000);
+                            }
                             let shielded = now <= defeat_shielded_until_ms;
-                            let cands = active_credit_candidates(&mut exposure_ledger, &active_cc, now);
+                            if !shielded {
+                                if let Some(b) = active_nav_overlay.as_ref().and_then(|ov| ov.badges.first()) {
+                                    active_defeat_trap = Some(b.label.clone());
+                                }
+                            }
+                            let linked_ccs = pd_bridge.trajectory.linked_ccs(&active_cc, wall_ms);
+                            let cands = active_credit_candidates_meta(&mut exposure_ledger, &linked_ccs, now);
                             let outbound = pd_bridge.verdicts.apply_outcome_credit(
                                 &cands,
                                 -1,
@@ -1030,7 +1062,9 @@ pub fn run(
                         "vision.game_victory" => {
                             session.victory(now);
                             last_victory_ms = Some(now);
-                            let cands = active_credit_candidates(&mut exposure_ledger, &active_cc, now);
+                            active_defeat_trap = None;
+                            let linked_ccs = pd_bridge.trajectory.linked_ccs(&active_cc, wall_ms);
+                            let cands = active_credit_candidates_meta(&mut exposure_ledger, &linked_ccs, now);
                             let outbound = pd_bridge.verdicts.apply_outcome_credit(
                                 &cands,
                                 1,
@@ -1117,12 +1151,23 @@ pub fn run(
                     if let Some(promoted) = fatigue.on_user_utterance(&active_cc, now) {
                         dialogue.push_turn(promoted);
                     }
-                    inputs.push(RouterInput::Utterance {
-                        text: clean,
-                        t_ms: now,
-                    });
+                    match speech_coalescer.push(&clean, now) {
+                        CoalesceOutcome::Buffering => {}
+                        CoalesceOutcome::Ready(merged) | CoalesceOutcome::CancelledAndReplaced(merged) => {
+                            inputs.push(RouterInput::Utterance {
+                                text: merged,
+                                t_ms: now,
+                            });
+                        }
+                    }
                 }
             }
+        }
+        if let Some(flushed) = speech_coalescer.flush_if_due(now) {
+            inputs.push(RouterInput::Utterance {
+                text: flushed,
+                t_ms: now,
+            });
         }
         let user_spoke = !inputs.is_empty();
         if user_spoke {
@@ -1191,7 +1236,7 @@ pub fn run(
             }
         }
 
-        // Learning: spans caught by vectors alone (never on scrubbed PII utterances).
+        // Learning: 4-게이트 안전 자동학습(Command Air-Gap · PII 스크럽 · Tier 2 앱 스코프 격리).
         if allow_lexicon_learn {
             if let (Some(tx), Some(min)) = (&learn, cfg.learn_min) {
                 for c in routed
@@ -1200,9 +1245,14 @@ pub fn run(
                     .chain(&routed.queries)
                     .filter(|c| c.hit == Hit::Vector && c.score >= min)
                 {
-                    let _ = tx.send(LexiconMsg::Learn {
+                    let _ = tx.send(LexiconMsg::LearnSafe {
+                        cc: Some(active_cc.clone()),
                         key: c.key.clone(),
                         span: c.span.clone(),
+                        session_id: format!("sess-{}", wall_ms / 1_800_000),
+                        score: c.score,
+                        margin: 0.15,
+                        outcome_sign: 0,
                     });
                 }
             }
@@ -1322,18 +1372,17 @@ pub fn run(
                             }
                             job_epoch = pd_bridge.rag.next_ask_epoch();
                         } else {
-                            // Scenario 3: TopicTracker -> 0 ms PreThink + 600 ms two-track RAG race!
-                            let screen_snap = ScreenAnchorSnapshot {
-                                cc: active_cc.clone(),
-                                screen_key: Some(active_screen_key.clone()),
-                                screen_label: last_screen
+                            // Phase 6 Part 3 (`CN2-78`): 활성 배지 오버레이에서 checkpoint_to · focused 를 직접 주입!
+                            let screen_snap = build_screen_anchor_snapshot(
+                                &active_cc,
+                                &active_screen_key,
+                                last_screen
                                     .as_ref()
                                     .and_then(|(k, _)| lexicon.vision_node(k))
-                                    .map(|v| v.semantic.clone()),
-                                checkpoint_to: None,
-                                focused: None,
-                                changed_at_ms: None,
-                            };
+                                    .map(|v| v.semantic.as_str()),
+                                active_nav_overlay.as_ref(),
+                                now,
+                            );
                             let extracted: Vec<String> = (!q.span.trim().is_empty())
                                 .then(|| q.span.clone())
                                 .into_iter()
@@ -1378,6 +1427,12 @@ pub fn run(
                                     ..
                                 } => {
                                     job_epoch = epoch;
+                                    // Phase 6 Part 3 (`CN2-79`): 하이브리드 RAG × 실시간 텔레메트리 중재 경고 주입
+                                    if let Some(arbiter_line) =
+                                        hybrid_arbiter_context_line(&slots, active_nav_overlay.as_ref())
+                                    {
+                                        context.push(arbiter_line);
+                                    }
                                     sess_ctx.verdict_slots = slots;
                                 }
                                 RagOutcome::Cancelled { .. } => {
@@ -1387,6 +1442,28 @@ pub fn run(
                         }
                         if sess_ctx.web_coach.is_none() {
                             sess_ctx.web_coach = active_web_brief.clone();
+                        }
+                        if sess_ctx.course_brief.is_none() {
+                            sess_ctx.course_brief = active_course_brief.clone();
+                        }
+                        // Phase 6 Part 3 (`CN2-80`): 같은 턴의 활성 코스 체크포인트를 "route" 슬롯으로 병행 등록
+                        if let Some(primary) = active_nav_overlay
+                            .as_ref()
+                            .and_then(|ov| ov.badges.iter().find(|b| !b.unavailable))
+                        {
+                            let role = if primary.tier == Some(Tier::Discount) {
+                                ExposureRole::WarnedTrap
+                            } else {
+                                ExposureRole::RecommendedSolution
+                            };
+                            exposure_ledger.record_course_checkpoint(
+                                &primary.anchor,
+                                &active_cc,
+                                Some(&primary.anchor),
+                                &primary.label,
+                                role,
+                                now,
+                            );
                         }
                     }
 
@@ -1468,6 +1545,8 @@ pub fn run(
                             mode,
                             &active_nav_overlay,
                             &active_web_brief,
+                            active_defeat_trap.as_deref(),
+                            &reflex_compiler,
                             &mut fatigue,
                             &llm,
                             &mut session,
@@ -1493,6 +1572,8 @@ pub fn run(
                     mode,
                     &active_nav_overlay,
                     &active_web_brief,
+                    active_defeat_trap.as_deref(),
+                    &reflex_compiler,
                     &mut fatigue,
                     &llm,
                     &mut session,
@@ -1531,6 +1612,8 @@ fn deliver_proactive_coach(
     mode: zena_core::coach::CoachDeliveryMode,
     nav_overlay: &Option<NavBadgeOverlay>,
     web_brief: &Option<WebCoachBrief>,
+    defeat_trap: Option<&str>,
+    reflex_compiler: &ReflexCompiler,
     fatigue: &mut CoachingFatigueController,
     llm: &LlmWorker,
     session: &mut SessionTracker,
@@ -1549,11 +1632,22 @@ fn deliver_proactive_coach(
             .as_ref()
             .and_then(|w| w.primary.as_ref().filter(|p| p.verified))
             .map(|p| format!("#{} '{}'", p.number, p.label)),
-        confirmed_trap: web_brief.as_ref().and_then(|w| w.friction_trap.clone()),
+        confirmed_trap: web_brief
+            .as_ref()
+            .and_then(|w| w.friction_trap.clone())
+            .or_else(|| defeat_trap.map(str::to_string)),
         point_at: primary_badge.map(|b| b.number),
     };
     let cur_epoch = ask_epoch.load(Ordering::Acquire);
-    match route_proactive(coach, mode, &evidence, true, cur_epoch, fatigue) {
+    match route_proactive_with_reflex(
+        coach,
+        mode,
+        &evidence,
+        true,
+        cur_epoch,
+        fatigue,
+        reflex_compiler,
+    ) {
         ProactiveRoute::Lv3(brief) => {
             let mut sess = session.snapshot(now);
             sess.friction_brief = Some(brief);
@@ -1613,18 +1707,91 @@ fn deliver_proactive_coach(
     Ok(())
 }
 
-fn active_credit_candidates(
-    ledger: &mut ExposureLedger,
+/// Phase 6 Part 3 (`CN2-78`): 활성 배지 오버레이에서 `ScreenAnchorSnapshot` (`checkpoint_to` · `focused`) 을 채운다.
+fn build_screen_anchor_snapshot(
     cc: &str,
+    screen_key: &str,
+    screen_label: Option<&str>,
+    overlay: Option<&NavBadgeOverlay>,
+    now_ms: u64,
+) -> ScreenAnchorSnapshot {
+    let primary = overlay.and_then(|ov| ov.badges.iter().find(|b| !b.unavailable));
+    ScreenAnchorSnapshot {
+        cc: cc.to_string(),
+        screen_key: Some(screen_key.to_string()),
+        screen_label: screen_label.map(str::to_string),
+        checkpoint_to: primary.map(|b| b.anchor.clone()),
+        focused: primary.map(|b| FocusedRegion {
+            number: Some(b.number),
+            label: b.label.clone(),
+            to: Some(b.anchor.clone()),
+            at_ms: now_ms,
+        }),
+        changed_at_ms: Some(now_ms),
+    }
+}
+
+/// Phase 6 Part 3 (`CN2-78`): 활성 배지 오버레이에서 `CourseBrief` 를 구축한다.
+fn build_course_brief_from_overlay(overlay: &NavBadgeOverlay) -> Option<CourseBrief> {
+    let primary = overlay
+        .badges
+        .iter()
+        .find(|b| !b.unavailable && !b.commit_guarded)?;
+    Some(CourseBrief {
+        passed: 1,
+        length: overlay.badges.len().max(1),
+        next_hint: NextStepHint::NumberedOnScreen {
+            number: primary.number,
+            clean_label: primary.label.clone(),
+            direction_label: String::new(),
+        },
+        verdict_judged_premium: primary.tier == Some(Tier::Premium),
+        ..Default::default()
+    })
+}
+
+/// Phase 6 Part 3 (`CN2-79`): RAG 슬롯(90일 `pd` 트랙)과 실시간 배지(14일 `nav` 트랙) 티어를 4사분면 중재한다.
+fn hybrid_arbiter_context_line(
+    slots: &[PackedVerdictSlot],
+    overlay: Option<&NavBadgeOverlay>,
+) -> Option<String> {
+    let ov = overlay?;
+    let primary = ov.badges.iter().find(|b| !b.unavailable)?;
+    let nav_tier = match primary.tier {
+        Some(Tier::Premium) => TelemetryTier::Premium,
+        Some(Tier::Discount) => TelemetryTier::Discount,
+        Some(Tier::Neutral) => TelemetryTier::Neutral,
+        _ => TelemetryTier::Unrated,
+    };
+    let rag_tier = slots
+        .first()
+        .map(|s| match s.role {
+            zena_core::claims::SlotRole::Solution => TelemetryTier::Premium,
+            zena_core::claims::SlotRole::Warning => TelemetryTier::Discount,
+            _ => TelemetryTier::Unrated,
+        })
+        .unwrap_or(TelemetryTier::Unrated);
+    arbitrate_rag_with_telemetry(rag_tier, nav_tier, &primary.label).1
+}
+
+/// Phase 6 Part 1 & 3 (`CN2-72`, `CN2-80`): 크로스-앱 메타 궤적과 `RagRecord` × `CourseCheckpoint` 시너지 귀속 후보 생성.
+fn active_credit_candidates_meta(
+    ledger: &mut ExposureLedger,
+    linked_ccs: &[String],
     now_ms: u64,
 ) -> Vec<AttributionCandidate> {
+    let cc_refs: Vec<&str> = linked_ccs.iter().map(String::as_str).collect();
     ledger
-        .active_in_window(cc, now_ms)
+        .active_in_meta_trajectory(&cc_refs, now_ms)
         .into_iter()
         .map(|rec| AttributionCandidate {
             id: rec.record_id,
-            kind: CreditTargetKind::RagRecord,
-            exclusive_slot_group: rec.to,
+            kind: match rec.target_kind {
+                ExposureTargetKind::RagRecord => CreditTargetKind::RagRecord,
+                ExposureTargetKind::CourseCheckpoint => CreditTargetKind::CourseCheckpoint,
+                ExposureTargetKind::NavRegion => CreditTargetKind::NavRegion,
+            },
+            exclusive_slot_group: rec.exclusive_slot_group.or(rec.to),
             is_warned_trap: rec.role == ExposureRole::WarnedTrap,
             exposure_weight: rec.w_spoken,
             age_ms: now_ms.saturating_sub(rec.exposed_at_ms),
@@ -2217,5 +2384,80 @@ mod tests {
             blind.session.as_ref().is_some_and(|s| s.privacy_locked),
             "session must carry privacy_locked = true during BlindAssist"
         );
+    }
+
+    #[test]
+    fn cn278_pipeline_wires_live_web_rows_checkpoint_to_focused_and_course_brief() {
+        use crate::browser_uia::NavBadge;
+        use premium_discount_nav::Rect;
+        let overlay = NavBadgeOverlay {
+            cc: "shop.example.com".into(),
+            screen_key: Some("0xpage1".into()),
+            window_rect_px: None,
+            badges: vec![NavBadge {
+                number: 1,
+                anchor: "0xcp-easypay".into(),
+                label: "간편결제".into(),
+                rect: Rect { x: 0.2, y: 0.3, w: 0.2, h: 0.1 },
+                tier: Some(Tier::Premium),
+                commit_guarded: false,
+                unavailable: false,
+            }],
+            occluded_by_overlay: false,
+            primary_arrow_deg: None,
+        };
+        let snap = build_screen_anchor_snapshot(
+            "shop.example.com",
+            "0xpage1",
+            Some("결제 화면"),
+            Some(&overlay),
+            5_000,
+        );
+        assert_eq!(snap.checkpoint_to.as_deref(), Some("0xcp-easypay"));
+        assert_eq!(snap.focused.as_ref().and_then(|f| f.number), Some(1));
+        let brief = build_course_brief_from_overlay(&overlay).expect("course brief built from live overlay");
+        assert!(brief.verdict_judged_premium);
+        assert!(brief.to_prompt_lines()[1].contains("#1 '간편결제'"));
+    }
+
+    #[test]
+    fn cn280_hybrid_turn_attributes_05_05_synergy_credit_across_rag_and_course_checkpoint() {
+        let mut ledger = ExposureLedger::new();
+        // Same hybrid turn delivers a RAG tactics note ("tactics") AND a course checkpoint ("route").
+        ledger.insert(zena_core::exposure::ExposedRecord {
+            record_id: "rag-ice-jar".into(),
+            cc: "eldenring.exe".into(),
+            to: None,
+            canonical_topic: "빙결 항아리".into(),
+            role: ExposureRole::RecommendedSolution,
+            w_spoken: 1.0,
+            exposed_at_ms: 10_000,
+            target_kind: ExposureTargetKind::RagRecord,
+            exclusive_slot_group: Some("tactics".into()),
+        });
+        ledger.record_course_checkpoint(
+            "0xcp-right-ladder",
+            "eldenring.exe",
+            Some("0xcp-right-ladder"),
+            "우측 사다리",
+            ExposureRole::RecommendedSolution,
+            10_000,
+        );
+        let cands = active_credit_candidates_meta(&mut ledger, &["eldenring.exe".to_string()], 20_000);
+        assert_eq!(cands.len(), 2);
+        assert!(cands.iter().any(|c| c.kind == CreditTargetKind::RagRecord));
+        assert!(cands.iter().any(|c| c.kind == CreditTargetKind::CourseCheckpoint));
+
+        let mut verdicts = crate::pd_bridge::LocalVerdictStore::default();
+        verdicts.ensure_record("rag-ice-jar", "eldenring.exe", None, "빙결 항아리", "stored");
+        let cp = verdicts.ensure_record("0xcp-right-ladder", "eldenring.exe", None, "우측 사다리", "local");
+        cp.track = "nav".into();
+        let mut gate = crate::pd_bridge::OutcomeVoteGate::new(false);
+        verdicts.apply_outcome_credit(&cands, 1, 20_000, false, &mut gate);
+        // Both RagRecord and CourseCheckpoint receive complementary 0.5 / 0.5 synergy credit!
+        assert_eq!(verdicts.records["rag-ice-jar"].wins, 1);
+        assert_eq!(verdicts.records["0xcp-right-ladder"].wins, 1);
+        assert!((verdicts.records["rag-ice-jar"].obs[0].credit - 0.5).abs() < 1e-6);
+        assert!((verdicts.records["0xcp-right-ladder"].obs[0].credit - 0.5).abs() < 1e-6);
     }
 }

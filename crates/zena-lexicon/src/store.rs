@@ -18,7 +18,11 @@
 //! The anchors are computed once per dictionary change by the Raon-VisionEncoder text tower (`zena-lexicon
 //! anchors`); at run time only the vision tower is loaded and the anchors are read from here.
 
-use crate::model::{node_json, node_of, vision_json, vision_of, Action, Express, Lexicon, Node, VisionPrompting};
+use crate::model::{
+    check_safe_learn_gates, node_json, node_of, vision_json, vision_of, Action, Express, Lexicon, Node,
+    SafeLearnOutcome, ScopedBinding, VisionKind, VisionPrompting, SAFE_LEARN_PROMOTE_SESSIONS,
+    SAFE_LEARN_REVOKE_REJECTS,
+};
 use crate::phrase::{split_phrase_list, weighted_phrases};
 use anyhow::{anyhow, bail, Context, Result};
 use futures::TryStreamExt;
@@ -45,7 +49,8 @@ const PHRASES: &str = "phrases";
 const VISION: &str = "vision";
 const ANCHORS: &str = "anchors";
 const CANDIDATES: &str = "candidates";
-const TABLES: [&str; 5] = [DOMAINS, PHRASES, VISION, ANCHORS, CANDIDATES];
+const SCOPED_BINDINGS: &str = "scoped_bindings";
+const TABLES: [&str; 6] = [DOMAINS, PHRASES, VISION, ANCHORS, CANDIDATES, SCOPED_BINDINGS];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -197,6 +202,16 @@ fn schema(table: &str) -> SchemaRef {
             utf8("text"),
             Field::new("hits", DataType::Int64, false),
             Field::new("last_ms", DataType::Int64, false),
+        ],
+        SCOPED_BINDINGS => vec![
+            utf8("cc"),
+            utf8("domain"),
+            utf8("text"),
+            Field::new("hits", DataType::Int64, false),
+            utf8("sessions"),
+            Field::new("rejects", DataType::Int64, false),
+            Field::new("promoted", DataType::Int64, false),
+            Field::new("updated_ms", DataType::Int64, false),
         ],
         _ => unreachable!("unknown table {table}"),
     };
@@ -537,7 +552,7 @@ impl LexiconStore {
             for b in self.rows(ANCHORS, None).await? {
                 let (t, s) = (col_str(&b, "text")?, col_str(&b, "signature")?);
                 for i in 0..b.num_rows() {
-                    if wanted.contains(&t[i]) && s[i] == signature {
+                    if (wanted.contains(&t[i]) && s[i] == signature) || t[i].starts_with("proto::") {
                         rep.anchors_kept += 1;
                     } else {
                         stale.push(lit(&t[i]));
@@ -548,6 +563,7 @@ impl LexiconStore {
                 anchors.delete(format!("text IN ({})", stale.join(", ")).as_str()).await?;
             }
             self.table_or_create(CANDIDATES).await?;
+            self.table_or_create(SCOPED_BINDINGS).await?;
             let prompting =
                 json!({"semantic": lex.prompting.semantic, "templates": lex.prompting.templates, "background": lex.prompting.background})
                     .to_string();
@@ -849,6 +865,256 @@ impl LexiconStore {
             out.sort();
             Ok(out)
         })
+    }
+
+    /// Phase 6 Part 2 (`CN2-73`, `CN2-76`): 4-게이트 안전 자동학습.
+    ///
+    /// * Gate 1: `Action::System` / `Action::Asset` 명령 노드는 영구 차단(Command Air-Gap).
+    /// * Gate 2: PII(이메일/숫자열)·`0x...` 해시·기능어 스크럽 차단.
+    /// * Gate 3: `score >= 0.72 && margin >= 0.10 && outcome_sign >= 0`.
+    /// * Gate 4: 독립 3세션(`SAFE_LEARN_PROMOTE_SESSIONS`) 이상에서만 승격.
+    /// * `cc == Some(app_cc)` 이면 Tier 2 `scoped_bindings` 에 격리 저장(글로벌 오염 차단).
+    #[allow(clippy::too_many_arguments)]
+    pub fn learn_safe(
+        &self,
+        cc: Option<&str>,
+        key: &str,
+        text: &str,
+        session_id: &str,
+        score: f32,
+        margin: f32,
+        outcome_sign: i32,
+    ) -> Result<SafeLearnOutcome> {
+        let lex = self.load()?;
+        let node = lex.node(key).ok_or_else(|| anyhow!("no domain '{key}' in the dictionary"))?;
+        let fn_phrases = lex.function_phrases();
+        let clean = match check_safe_learn_gates(node, text, &fn_phrases, score, margin, outcome_sign) {
+            Ok(c) => c,
+            Err(reason) => return Ok(SafeLearnOutcome::Rejected(reason)),
+        };
+        let scope_cc = cc
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "*".to_string());
+        if scope_cc == "*"
+            && (node.bias.iter().any(|p| p.text.to_lowercase() == clean)
+                || node.exact_match.iter().any(|e| e.to_lowercase() == clean))
+        {
+            return Ok(SafeLearnOutcome::AlreadyKnown);
+        }
+        let session = if session_id.trim().is_empty() {
+            "default-session".to_string()
+        } else {
+            session_id.trim().to_string()
+        };
+        let (sessions_len, newly_promoted) = self.rt.block_on(async {
+            let filter = format!(
+                "cc = {} AND domain = {} AND text = {}",
+                lit(&scope_cc),
+                lit(key),
+                lit(&clean)
+            );
+            let mut hits = 0i64;
+            let mut sessions: Vec<String> = Vec::new();
+            let mut rejects = 0i64;
+            let mut already_promoted = false;
+            for b in self.rows(SCOPED_BINDINGS, Some(filter.clone())).await? {
+                if b.num_rows() > 0 {
+                    hits = col_i64(&b, "hits")?[0];
+                    sessions = serde_json::from_str(&col_str(&b, "sessions")?[0]).unwrap_or_default();
+                    rejects = col_i64(&b, "rejects")?[0];
+                    already_promoted = col_i64(&b, "promoted")?[0] != 0;
+                }
+            }
+            if already_promoted {
+                return Ok::<_, anyhow::Error>((sessions.len() as u32, false));
+            }
+            hits += 1;
+            if !sessions.contains(&session) {
+                sessions.push(session);
+            }
+            let promoted = sessions.len() as u32 >= SAFE_LEARN_PROMOTE_SESSIONS;
+            let t = self.table_or_create(SCOPED_BINDINGS).await?;
+            t.delete(filter.as_str()).await?;
+            let batch = RecordBatch::try_new(
+                schema(SCOPED_BINDINGS),
+                vec![
+                    strings(vec![scope_cc.clone()]),
+                    strings(vec![key.to_string()]),
+                    strings(vec![clean.clone()]),
+                    Arc::new(Int64Array::from(vec![hits])),
+                    strings(vec![serde_json::to_string(&sessions)?]),
+                    Arc::new(Int64Array::from(vec![rejects])),
+                    Arc::new(Int64Array::from(vec![i64::from(promoted)])),
+                    Arc::new(Int64Array::from(vec![now_ms()])),
+                ],
+            )?;
+            t.add(batch).execute().await?;
+            let note = if promoted {
+                format!("learn-safe promote [{scope_cc}] {key}: {clean}")
+            } else {
+                format!("learn-safe count [{scope_cc}] {key}: {clean} ({} sessions)", sessions.len())
+            };
+            self.commit(&note, None, None, None).await?;
+            Ok((sessions.len() as u32, promoted))
+        })?;
+        if newly_promoted {
+            if scope_cc == "*" {
+                let _ = self.add_phrase(key, Role::Bias, &clean, "learned")?;
+            }
+            Ok(SafeLearnOutcome::Promoted)
+        } else if sessions_len >= SAFE_LEARN_PROMOTE_SESSIONS {
+            Ok(SafeLearnOutcome::AlreadyKnown)
+        } else {
+            Ok(SafeLearnOutcome::PendingSessions(sessions_len))
+        }
+    }
+
+    /// Phase 6 Part 2 (`CN2-76`): 자동 학습된 바인딩/구문에 사용자 거부·오작동이 2회 누적되면 즉시 자동 철회(Revoke)한다.
+    pub fn record_scoped_rejection(&self, cc: Option<&str>, domain: &str, text: &str) -> Result<bool> {
+        let scope_cc = cc
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "*".to_string());
+        let clean = text.trim().to_lowercase();
+        let revoked = self.rt.block_on(async {
+            let filter = format!(
+                "cc = {} AND domain = {} AND text = {}",
+                lit(&scope_cc),
+                lit(domain),
+                lit(&clean)
+            );
+            let mut existing: Option<(i64, String, i64, i64)> = None;
+            for b in self.rows(SCOPED_BINDINGS, Some(filter.clone())).await? {
+                if b.num_rows() > 0 {
+                    existing = Some((
+                        col_i64(&b, "hits")?[0],
+                        col_str(&b, "sessions")?[0].clone(),
+                        col_i64(&b, "rejects")?[0],
+                        col_i64(&b, "promoted")?[0],
+                    ));
+                }
+            }
+            let Some((hits, sessions_json, rejects, promoted)) = existing else {
+                return Ok::<_, anyhow::Error>(false);
+            };
+            let next_rejects = rejects + 1;
+            let t = self.table_or_create(SCOPED_BINDINGS).await?;
+            t.delete(filter.as_str()).await?;
+            if next_rejects as u32 >= SAFE_LEARN_REVOKE_REJECTS {
+                self.commit(&format!("learn-revoke [{scope_cc}] {domain}: {clean}"), None, None, None)
+                    .await?;
+                return Ok(true);
+            }
+            let batch = RecordBatch::try_new(
+                schema(SCOPED_BINDINGS),
+                vec![
+                    strings(vec![scope_cc.clone()]),
+                    strings(vec![domain.to_string()]),
+                    strings(vec![clean.clone()]),
+                    Arc::new(Int64Array::from(vec![hits])),
+                    strings(vec![sessions_json]),
+                    Arc::new(Int64Array::from(vec![next_rejects])),
+                    Arc::new(Int64Array::from(vec![promoted])),
+                    Arc::new(Int64Array::from(vec![now_ms()])),
+                ],
+            )?;
+            t.add(batch).execute().await?;
+            self.commit(&format!("learn-reject [{scope_cc}] {domain}: {clean} ({next_rejects})"), None, None, None)
+                .await?;
+            Ok(false)
+        })?;
+        if revoked && scope_cc == "*" {
+            let _ = self.remove_phrase(domain, Role::Bias, &clean);
+        }
+        Ok(revoked)
+    }
+
+    /// Phase 6 Part 2: Tier 2 앱/사이트 종속 바인딩 목록 조회 (`cc == None` 이면 전체).
+    pub fn scoped_bindings(&self, cc: Option<&str>) -> Result<Vec<ScopedBinding>> {
+        let filter = cc
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .map(|c| format!("cc = {}", lit(&c)));
+        self.rt.block_on(async {
+            let mut out = Vec::new();
+            for b in self.rows(SCOPED_BINDINGS, filter).await? {
+                let (ccs, ds, ts, hs, ss, rs, ps, us) = (
+                    col_str(&b, "cc")?,
+                    col_str(&b, "domain")?,
+                    col_str(&b, "text")?,
+                    col_i64(&b, "hits")?,
+                    col_str(&b, "sessions")?,
+                    col_i64(&b, "rejects")?,
+                    col_i64(&b, "promoted")?,
+                    col_i64(&b, "updated_ms")?,
+                );
+                for i in 0..b.num_rows() {
+                    out.push(ScopedBinding {
+                        cc: ccs[i].clone(),
+                        domain: ds[i].clone(),
+                        text: ts[i].clone(),
+                        hits: hs[i].max(0) as u32,
+                        sessions: serde_json::from_str(&ss[i]).unwrap_or_default(),
+                        rejects: rs[i].max(0) as u32,
+                        promoted: ps[i] != 0,
+                        updated_ms: us[i],
+                    });
+                }
+            }
+            out.sort_by(|a, b| a.cc.cmp(&b.cc).then(a.domain.cmp(&b.domain)).then(a.text.cmp(&b.text)));
+            Ok(out)
+        })
+    }
+
+    /// Phase 6 Part 2 (`CN2-75`): TextTower 로드 없이 1152-d 이미지 프로토타입 벡터를 `anchors` 에 직접 주입한다.
+    /// `VisionKind::Privacy` 노드는 불변 보안 경계이므로 어떠한 경우에도 덮어쓰기를 거부(`Ok(false)`)한다.
+    pub fn upsert_visual_prototype(&self, vision_key: &str, prototype: &[f32], model: &str) -> Result<bool> {
+        if prototype.len() != ANCHOR_DIMS {
+            bail!("visual prototype has {} dims, expected {ANCHOR_DIMS}", prototype.len());
+        }
+        let lex = self.load()?;
+        if let Some(vn) = lex.vision_node(vision_key) {
+            if vn.kind == VisionKind::Privacy {
+                return Ok(false);
+            }
+        }
+        if vision_key.contains("privacy") || vision_key.contains("private") {
+            return Ok(false);
+        }
+        let norm = prototype.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        if norm <= 1e-6 || !norm.is_finite() {
+            bail!("visual prototype must have finite non-zero norm");
+        }
+        let unit: Vec<f32> = prototype.iter().map(|&x| (x as f64 / norm) as f32).collect();
+        let proto_key = format!("proto::{vision_key}");
+        self.rt.block_on(async {
+            let (_, _, _, old_model, signature) = self.meta_row().await?.ok_or_else(|| anyhow!("no lexicon"))?;
+            let t = self.table_or_create(ANCHORS).await?;
+            t.delete(format!("text = {}", lit(&proto_key)).as_str()).await?;
+            let use_model = if model.trim().is_empty() { old_model } else { model.to_string() };
+            t.add(anchor_batch(&[(proto_key.clone(), use_model.clone(), signature.clone(), unit)])?)
+                .execute()
+                .await?;
+            self.commit(&format!("visual-proto {vision_key}"), None, None, Some((&use_model, &signature)))
+                .await?;
+            Ok(true)
+        })
+    }
+
+    /// Phase 6 Part 2: 학습·철회·시각 프로토타입·롤백 감사 로그 조회.
+    pub fn audit_log(&self, limit: usize) -> Result<Vec<Revision>> {
+        let hist = self.history()?;
+        Ok(hist
+            .into_iter()
+            .filter(|r| {
+                r.note.starts_with("learn-")
+                    || r.note.starts_with("visual-proto")
+                    || r.note.starts_with("rollback")
+                    || r.note.starts_with("import")
+            })
+            .take(limit)
+            .collect())
     }
 
     /// BM25 search (2–3 character n-grams) over dictionary phrases and vision prompts.
@@ -1179,6 +1445,111 @@ mod tests {
         assert!(s.stats().unwrap().contains("anchored by test-model"));
         s.compact(None).unwrap();
         assert_eq!(s.load().unwrap().nodes, back.nodes, "compaction changes files, not contents");
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cn273_lexicon_2tier_nav_archetypes_and_scoped_bindings_survive_reimport() {
+        let (s, dir) = store("cn273");
+        let lex = Lexicon::bundled();
+        // Verify all 5 closed nav.* archetypes exist and are excluded from text_nodes()
+        for k in [
+            "nav.shortcut_prompt",
+            "nav.trap_warn",
+            "nav.milestone_cheer",
+            "nav.rejoin_relief",
+            "nav.pace_record",
+        ] {
+            let n = lex.node(k).unwrap_or_else(|| panic!("missing {k}"));
+            assert!(n.action.express().is_some());
+            assert!(lex.text_nodes().all(|t| t.key != k), "{k} must stay out of text router");
+        }
+        s.import(&lex).unwrap();
+        // Promote an app-scoped jargon binding across 3 distinct sessions into Tier 2 scoped_bindings.
+        for (i, sess) in ["s1", "s2", "s3"].iter().enumerate() {
+            let res = s
+                .learn_safe(Some("eldenring.exe"), "coach.game_tip", "물새난격", sess, 0.85, 0.20, 1)
+                .unwrap();
+            if i < 2 {
+                assert_eq!(res, SafeLearnOutcome::PendingSessions((i + 1) as u32));
+            } else {
+                assert_eq!(res, SafeLearnOutcome::Promoted);
+            }
+        }
+        // Global domains must stay unpolluted by game-specific jargon!
+        assert!(!s
+            .load()
+            .unwrap()
+            .node("coach.game_tip")
+            .unwrap()
+            .bias
+            .iter()
+            .any(|p| p.text == "물새난격"));
+        // Re-import must preserve Tier 2 scoped_bindings!
+        s.import(&lex).unwrap();
+        let bindings = s.scoped_bindings(Some("eldenring.exe")).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].promoted && bindings[0].text == "물새난격");
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cn276_safe_learn_4gates_enforce_command_airgap_pii_scrub_and_2rejection_revoke() {
+        let (s, dir) = store("cn276");
+        let lex = Lexicon::bundled();
+        s.import(&lex).unwrap();
+
+        // Gate 1: Command Air-Gap blocks Action::System and Action::Asset unconditionally.
+        assert_eq!(
+            s.learn_safe(None, "system.exit_app", "종료해버려", "s1", 0.99, 0.50, 1).unwrap(),
+            SafeLearnOutcome::Rejected(crate::SafeLearnReject::CommandAirGap)
+        );
+        // Gate 2: PII / hex hash / function word blocked.
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "user@example.com", "s1", 0.90, 0.25, 1).unwrap(),
+            SafeLearnOutcome::Rejected(crate::SafeLearnReject::ScrubRejected)
+        );
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "0x1234abcd", "s1", 0.90, 0.25, 1).unwrap(),
+            SafeLearnOutcome::Rejected(crate::SafeLearnReject::ScrubRejected)
+        );
+        // Gate 3: Low margin or negative outcome blocked.
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "쿠폰우회", "s1", 0.85, 0.05, 1).unwrap(),
+            SafeLearnOutcome::Rejected(crate::SafeLearnReject::LowConfidenceOrBadOutcome)
+        );
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "쿠폰우회", "s1", 0.85, 0.25, -1).unwrap(),
+            SafeLearnOutcome::Rejected(crate::SafeLearnReject::LowConfidenceOrBadOutcome)
+        );
+        // Gate 4: Same session repeated 5 times stays at 1 session (no burst promotion); 3 distinct sessions promote.
+        for _ in 0..5 {
+            assert_eq!(
+                s.learn_safe(Some("shop.com"), "coach.game_tip", "간편우회", "same-sess", 0.88, 0.22, 1).unwrap(),
+                SafeLearnOutcome::PendingSessions(1)
+            );
+        }
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "간편우회", "sess-2", 0.88, 0.22, 1).unwrap(),
+            SafeLearnOutcome::PendingSessions(2)
+        );
+        assert_eq!(
+            s.learn_safe(Some("shop.com"), "coach.game_tip", "간편우회", "sess-3", 0.88, 0.22, 1).unwrap(),
+            SafeLearnOutcome::Promoted
+        );
+        // 2 rejections automatically revoke the binding and record an audit trail!
+        assert!(!s.record_scoped_rejection(Some("shop.com"), "coach.game_tip", "간편우회").unwrap());
+        assert!(s.record_scoped_rejection(Some("shop.com"), "coach.game_tip", "간편우회").unwrap());
+        assert!(s.scoped_bindings(Some("shop.com")).unwrap().is_empty());
+        assert!(s.audit_log(10).unwrap().iter().any(|r| r.note.starts_with("learn-revoke")));
+
+        // Privacy visual anchor immutability: refusing prototype overwrite on vision.private!
+        let proto = vec![1.0 / (ANCHOR_DIMS as f32).sqrt(); ANCHOR_DIMS];
+        assert!(!s.upsert_visual_prototype("vision.private", &proto, "raon-ve-so400m-v1").unwrap());
+        assert!(s.upsert_visual_prototype("vision.game_battle", &proto, "raon-ve-so400m-v1").unwrap());
+        assert!(s.anchors().unwrap().vectors.contains_key("proto::vision.game_battle"));
         drop(s);
         let _ = std::fs::remove_dir_all(dir);
     }

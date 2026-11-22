@@ -601,6 +601,172 @@ impl TopicTracker {
             ambiguous_pair,
         }
     }
+
+    /// Phase 6 Part 1 (`CN2-70`): 크로스-앱 메타 코스의 선택적 토픽 브리지.
+    ///
+    /// * `shared_relay_keys` 가 비어 있으면 아무것도 전이하지 않는다 (**CR-02 PLINKO 단절 0.0 완전 보존**).
+    /// * 공통 캐노니컬 `RelayKey` 가 1개 이상 존재할 때만 `from_cc` 의 활성 상위 토픽을 `to_cc` 로 감쇠 전이(`0.80`)한다.
+    pub fn bridge_cross_cc(
+        &mut self,
+        from_cc: &str,
+        to_cc: &str,
+        shared_relay_keys: &[String],
+        now_ms: u64,
+    ) -> usize {
+        if shared_relay_keys.is_empty() {
+            return 0;
+        }
+        let src = normalize_cc(from_cc);
+        let dst = normalize_cc(to_cc);
+        if src.is_empty() || dst.is_empty() || src == dst {
+            return 0;
+        }
+        let active: Vec<(f32, TopicEntity)> = self
+            .ranked(&src, now_ms)
+            .into_iter()
+            .filter(|(s, _)| *s >= SALIENCE_FLOOR)
+            .take(3)
+            .collect();
+        let mut bridged = 0usize;
+        for (sal, ent) in active {
+            let weight = (sal * 0.80).clamp(SALIENCE_FLOOR, USER_MENTION_WEIGHT);
+            self.remember(&dst, &ent.surface, weight, now_ms);
+            bridged += 1;
+        }
+        if bridged > 0 {
+            let dst_frame = self.by_cc.entry(dst).or_default();
+            dst_frame.last_turn_ms = Some(now_ms);
+        }
+        bridged
+    }
+}
+
+/// Phase 7 Part 3 (`AC-05`): 구음장애 · 말더듬 발화 병합 창(2.5초).
+pub const SPEECH_COALESCE_WINDOW_MS: u64 = 2_500;
+
+/// Phase 7 Part 3 (`AC-05`): 구음장애·말더듬으로 잘게 끊어 들어오는 음성 조각을 문법적 완결 시점까지 병합한다.
+/// CR-06 명시적 정정·취소("아니", "취소", "말고")가 들어오면 기존 버퍼를 즉시 취소·교체한다.
+#[derive(Debug, Clone, Default)]
+pub struct SpeechCoalescer {
+    fragments: Vec<String>,
+    last_at_ms: Option<u64>,
+    pub window_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoalesceOutcome {
+    /// 아직 문장이 미완결이므로 추가 조각을 대기한다.
+    Buffering,
+    /// 완결된 병합 발화를 방출한다.
+    Ready(String),
+    /// CR-06 명시적 취소·정정이 감지돼 이전 버퍼를 폐기하고 새 발화를 방출한다.
+    CancelledAndReplaced(String),
+}
+
+impl SpeechCoalescer {
+    pub fn new() -> Self {
+        Self {
+            fragments: Vec::new(),
+            last_at_ms: None,
+            window_ms: SPEECH_COALESCE_WINDOW_MS,
+        }
+    }
+
+    fn is_cancel_or_correction(s: &str) -> bool {
+        let t = s.trim().to_ascii_lowercase();
+        ["아니", "취소", "말고", "그만", "cancel", "no wait", "stop"]
+            .iter()
+            .any(|k| t.starts_with(k) || t.contains(" 말고") || t.contains("취소"))
+    }
+
+    fn is_incomplete_fragment(s: &str) -> bool {
+        let t = s.trim();
+        if t.is_empty() {
+            return true;
+        }
+        if t.ends_with("...") || t.ends_with('…') || t.ends_with(',') {
+            return true;
+        }
+        let stripped = t.trim_end_matches(|c: char| matches!(c, '.' | '…' | ',' | ' '));
+        let filler = matches!(
+            stripped,
+            "어" | "음" | "그" | "저" | "이" | "그거" | "이거" | "uh" | "um" | "the"
+        );
+        if filler {
+            return true;
+        }
+        // 조사·관형어로 끝나고 종결어미·물음표가 없는 짧은 조각
+        let ends_complete = stripped.ends_with('?')
+            || stripped.ends_with('!')
+            || stripped.ends_with('요')
+            || stripped.ends_with('줘')
+            || stripped.ends_with('해')
+            || stripped.ends_with('야')
+            || stripped.ends_with('까')
+            || stripped.ends_with('다')
+            || stripped.ends_with("press")
+            || stripped.ends_with("click");
+        !ends_complete && stripped.split_whitespace().count() <= 2
+    }
+
+    fn clean_fragment(s: &str) -> String {
+        let stripped = s
+            .trim()
+            .trim_end_matches(|c: char| matches!(c, '.' | '…' | ','))
+            .trim();
+        // 말더듬 간투사 제거 ("어... 2번" -> "2번")
+        let mut parts: Vec<&str> = stripped.split_whitespace().collect();
+        while parts
+            .first()
+            .is_some_and(|w| matches!(w.trim_end_matches(|c: char| matches!(c, '.' | '…')), "어" | "음" | "uh" | "um"))
+        {
+            parts.remove(0);
+        }
+        parts.join(" ")
+    }
+
+    pub fn push(&mut self, fragment: &str, now_ms: u64) -> CoalesceOutcome {
+        let raw = fragment.trim();
+        if raw.is_empty() {
+            return CoalesceOutcome::Buffering;
+        }
+        if Self::is_cancel_or_correction(raw) {
+            self.fragments.clear();
+            self.last_at_ms = None;
+            return CoalesceOutcome::CancelledAndReplaced(collapse_ws(raw));
+        }
+        if let Some(prev) = self.last_at_ms {
+            if now_ms.saturating_sub(prev) > self.window_ms {
+                self.fragments.clear();
+            }
+        }
+        let cleaned = Self::clean_fragment(raw);
+        if !cleaned.is_empty() {
+            self.fragments.push(cleaned);
+        }
+        self.last_at_ms = Some(now_ms);
+        if Self::is_incomplete_fragment(raw) {
+            CoalesceOutcome::Buffering
+        } else {
+            let out = collapse_ws(&self.fragments.join(" "));
+            self.fragments.clear();
+            self.last_at_ms = None;
+            CoalesceOutcome::Ready(out)
+        }
+    }
+
+    /// 2.5초 창이 만료되면 대기 중인 조각을 강제 방출한다.
+    pub fn flush_if_due(&mut self, now_ms: u64) -> Option<String> {
+        let last = self.last_at_ms?;
+        if now_ms.saturating_sub(last) >= self.window_ms && !self.fragments.is_empty() {
+            let out = collapse_ws(&self.fragments.join(" "));
+            self.fragments.clear();
+            self.last_at_ms = None;
+            Some(out)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -814,5 +980,52 @@ mod tests {
         );
         assert_eq!(normalize_cc(" APP://Code.exe "), "code.exe");
         assert_eq!(normalize_cc("www.shop.example.com"), "shop.example.com");
+    }
+
+    #[test]
+    fn cn270_cross_cc_topic_bridge_transfers_only_on_shared_relay_key_preserving_cr02_cliff() {
+        let mut tracker = TopicTracker::new().with_hasher(fake_hash);
+        tracker.remember("fextralife.com", "말레니아 빙결 항아리", USER_MENTION_WEIGHT, 1_000);
+
+        // 1) Unrelated app switch (no shared RelayKey): CR-02 PLINKO cliff stays strictly 0.0!
+        assert_eq!(tracker.bridge_cross_cc("fextralife.com", "notepad.exe", &[], 2_000), 0);
+        assert_eq!(tracker.salience("notepad.exe", "말레니아 빙결 항아리", 2_000), 0.0);
+
+        // 2) Linked meta-course Alt-Tab (shared canonical RelayKey): topic bridges cleanly!
+        let bridged = tracker.bridge_cross_cc(
+            "fextralife.com",
+            "eldenring.exe",
+            &["0xrelay-malenia-0001".to_string()],
+            2_500,
+        );
+        assert_eq!(bridged, 1);
+        assert!(tracker.salience("eldenring.exe", "말레니아 빙결 항아리", 2_500) >= SALIENCE_FLOOR);
+
+        let game_snap = ScreenAnchorSnapshot {
+            cc: "eldenring.exe".into(),
+            ..Default::default()
+        };
+        let plan = tracker.resolve_and_plan("그거 어떻게 써?", &[], &game_snap, 3_000);
+        assert_eq!(plan.kind, ReferenceKind::AnaphoricDialogue);
+        assert_eq!(plan.resolved_entity.as_deref(), Some("말레니아 빙결 항아리"));
+    }
+
+    #[test]
+    fn ac05_speech_coalescer_merges_stuttered_fragments_without_breaking_cr06_cancel() {
+        let mut coal = SpeechCoalescer::new();
+        assert_eq!(coal.push("그...", 1_000), CoalesceOutcome::Buffering);
+        assert_eq!(coal.push("어... 2번", 1_900), CoalesceOutcome::Buffering);
+        assert_eq!(
+            coal.push("눌러줘", 2_800),
+            CoalesceOutcome::Ready("그 2번 눌러줘".to_string())
+        );
+
+        // CR-06 explicit correction/cancel clears buffered fragments immediately.
+        assert_eq!(coal.push("어... 3번", 5_000), CoalesceOutcome::Buffering);
+        assert_eq!(
+            coal.push("아니 취소 1번으로", 5_700),
+            CoalesceOutcome::CancelledAndReplaced("아니 취소 1번으로".to_string())
+        );
+        assert_eq!(coal.flush_if_due(10_000), None);
     }
 }

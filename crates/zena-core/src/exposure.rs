@@ -26,6 +26,16 @@ pub enum ExposureRole {
     WarnedTrap,
 }
 
+/// Phase 6 Part 3: 노출 원장의 대상 유형 (`zena_verdict::CreditTargetKind` 와 1:1 대응).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExposureTargetKind {
+    #[default]
+    RagRecord,
+    CourseCheckpoint,
+    NavRegion,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExposedRecord {
     pub record_id: String,
@@ -36,6 +46,10 @@ pub struct ExposedRecord {
     /// 1.0 when the topic was named, 0.75..1.0 for a semantic match.
     pub w_spoken: f32,
     pub exposed_at_ms: u64,
+    /// Phase 6 Part 3: 공략 노트 vs 타임트라이얼 체크포인트 시너지 귀속 구분.
+    pub target_kind: ExposureTargetKind,
+    /// Phase 6 Part 3: 상호보완("tactics" vs "route") 또는 상호배타적 슬롯 그룹.
+    pub exclusive_slot_group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +139,39 @@ impl ExposureLedger {
                 },
                 w_spoken: w,
                 exposed_at_ms: now_ms,
+                target_kind: ExposureTargetKind::RagRecord,
+                exclusive_slot_group: Some("tactics".to_string()),
             });
             n += 1;
         }
         n
+    }
+
+    /// Phase 6 Part 3: 같은 턴에서 공략 RAG("tactics") 와 코스 체크포인트("route")를 함께 안내했을 때
+    /// 서로 다른 슬롯 그룹(`Complementary`)으로 노출 원장에 등록해 승리 시 0.5 / 0.5 시너지 귀속을 가능하게 한다.
+    pub fn record_course_checkpoint(
+        &mut self,
+        checkpoint_id: &str,
+        cc: &str,
+        to: Option<&str>,
+        label: &str,
+        role: ExposureRole,
+        now_ms: u64,
+    ) {
+        if checkpoint_id.is_empty() {
+            return;
+        }
+        self.insert(ExposedRecord {
+            record_id: checkpoint_id.to_string(),
+            cc: cc.to_string(),
+            to: to.map(str::to_string),
+            canonical_topic: label.to_string(),
+            role,
+            w_spoken: 1.0,
+            exposed_at_ms: now_ms,
+            target_kind: ExposureTargetKind::CourseCheckpoint,
+            exclusive_slot_group: Some("route".to_string()),
+        });
     }
 
     /// Drops exposures older than the TTL.
@@ -141,6 +184,13 @@ impl ExposureLedger {
     pub fn active_in_window(&mut self, cc: &str, now_ms: u64) -> Vec<ExposedRecord> {
         self.prune(now_ms);
         self.entries.iter().filter(|e| e.cc == cc).cloned().collect()
+    }
+
+    /// Phase 6 Part 1: 크로스-앱 메타 궤적(`ccs`, 예: `["eldenring.exe", "fextralife.com"]`)에 걸쳐
+    /// 최근 `ttl_ms` 내 노출된 모든 공략·체크포인트 기록을 수집해 크로스-앱 승리 귀속을 지원한다.
+    pub fn active_in_meta_trajectory(&mut self, ccs: &[&str], now_ms: u64) -> Vec<ExposedRecord> {
+        self.prune(now_ms);
+        self.entries.iter().filter(|e| ccs.iter().any(|cc| *cc == e.cc)).cloned().collect()
     }
 }
 

@@ -475,6 +475,35 @@ pub fn outcome_gate(outcome_sign: i32, feedback: Option<&ExtractedFeedback>) -> 
     }
 }
 
+/// Phase 4 Part 1 (FC-05/FC-06): 타임트라이얼 스텝별 마찰 z · 경고 함정 마스크 · 자책 방패를
+/// `premium_discount_nav::route_marks_v2` 의 16비트 `fault_steps_mask` 로 변환한다.
+///
+/// * `shielded_defeat == true`: 플레이어 본인 실수(자책 방패) — 모든 스텝을 기권(`u16::MAX`) 처리해 경로 오염을 0으로 차단.
+/// * `warned_trap_mask`: 제나가 이미 경고한 함정(FC-06) — 승리 시에도 False Premium(+1) 수혜 금지.
+/// * `friction_z >= BOTTLENECK_Z` (1.0): 실제 병목이 발생한 스텝만 마킹해 순항 구간 보호(FC-05).
+pub fn step_fault_mask(step_friction_z: &[Option<f64>], warned_trap_mask: u16, shielded_defeat: bool) -> u16 {
+    if shielded_defeat {
+        return u16::MAX;
+    }
+    let mut mask = warned_trap_mask;
+    for (idx, z_opt) in step_friction_z.iter().enumerate().take(16) {
+        if z_opt.is_some_and(|z| z.is_finite() && z >= BOTTLENECK_Z) {
+            mask |= 1u16 << idx;
+        }
+    }
+    mask
+}
+
+/// Phase 4 Part 1 (FC-05): 승리 직후 부정 발화(SuppressedByFeedback) 또는 자책 패배(Shielded)가 감지되면
+/// 타임트라이얼 런 부호(`+1`/`-1`)를 중립(`0`)으로 억제해 가짜 Premium/Discount 투표를 막는다.
+pub fn adjust_run_for_feedback(run_kind: i32, feedback: Option<&ExtractedFeedback>) -> (i32, OutcomeGate) {
+    let gate = outcome_gate(run_kind, feedback);
+    match gate {
+        OutcomeGate::Distribute => (run_kind.signum(), gate),
+        OutcomeGate::Shielded | OutcomeGate::SuppressedByFeedback => (0, gate),
+    }
+}
+
 /// N × 4 double-centred credit attribution for one event of `event_kind` ("feedback" | "reaction" | "outcome" |
 /// "manual" | "implicit") and `sign`, updating `scope_stat` (`credit.margin`, the confusion ledger) — see the module
 /// docs. `strength` is the extracted strength (0.5 or 1.0); `shield_defeat` shields an `outcome` −1;
@@ -1038,5 +1067,31 @@ mod tests {
         );
         let back: AttributionReport = serde_json::from_value(json).unwrap();
         assert_eq!(back.tie, TieKind::Decisive);
+    }
+
+    #[test]
+    fn cn248_fc05_fault_mask_and_post_victory_feedback_gate_prevent_false_route_marks() {
+        // 1) Self-blame defeat shields all steps (fault_mask = u16::MAX, run_kind -> 0).
+        let defeat_ctx = FeedbackContext {
+            recent_defeat_within_15s: true,
+            ..Default::default()
+        };
+        let self_blame = extract_pragmatic_feedback("공략은 맞는데 내 손이 꼬였어", &[], "ko", defeat_ctx).unwrap();
+        let (adj_defeat, gate_defeat) = adjust_run_for_feedback(-1, Some(&self_blame));
+        assert_eq!(gate_defeat, OutcomeGate::Shielded);
+        assert_eq!(adj_defeat, 0);
+        assert_eq!(step_fault_mask(&[Some(-0.2), Some(2.4)], 0, true), u16::MAX);
+
+        // 2) Post-victory disapproval ("깨긴 했는데 비추") suppresses +1 run sign to 0.
+        let disapproval = extract_pragmatic_feedback("깨긴 했는데 비추", &[], "ko", FeedbackContext::default()).unwrap();
+        let (adj_win, gate_win) = adjust_run_for_feedback(1, Some(&disapproval));
+        assert_eq!(gate_win, OutcomeGate::SuppressedByFeedback);
+        assert_eq!(adj_win, 0);
+
+        // 3) Bottleneck at step 2 (z=2.1) + WarnedTrap at step 1 => cruise step 0 stays 0 (protected), steps 1 & 2 masked.
+        let mask = step_fault_mask(&[Some(-0.4), Some(0.1), Some(2.1)], 1 << 1, false);
+        assert_eq!(mask & (1 << 0), 0);
+        assert_ne!(mask & (1 << 1), 0);
+        assert_ne!(mask & (1 << 2), 0);
     }
 }

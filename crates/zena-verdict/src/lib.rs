@@ -19,16 +19,18 @@ pub mod feedback;
 pub mod speak;
 
 pub use credit::{
-    attribute_and_update_duels, duel_for_item, outcome_gate, outperforms, record_demotion, AttributionCandidate, AttributionReport,
-    CandidateRelation, CreditShare, CreditTargetKind, CrossTrialMemory, Exclusion, OutcomeGate, RivalFailure,
+    adjust_run_for_feedback, attribute_and_update_duels, duel_for_item, outcome_gate, outperforms, record_demotion,
+    step_fault_mask, AttributionCandidate, AttributionReport, CandidateRelation, CreditShare, CreditTargetKind,
+    CrossTrialMemory, Exclusion, OutcomeGate, RivalFailure,
 };
 pub use feedback::{
     apply_feedback_to_ledger, extract_pragmatic_feedback, extract_pragmatic_feedback_with, feedback_obs, manual_obs, mentioned_label,
     ExtractedFeedback, FeedbackContext, FeedbackIntent, FeedbackLexicon, FeedbackToken, ObsKind,
 };
 pub use speak::{
-    outbound_votes, stance, toggle_pin, DifferKind, GlobalVerdict, LocalVerdictEntry, MemoryFreshness, PinToggle, Stance, UserPin,
-    VerdictLocale, VerdictPairView,
+    course_stance_brief_line, outbound_votes, should_reinstate_standard_course, stance, toggle_pin, DifferKind,
+    GlobalVerdict, LocalVerdictEntry, MemoryFreshness, PinToggle, Stance, UserPin, VerdictLocale, VerdictPairView,
+    REINSTATE_MIN_EVIDENCE,
 };
 
 /// `pd-verdict/1`, under the name this crate has always used (premium-discount calls it `RECIPE_V1`).

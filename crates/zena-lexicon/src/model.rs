@@ -40,6 +40,91 @@ const RESERVED: &[&str] = &["version", "meta", "vision", "vision_prompting", FEE
 pub const FEEDBACK_RULES: &str = "feedback_rules";
 pub const FUNCTION_GROUP: &str = "function";
 pub const PROACTIVE_GROUP: &str = "proactive";
+/// Phase 6 Part 2: 닫힌 내비게이션 아키타입 5종(`nav.*`) 그룹 — 텍스트 라우터 오발동 방지를 위해 `text_nodes()` 에서 제외.
+pub const NAV_GROUP: &str = "nav";
+
+/// Phase 6 Part 2: 2-계층 렉시콘의 Tier 2 앱/사이트 종속 바인딩(예: 특정 게임 은어 · 웹 UI 라벨).
+/// 글로벌 `domains`/`phrases` 와 완전히 격리되며, `import` 재시딩 시에도 보존된다.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopedBinding {
+    pub cc: String,
+    pub domain: String,
+    pub text: String,
+    pub hits: u32,
+    pub sessions: Vec<String>,
+    pub rejects: u32,
+    pub promoted: bool,
+    pub updated_ms: i64,
+}
+
+/// Phase 6 Part 2: 4-게이트 안전 자동학습(`--learn`) 거부 사유.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafeLearnReject {
+    /// Gate 1 (Command Air-Gap): `Action::System` / `Action::Asset` 명령 노드는 자동 학습 영구 금지.
+    CommandAirGap,
+    /// Gate 2 (PII · 해시 · 기능어 스크럽): 이메일/전화/카드/계좌 숫자열, `0x...` 해시, 기능어, 2자 미만 차단.
+    ScrubRejected,
+    /// Gate 3 (신뢰도 · 마진 · 결과 게이트): `score < 0.72`, `margin < 0.10`, 또는 부정 결과(`outcome_sign < 0`).
+    LowConfidenceOrBadOutcome,
+}
+
+/// Phase 6 Part 2: `learn_safe` 실행 결과.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafeLearnOutcome {
+    Rejected(SafeLearnReject),
+    /// 이미 등록된 구문/바인딩.
+    AlreadyKnown,
+    /// 교차 에피소드 승격 대기 중(현재 고유 세션 수).
+    PendingSessions(u32),
+    /// 독립 3세션 이상 검증 완료로 승격됨.
+    Promoted,
+}
+
+pub const SAFE_LEARN_MIN_SCORE: f32 = 0.72;
+pub const SAFE_LEARN_MIN_MARGIN: f32 = 0.10;
+pub const SAFE_LEARN_PROMOTE_SESSIONS: u32 = 3;
+pub const SAFE_LEARN_REVOKE_REJECTS: u32 = 2;
+
+/// Phase 6 Part 2: 4-게이트 중 앞 3개(Command Air-Gap · PII/해시/기능어 스크럽 · 신뢰도/결과 게이트)를 순수 검증한다.
+pub fn check_safe_learn_gates(
+    node: &Node,
+    text: &str,
+    function_phrases: &[String],
+    score: f32,
+    margin: f32,
+    outcome_sign: i32,
+) -> std::result::Result<String, SafeLearnReject> {
+    // Gate 1: Command Air-Gap
+    if node.action.is_command() {
+        return Err(SafeLearnReject::CommandAirGap);
+    }
+    // Gate 2: PII / Hash / Function scrub
+    let clean = text.trim().to_lowercase();
+    if clean.chars().count() < 2 || clean.chars().count() > 64 {
+        return Err(SafeLearnReject::ScrubRejected);
+    }
+    if clean.contains('@')
+        || clean.contains("http://")
+        || clean.contains("https://")
+        || clean.contains("0x")
+        || clean.chars().filter(|c| c.is_ascii_digit()).count() >= 6
+    {
+        return Err(SafeLearnReject::ScrubRejected);
+    }
+    if function_phrases.iter().any(|f| f == &clean) {
+        return Err(SafeLearnReject::ScrubRejected);
+    }
+    // Gate 3: Confidence / Margin / Outcome
+    if !score.is_finite()
+        || !margin.is_finite()
+        || score < SAFE_LEARN_MIN_SCORE
+        || margin < SAFE_LEARN_MIN_MARGIN
+        || outcome_sign < 0
+    {
+        return Err(SafeLearnReject::LowConfidenceOrBadOutcome);
+    }
+    Ok(clean)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExpressLevel {
@@ -502,6 +587,7 @@ impl Lexicon {
         self.nodes.iter().filter(|n| {
             n.group != FUNCTION_GROUP
                 && n.group != PROACTIVE_GROUP
+                && n.group != NAV_GROUP
                 && n.action != Action::None
                 && (!n.bias.is_empty() || !n.exact_match.is_empty())
         })
