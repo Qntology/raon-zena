@@ -29,9 +29,9 @@ use zena_core::brief::{
 use zena_core::reference::normalize_cc;
 use zena_sds::matrix::{double_center, exclusive_assign_by_score, ABSENT};
 
-/// Logical vector space identifier for multilingual UI label matching (`WA-09`).
+/// Logical vector space identifier for multilingual UI label matching (`WA-09` & Phase 5 Part 3 Canonical Space).
 #[allow(dead_code)]
-pub const LABEL_SPACE_ID: &str = "granite-label-384d";
+pub const LABEL_SPACE_ID: &str = premium_discount_nav::LABEL_SPACE;
 /// Minimum raw score (`0.65*cos + 0.20*role + 0.15*ord`) before entering 1:1 assignment.
 pub const LABEL_MATCH_MIN: f32 = 0.72;
 /// Elements with less than 35% visible area behind sticky headers/footers are clipped.
@@ -86,6 +86,150 @@ pub struct NavBadgeOverlay {
     pub occluded_by_overlay: bool,
     /// Optional 3D coaching arrow angle (deg, 0° right, 90° up) pointing toward badge #1.
     pub primary_arrow_deg: Option<f32>,
+}
+
+/// Phase 7 Part 2 (`AC-04`): 색각 이상·저시력 사용자를 위한 배지 형태+기호 이중 부호화.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BadgeShape {
+    /// Premium 검증 경로: 별/다이아몬드 외곽 + `★`
+    StarPremium,
+    /// 표준 중립 경로: 원형 + 숫자
+    CircleNeutral,
+    /// Discount / 함정 경고: 삼각형 + `!`
+    TriangleTrap,
+    /// 최종 결제 CommitGuard: 방패 + `🔒`
+    ShieldCommit,
+    /// 품절·비활성: 점선 + `×`
+    DashedUnavailable,
+}
+
+impl BadgeShape {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BadgeShape::StarPremium => "★",
+            BadgeShape::CircleNeutral => "●",
+            BadgeShape::TriangleTrap => "▲!",
+            BadgeShape::ShieldCommit => "🔒",
+            BadgeShape::DashedUnavailable => "×",
+        }
+    }
+}
+
+pub fn badge_shape_for(b: &NavBadge) -> BadgeShape {
+    if b.unavailable {
+        BadgeShape::DashedUnavailable
+    } else if b.commit_guarded || is_commit_label(&b.label) {
+        BadgeShape::ShieldCommit
+    } else {
+        match b.tier {
+            Some(Tier::Premium) => BadgeShape::StarPremium,
+            Some(Tier::Discount) => BadgeShape::TriangleTrap,
+            _ => BadgeShape::CircleNeutral,
+        }
+    }
+}
+
+/// Phase 7 Part 1 (`AC-01`): 운동·진전 장애 사용자를 보호하는 2-단계 명시적 결제 확인 가드.
+/// 단순 `#3, #3` 빠른 재입력을 진전 더블탭으로 간주해 차단하며, `>= 800ms` 간격의 의식적 재확인 또는
+/// 명시적 발화("결제 진행" / "확인" / "confirm")로만 최종 통과한다.
+#[derive(Debug, Clone, Default)]
+pub struct AccessibleCommitGuardState {
+    pending_number: Option<u8>,
+    focused_at_ms: u64,
+    pub min_deliberate_ms: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitGuardStep {
+    /// 1단계: 포커스 이동만 수행하고 결제 확인 프롬프트를 대기한다.
+    FocusedAwaitingConfirm,
+    /// 진전 더블탭(800ms 미만 반복 입력) 차단!
+    BlockedTremorDoubleTap,
+    /// 2단계: 명시적 확인 완료.
+    ConfirmedProceed,
+}
+
+impl AccessibleCommitGuardState {
+    pub fn new() -> Self {
+        Self {
+            pending_number: None,
+            focused_at_ms: 0,
+            min_deliberate_ms: 800,
+            timeout_ms: 10_000,
+        }
+    }
+
+    /// 숫자 키·음성으로 결제 버튼(`number`)을 선택했을 때 호출한다.
+    pub fn on_commit_slot_input(&mut self, number: u8, now_ms: u64) -> CommitGuardStep {
+        if let Some(prev) = self.pending_number {
+            let elapsed = now_ms.saturating_sub(self.focused_at_ms);
+            if prev == number && elapsed < self.min_deliberate_ms {
+                return CommitGuardStep::BlockedTremorDoubleTap;
+            }
+            if prev == number && elapsed <= self.timeout_ms {
+                self.pending_number = None;
+                return CommitGuardStep::ConfirmedProceed;
+            }
+        }
+        self.pending_number = Some(number);
+        self.focused_at_ms = now_ms;
+        CommitGuardStep::FocusedAwaitingConfirm
+    }
+
+    /// 명시적 음성 확인("결제 진행", "확인", "confirm")으로 대기 중인 결제 포커스를 확정한다.
+    pub fn on_explicit_confirm_phrase(&mut self, phrase: &str, now_ms: u64) -> Option<u8> {
+        let num = self.pending_number?;
+        if now_ms.saturating_sub(self.focused_at_ms) > self.timeout_ms {
+            self.pending_number = None;
+            return None;
+        }
+        let lower = phrase.trim().to_ascii_lowercase();
+        let confirmed = ["결제 진행", "진행해", "확인", "confirm", "proceed", "yes pay"]
+            .iter()
+            .any(|k| lower.contains(k));
+        if confirmed {
+            self.pending_number = None;
+            Some(num)
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn cancel(&mut self) {
+        self.pending_number = None;
+    }
+}
+
+/// Phase 4 Part 3 (`CN2-55`): 공개 코스 체크포인트 · 로컬 선택지/판정 · 사이트 분석 3-소스를
+/// 중복 없이 병합해 `build_web_nav_overlay` 에 즉시 투입할 `WebAnalyticTierRow` 목록을 만든다.
+pub fn build_live_web_rows(
+    local_rows: &[WebAnalyticTierRow],
+    public_trial_rows: &[WebAnalyticTierRow],
+    owner_analytic_rows: &[WebAnalyticTierRow],
+) -> Vec<WebAnalyticTierRow> {
+    let mut merged: Vec<WebAnalyticTierRow> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    // 우선순위: 로컬 개인 판정(WorksForMeOnly/Pin 포함) > 공개 타임트라이얼 체크포인트 > 오너 분석
+    for src in [local_rows, public_trial_rows, owner_analytic_rows] {
+        for row in src {
+            let key = row.label.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(&idx) = seen.get(&key) {
+                // 함정 플래그는 어느 한 소스라도 확정하면 보수적으로 유지
+                if row.is_friction_trap {
+                    merged[idx].is_friction_trap = true;
+                }
+            } else {
+                seen.insert(key, merged.len());
+                merged.push(row.clone());
+            }
+        }
+    }
+    merged
 }
 
 impl NavBadgeOverlay {
@@ -1223,5 +1367,54 @@ mod tests {
         );
         assert!(brief.commit_safety_guard());
         assert_eq!(brief.runtime_blocked_primary.as_deref(), Some("간편결제"));
+    }
+
+    #[test]
+    fn cn255_build_live_web_rows_wires_3sources_and_accessible_commit_guard_blocks_tremor_double_tap() {
+        assert_eq!(LABEL_SPACE_ID, premium_discount_nav::LABEL_SPACE);
+        let local = vec![WebAnalyticTierRow {
+            label: "간편결제".into(),
+            role: Role::Button,
+            ordinal_norm: 0.1,
+            tier: Tier::Premium,
+            is_friction_trap: false,
+        }];
+        let public = vec![WebAnalyticTierRow {
+            label: "쿠폰 적용".into(),
+            role: Role::Button,
+            ordinal_norm: 0.5,
+            tier: Tier::Discount,
+            is_friction_trap: true,
+        }];
+        let owner = vec![WebAnalyticTierRow {
+            label: "간편결제".into(),
+            role: Role::Button,
+            ordinal_norm: 0.1,
+            tier: Tier::Neutral,
+            is_friction_trap: false,
+        }];
+        let merged = build_live_web_rows(&local, &public, &owner);
+        assert_eq!(merged.len(), 2, "duplicate label merges with local precedence");
+        assert_eq!(merged[0].tier, Tier::Premium);
+        assert!(merged[1].is_friction_trap);
+
+        // Accessible 2-step CommitGuard blocks raw tremor double-tap (#3 within 300ms) and accepts explicit phrase.
+        let mut guard = AccessibleCommitGuardState::new();
+        assert_eq!(guard.on_commit_slot_input(3, 1_000), CommitGuardStep::FocusedAwaitingConfirm);
+        assert_eq!(guard.on_commit_slot_input(3, 1_300), CommitGuardStep::BlockedTremorDoubleTap);
+        assert_eq!(guard.on_explicit_confirm_phrase("결제 진행해줘", 2_000), Some(3));
+
+        // Dual-coded badge shape never relies on color alone.
+        let trap_badge = NavBadge {
+            number: 2,
+            anchor: "a".into(),
+            label: "쿠폰".into(),
+            rect: Rect { x: 0.1, y: 0.1, w: 0.1, h: 0.1 },
+            tier: Some(Tier::Discount),
+            commit_guarded: false,
+            unavailable: false,
+        };
+        assert_eq!(badge_shape_for(&trap_badge), BadgeShape::TriangleTrap);
+        assert_eq!(badge_shape_for(&trap_badge).symbol(), "▲!");
     }
 }

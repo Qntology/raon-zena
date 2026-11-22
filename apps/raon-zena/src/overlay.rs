@@ -28,6 +28,7 @@ use winit::window::{Window, WindowId, WindowLevel};
 use zena_core::avatar::{
     live2d_gaze_params, live2d_mouth, look_at_event, AvatarPlacement, LookAt, Viseme,
 };
+use zena_core::cues::{peripheral_visual_arc, EdgeVisualArc};
 use zena_core::geometry::{BBox, Polar, ScreenGeometry};
 use zena_core::ingress_guard::zeroize_string;
 use zena_core::nav_target::NavTargetProjector;
@@ -130,6 +131,9 @@ pub struct Overlay {
     sync_view: OverlaySyncView,
     drawer_open: bool,
     nav_badges: NavBadgeOverlay,
+    /// Phase 7 Part 2: 청각 장애·난청 주변시 방향 아크 HUD 상태.
+    #[allow(dead_code)]
+    peripheral_arc: Option<EdgeVisualArc>,
     step_aside_occluded: bool,
     cursor_pos: (f64, f64),
     press_pos: Option<(f64, f64)>,
@@ -184,6 +188,7 @@ impl Overlay {
             sync_view: OverlaySyncView::default(),
             drawer_open: false,
             nav_badges: NavBadgeOverlay::default(),
+            peripheral_arc: None,
             step_aside_occluded: false,
             cursor_pos: (0.0, 0.0),
             press_pos: None,
@@ -301,6 +306,7 @@ impl Overlay {
         if locked {
             self.drawer_open = false;
             self.nav_badges = NavBadgeOverlay::default();
+            self.peripheral_arc = None;
             self.step_aside_occluded = false;
         }
         self.apply_privacy_actions(acts);
@@ -313,6 +319,8 @@ impl Overlay {
                 r: g.distance_norm,
                 theta_deg: g.angle_deg,
             });
+            let urgent = matches!(args.emotion_state, EmotionState::Surprised | EmotionState::Worried);
+            self.peripheral_arc = Some(peripheral_visual_arc(g.angle_deg, g.distance_norm, urgent));
         }
         if args.body_motion != self.anim.motion || args.body_motion != BodyMotion::Idle {
             self.anim.motion_start = Instant::now();
@@ -348,7 +356,19 @@ impl Overlay {
             eprintln!("[zena:{level:?}] {t}");
             self.bubble.text = t.clone();
             self.bubble.fresh = false;
+            self.announce_if_screen_reader(t);
         }
+    }
+
+    fn announce_if_screen_reader(&self, text: &str) {
+        #[cfg(windows)]
+        if crate::win32::is_screen_reader_active() {
+            if let Some(h) = self.hwnd() {
+                crate::win32::announce_live_region(h, text);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = text;
     }
 
     /// A streamed sentence: queued after the current speech.
@@ -381,6 +401,7 @@ impl Overlay {
             self.bubble.text.push_str(text);
         }
         self.anim.level = self.anim.level.max(level);
+        self.announce_if_screen_reader(text);
         let end = self.anim.speech_start + Duration::from_millis(self.anim.speech_ms as u64);
         self.anim.expression_until = self.anim.expression_until.max(end + Duration::from_millis(1800));
     }

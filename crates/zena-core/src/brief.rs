@@ -101,6 +101,12 @@ pub struct CourseBrief {
     pub next_hint: NextStepHint,
     /// The course is judged Premium; `false` (Unrated / Neutral) → facts only.
     pub verdict_judged_premium: bool,
+    /// Phase 7 Part 3 (AC-06): 차분한 나침반 모드 — 스톱워치 시간차·속도 비교 문구를 완전히 숨기고 방향만 안내.
+    pub calm_compass: bool,
+    /// Phase 4 Part 2: 로컬 전용 검증 지름길 또는 `WorksForMeOnly` 안내 주석.
+    pub local_shortcut_note: Option<String>,
+    /// Phase 5 Part 1: 반감기 감쇠로 흐려진 과거 경로 회상(`FadedRecall`) 주석.
+    pub faded_recall_note: Option<String>,
 }
 
 /// "내 최고와 동등" / "타인 평균보다 3.2초 빠름" with the 1-second dead band.
@@ -176,8 +182,22 @@ impl CourseBrief {
     /// The (at most two) lines after `<|im_start|>user\n`.
     pub fn to_prompt_lines(&self) -> Vec<String> {
         let progress = format!("{}/{}", self.passed.min(self.length), self.length);
+        if self.calm_compass {
+            // Phase 7 Part 3 (AC-06): 스톱워치 압박 제거 — 초/느림/빠름 문구 0건, 차분한 방향 안내만 출력.
+            let sync_note = match self.sync {
+                CourseSync::OnTrack => "천천히 순서대로 진행 중",
+                CourseSync::Detouring => "다른 길로 이동 중 (서두르지 말 것)",
+                CourseSync::Rejoined => "본래 경로로 자연스럽게 합류함",
+            };
+            let first = format!("[차분한 나침반 {progress}] {sync_note}");
+            return vec![first, self.next_step_line()];
+        }
         let splits = self.split_summary();
-        let first = if self.facts_only() {
+        let first = if let Some(recall) = self.faded_recall_note.as_deref().map(prompt_label).filter(|s| !s.is_empty()) {
+            format!("[과거 경로 회상 {progress}] {recall}")
+        } else if let Some(local_note) = self.local_shortcut_note.as_deref().map(prompt_label).filter(|s| !s.is_empty()) {
+            format!("[내 지름길 {progress}] {local_note}")
+        } else if self.facts_only() {
             let mut parts = vec![format!("{progress} 구간")];
             match self.sync {
                 CourseSync::Detouring => parts.push("고스트 경로 밖".into()),
@@ -205,6 +225,62 @@ impl CourseBrief {
             }
         };
         vec![first, self.next_step_line()]
+    }
+}
+
+/// Phase 6 Part 3: 하이브리드 RAG(90일 반감기 `pd` 트랙) × 실시간 텔레메트리(14일 반감기 `nav` 트랙) 중재 티어.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TelemetryTier {
+    Premium,
+    Neutral,
+    Discount,
+    Unrated,
+}
+
+/// Phase 6 Part 3: 4사분면 중재 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TelemetryArbiterVerdict {
+    /// 공략(Premium) + 최근 실측(Premium) — 시너지 확신 안내.
+    SynergyBothPremium,
+    /// 공략(Premium, 90일) vs 최근 실측(Discount, 14일) — 패치·UI 변경 경고 우선!
+    RecentPatchCaution,
+    /// 공략 없음(Unrated/Neutral) + 최근 실측(Premium) — 미문서화 신규 지름길 제안.
+    UndocumentedShortcut,
+    /// 공략(Discount) + 최근 실측(Discount) — 이중 확인 함정 경고.
+    SharedTrap,
+    /// 중재 필요 없음.
+    NeutralPass,
+}
+
+/// Phase 6 Part 3: 공략 RAG 와 텔레메트리 `nav` 트랙의 반감기 시차 충돌을 4사분면으로 중재하고,
+/// `<|im_start|>user\n` 뒤에 주입할 중재 경고 라인을 생성한다(원본 해시 절대 노출 금지).
+pub fn arbitrate_rag_with_telemetry(
+    rag_tier: TelemetryTier,
+    nav_tier: TelemetryTier,
+    label: &str,
+) -> (TelemetryArbiterVerdict, Option<String>) {
+    let clean = prompt_label(label);
+    let subject = if clean.is_empty() { "이 구간".to_string() } else { format!("'{clean}'") };
+    match (rag_tier, nav_tier) {
+        (TelemetryTier::Premium, TelemetryTier::Premium) => (
+            TelemetryArbiterVerdict::SynergyBothPremium,
+            Some(format!("[교차 검증] {subject} — 공략과 최근 실측 경로 모두 검증됨")),
+        ),
+        (TelemetryTier::Premium, TelemetryTier::Discount) => (
+            TelemetryArbiterVerdict::RecentPatchCaution,
+            Some(format!(
+                "[최신 변동 주의] {subject} — 예전 공략은 추천이나 최근 실측 경로에선 막힘(패치·UI 변경 가능성: 맹신 말고 우회 안내)"
+            )),
+        ),
+        (TelemetryTier::Unrated | TelemetryTier::Neutral, TelemetryTier::Premium) => (
+            TelemetryArbiterVerdict::UndocumentedShortcut,
+            Some(format!("[실측 지름길] {subject} — 글 공략은 없으나 최근 유저 실측으로 검증된 빠른 경로")),
+        ),
+        (TelemetryTier::Discount, TelemetryTier::Discount) => (
+            TelemetryArbiterVerdict::SharedTrap,
+            Some(format!("[이중 경고] {subject} — 공략과 실측 모두 함정 구간, 피할 것")),
+        ),
+        _ => (TelemetryArbiterVerdict::NeutralPass, None),
     }
 }
 
@@ -826,5 +902,52 @@ mod tests {
             "a sufficient sample may say so"
         );
         assert!(!AnalyticBrief::sample_sufficient(20, Some(10)), "the comparison window counts too");
+    }
+
+    #[test]
+    fn cn279_hybrid_arbiter_resolves_stale_rag_premium_vs_fresh_nav_discount_conflict() {
+        // Stale 90d RAG says Premium, fresh 14d telemetry says Discount (patched/broken) -> RecentPatchCaution!
+        let (verdict, line) = arbitrate_rag_with_telemetry(
+            TelemetryTier::Premium,
+            TelemetryTier::Discount,
+            "구버전 사다리 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert_eq!(verdict, TelemetryArbiterVerdict::RecentPatchCaution);
+        let text = line.expect("caution line");
+        assert!(text.contains("최신 변동 주의") && text.contains("우회"));
+        assert!(!text.contains("0xdeadbeef"), "raw hashes must be stripped");
+
+        let (v2, l2) = arbitrate_rag_with_telemetry(TelemetryTier::Unrated, TelemetryTier::Premium, "간편결제");
+        assert_eq!(v2, TelemetryArbiterVerdict::UndocumentedShortcut);
+        assert!(l2.unwrap().contains("실측 지름길"));
+
+        let (v3, _) = arbitrate_rag_with_telemetry(TelemetryTier::Premium, TelemetryTier::Premium, "우회로");
+        assert_eq!(v3, TelemetryArbiterVerdict::SynergyBothPremium);
+    }
+
+    #[test]
+    fn ac06_calm_compass_hides_stopwatch_deltas_and_preserves_prefix_cache() {
+        let calm = CourseBrief {
+            calm_compass: true,
+            vs_best_ms: Some(4_500),
+            vs_public_ms: Some(8_200),
+            ..premium()
+        };
+        let lines = calm.to_prompt_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("[차분한 나침반 2/4]"), "{}", lines[0]);
+        for banned in ["느림", "빠름", "초", "4.5", "8.2"] {
+            assert!(!lines[0].contains(banned), "calm compass must hide stopwatch delta {banned}: {}", lines[0]);
+        }
+        let bare = build_fast_path_prompt(&Situation::default());
+        let with_calm = build_fast_path_prompt(&Situation {
+            session: Some(SessionContext {
+                course_brief: Some(calm),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let head = |p: &str| p[..p.find(USER_TURN).unwrap() + USER_TURN.len()].to_string();
+        assert_eq!(head(&bare), head(&with_calm), "prefix cache remains byte-identical");
     }
 }

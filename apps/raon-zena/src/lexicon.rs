@@ -75,11 +75,126 @@ pub fn reanchor_if_stale(store: &zena_lexicon::LexiconStore, r: &Reanchor) -> Re
     Ok(Some(n))
 }
 
+/// Phase 6 Part 2 (`CN2-75` / `PF-09`): 0.7B TextTower 백그라운드 재임베딩을 허용하기 위한 최소 가용 RAM(MiB).
+pub const REANCHOR_MIN_AVAIL_RAM_MB: u64 = 650;
+
+/// Phase 6 Part 2 (`CN2-75`): 타임트라이얼 주행 중·고긴장 전투 중·저사양 메모리 부족(<650 MiB)일 때는
+/// 0.7B TextTower 로딩을 유휴 시점까지 지연시킨다.
+pub fn should_run_deferred_reanchor(
+    trial_active: bool,
+    high_tension_combat: bool,
+    avail_ram_mb: Option<u64>,
+) -> bool {
+    if trial_active || high_tension_combat {
+        return false;
+    }
+    avail_ram_mb.is_none_or(|mb| mb >= REANCHOR_MIN_AVAIL_RAM_MB)
+}
+
+/// Phase 6 Part 2 (`CN2-75`): TextTower 를 깨우지 않고 1152-d 이미지 임베딩만으로
+/// 시각 프로토타입을 누적·합의(독립 3회 연속 `cos >= 0.90`, ±10초 프라이버시 버퍼 제외)하는 축적기.
+#[derive(Debug, Clone)]
+pub struct VisualPrototypeAccumulator {
+    min_runs: usize,
+    min_cos: f32,
+    privacy_guard_ms: u64,
+    last_privacy_ms: Option<u64>,
+    buckets: HashMap<String, Vec<Vec<f32>>>,
+}
+
+impl Default for VisualPrototypeAccumulator {
+    fn default() -> Self {
+        Self {
+            min_runs: 3,
+            min_cos: 0.90,
+            privacy_guard_ms: 10_000,
+            last_privacy_ms: None,
+            buckets: HashMap::new(),
+        }
+    }
+}
+
+impl VisualPrototypeAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn note_privacy_event(&mut self, now_ms: u64) {
+        self.last_privacy_ms = Some(now_ms);
+        self.buckets.clear();
+    }
+
+    /// 깔끔한 비프라이버시 주행에서 관측된 1152-d 단위 이미지 벡터를 누적하고,
+    /// `min_runs`(3회) 이상 `cos >= 0.90` 일관성이 확인되면 L2 정규화 프로토타입을 반환한다.
+    pub fn observe(&mut self, vision_key: &str, unit_vec: &[f32], now_ms: u64) -> Option<Vec<f32>> {
+        if vision_key.contains("privacy") || vision_key.contains("private") || unit_vec.is_empty() {
+            return None;
+        }
+        if let Some(p_ms) = self.last_privacy_ms {
+            if now_ms.saturating_sub(p_ms) <= self.privacy_guard_ms {
+                return None;
+            }
+        }
+        let norm = unit_vec.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        if norm <= 1e-6 || !norm.is_finite() {
+            return None;
+        }
+        let norm_v: Vec<f32> = unit_vec.iter().map(|&x| (x as f64 / norm) as f32).collect();
+        let entry = self.buckets.entry(vision_key.to_string()).or_default();
+        if let Some(first) = entry.first() {
+            if first.len() != norm_v.len() {
+                entry.clear();
+            } else {
+                let cos: f32 = first.iter().zip(&norm_v).map(|(a, b)| a * b).sum();
+                if cos < self.min_cos {
+                    entry.clear();
+                }
+            }
+        }
+        entry.push(norm_v);
+        if entry.len() < self.min_runs {
+            return None;
+        }
+        let dims = entry[0].len();
+        let mut mean = vec![0.0f64; dims];
+        for v in entry.iter() {
+            for (m, &x) in mean.iter_mut().zip(v.iter()) {
+                *m += x as f64;
+            }
+        }
+        let mnorm = mean.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if mnorm <= 1e-12 {
+            return None;
+        }
+        let proto: Vec<f32> = mean.into_iter().map(|x| (x / mnorm) as f32).collect();
+        entry.clear();
+        Some(proto)
+    }
+}
+
 /// Something the pipeline asks the dictionary service to do.
 #[cfg_attr(not(feature = "lexicon-db"), allow(dead_code))]
 pub enum LexiconMsg {
-    /// A span caught by vectors alone, for learning.
+    /// Legacy learn message (routes through safe 4-gate pipeline when metadata is provided).
+    #[allow(dead_code)]
     Learn { key: String, span: String },
+    /// Phase 6 Part 2: 4-게이트 안전 자동학습(Tier 2 스코프 바인딩 및 Command Air-Gap 포함).
+    LearnSafe {
+        cc: Option<String>,
+        key: String,
+        span: String,
+        session_id: String,
+        score: f32,
+        margin: f32,
+        outcome_sign: i32,
+    },
+    /// Phase 6 Part 2: TextTower 없이 이미지 프로토타입 벡터 직접 주입(Privacy 불변 보호).
+    #[allow(dead_code)]
+    UpsertPrototype {
+        vision_key: String,
+        prototype: Vec<f32>,
+        model: String,
+    },
 }
 
 pub fn read_json(path: Option<&Path>) -> Result<Lexicon> {
@@ -160,10 +275,14 @@ pub fn spawn_service(
                 Err(e) => return eprintln!("[lexicon] service not started: {e:#}"),
             };
             let mut last = store.revision().unwrap_or(0);
-            // Once per service: a failed recompute is reported, not retried every poll.
+            // Phase 6 Part 2: 저사양 게임 중 0.7B TextTower 기동 차단 — 가용 RAM >= 650 MiB 유휴 조건에서만 재임베딩.
             if let Some(r) = &reanchor {
-                if let Err(e) = reanchor_if_stale(&store, r) {
-                    eprintln!("[lexicon] anchors not recomputed for {}: {e:#}", r.model.display());
+                if should_run_deferred_reanchor(false, false, crate::pd_bridge::avail_ram_mb()) {
+                    if let Err(e) = reanchor_if_stale(&store, r) {
+                        eprintln!("[lexicon] anchors not recomputed for {}: {e:#}", r.model.display());
+                    }
+                } else {
+                    eprintln!("[lexicon] deferred reanchor skipped (low available RAM < {REANCHOR_MIN_AVAIL_RAM_MB} MiB)");
                 }
             }
             loop {
@@ -172,6 +291,38 @@ pub fn spawn_service(
                         Ok(Learned::Promoted) => eprintln!("[lexicon] learned '{span}' for {key}"),
                         Ok(_) => {}
                         Err(e) => eprintln!("[lexicon] learn failed: {e:#}"),
+                    },
+                    Ok(LexiconMsg::LearnSafe {
+                        cc,
+                        key,
+                        span,
+                        session_id,
+                        score,
+                        margin,
+                        outcome_sign,
+                    }) => match store.learn_safe(
+                        cc.as_deref(),
+                        &key,
+                        &span,
+                        &session_id,
+                        score,
+                        margin,
+                        outcome_sign,
+                    ) {
+                        Ok(zena_lexicon::SafeLearnOutcome::Promoted) => {
+                            eprintln!("[lexicon] safe-learned '{span}' for {key} (cc={cc:?})")
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[lexicon] learn_safe failed: {e:#}"),
+                    },
+                    Ok(LexiconMsg::UpsertPrototype {
+                        vision_key,
+                        prototype,
+                        model,
+                    }) => match store.upsert_visual_prototype(&vision_key, &prototype, &model) {
+                        Ok(true) => eprintln!("[lexicon] visual prototype updated for {vision_key}"),
+                        Ok(false) => eprintln!("[lexicon] visual prototype blocked (immutable privacy): {vision_key}"),
+                        Err(e) => eprintln!("[lexicon] visual prototype failed: {e:#}"),
                     },
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -216,4 +367,33 @@ pub fn spawn_service(
     _reanchor: Option<Reanchor>,
 ) -> Sender<LexiconMsg> {
     std::sync::mpsc::channel().0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cn275_visual_prototype_accumulator_and_deferred_reanchor_guard_never_wake_text_tower_in_combat() {
+        // Deferred reanchor blocks during active trial, combat, or low RAM (< 650 MiB).
+        assert!(!should_run_deferred_reanchor(true, false, Some(2048)));
+        assert!(!should_run_deferred_reanchor(false, true, Some(2048)));
+        assert!(!should_run_deferred_reanchor(false, false, Some(512)));
+        assert!(should_run_deferred_reanchor(false, false, Some(1024)));
+
+        // VisualPrototypeAccumulator produces a unit prototype after 3 consistent clean runs (cos >= 0.90)
+        // and blocks privacy screens and +-10s privacy buffer windows!
+        let mut acc = VisualPrototypeAccumulator::new();
+        let v1 = vec![0.99f32, 0.141, 0.0];
+        let v2 = vec![0.985f32, 0.172, 0.0];
+        let v3 = vec![0.992f32, 0.126, 0.0];
+        assert!(acc.observe("vision.private", &v1, 1_000).is_none());
+        acc.note_privacy_event(5_000);
+        assert!(acc.observe("vision.game_battle", &v1, 10_000).is_none(), "inside 10s privacy buffer");
+        assert!(acc.observe("vision.game_battle", &v1, 20_000).is_none());
+        assert!(acc.observe("vision.game_battle", &v2, 25_000).is_none());
+        let proto = acc.observe("vision.game_battle", &v3, 30_000).expect("3 clean consistent runs emit prototype");
+        let norm: f32 = proto.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4);
+    }
 }

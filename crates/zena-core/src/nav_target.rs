@@ -18,6 +18,8 @@ use crate::prompt::direction_label;
 pub const OCCLUSION_IOU: f32 = 0.05;
 /// A badge number Zena said stays locked this long after her line ended.
 pub const SPOKEN_LOCK_HOLD_MS: u64 = 8_000;
+/// Phase 7 Part 2 (`AC-04`, `κ_sr = 2.5`): 스크린리더 활성 시 발화 번호 잠금 유지 시간(20초).
+pub const SPOKEN_LOCK_HOLD_SR_MS: u64 = 20_000;
 
 /// One target in desktop terms.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,6 +200,78 @@ impl SpokenSlotLock {
         self.line.clear();
         self.until_ms = [0; 10];
     }
+
+    /// Phase 7 Part 2 (`AC-04`): 스크린리더 활성 시 번호 잠금 창을 20초로 확장한다.
+    pub fn set_screen_reader_mode(&mut self, active: bool) {
+        self.hold_ms = if active {
+            SPOKEN_LOCK_HOLD_SR_MS
+        } else {
+            SPOKEN_LOCK_HOLD_MS
+        };
+    }
+}
+
+/// Phase 7 Part 2 (`AC-04`): 시각 장애·저시력 사용자를 위한 3D 공간 오디오 비콘 매개변수.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioBeaconCue {
+    /// 스테레오 패닝 `[-1.0 (좌), +1.0 (우)]`.
+    pub pan: f32,
+    /// 수직 고도 피치(Hz): 아래 ~220Hz, 중앙 440Hz, 위 ~660Hz.
+    pub pitch_hz: f32,
+    /// 근접 펄스 주기(Hz): 가까울수록 빠르게 맥동.
+    pub pulse_hz: f32,
+    /// 8방향 언어 힌트(UIA LiveRegion 병행 출력용).
+    pub direction: &'static str,
+}
+
+/// 화면 극좌표 `(r, θ)` 를 스테레오 패닝·피치·근접 펄스로 음향화한다.
+pub fn sonify_polar(polar: &Polar) -> AudioBeaconCue {
+    let rad = polar.theta_deg.to_radians();
+    let r = polar.r.clamp(0.0, 1.0);
+    let pan = (rad.cos() * r).clamp(-1.0, 1.0);
+    let pitch_hz = (440.0 + 220.0 * rad.sin()).clamp(220.0, 660.0);
+    let pulse_hz = (1.5 + 3.5 * (1.0 - r)).clamp(1.5, 5.0);
+    AudioBeaconCue {
+        pan,
+        pitch_hz,
+        pulse_hz,
+        direction: direction_label(polar.theta_deg),
+    }
+}
+
+/// Phase 7 Part 2 (`AC-04`): OS 돋보기(Magnifier) 확대 뷰포트 영역.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MagnifierViewport {
+    pub rect: BBox,
+    pub zoom: f32,
+}
+
+/// 돋보기 확대 뷰포트 내에서 대상(`target`)을 가리지 않는 가장 먼 모서리에 제나 오버레이를 도킹한다.
+pub fn dock_within_magnifier(viewport: &MagnifierViewport, overlay_size: (f32, f32), target: &BBox) -> BBox {
+    let (ow, oh) = (
+        overlay_size.0.min(viewport.rect.width().max(1.0)),
+        overlay_size.1.min(viewport.rect.height().max(1.0)),
+    );
+    let candidates = [
+        BBox::new(viewport.rect.x0, viewport.rect.y0, viewport.rect.x0 + ow, viewport.rect.y0 + oh),
+        BBox::new(viewport.rect.x1 - ow, viewport.rect.y0, viewport.rect.x1, viewport.rect.y0 + oh),
+        BBox::new(viewport.rect.x0, viewport.rect.y1 - oh, viewport.rect.x0 + ow, viewport.rect.y1),
+        BBox::new(viewport.rect.x1 - ow, viewport.rect.y1 - oh, viewport.rect.x1, viewport.rect.y1),
+    ];
+    let (tx, ty) = target.center();
+    candidates
+        .into_iter()
+        .max_by(|a, b| {
+            let occ_a = overlay_occludes(a, target);
+            let occ_b = overlay_occludes(b, target);
+            let dist = |box_: &BBox| {
+                let (cx, cy) = box_.center();
+                (cx - tx).hypot(cy - ty)
+            };
+            // 비가림 우선, 그다음 대상 중심으로부터의 거리 최대화
+            occ_b.cmp(&occ_a).then_with(|| dist(a).total_cmp(&dist(b)))
+        })
+        .unwrap_or(candidates[3])
 }
 
 #[cfg(test)]
@@ -336,5 +410,32 @@ mod tests {
         assert_eq!(spoken_slot_mask("#4번"), 1 << 4);
         assert_eq!(spoken_slot_mask("2번째 문, 12번 방, 0번, 이번엔"), 0);
         assert_eq!(spoken_slot_mask("３번"), 0, "fullwidth digits are not badge numbers");
+    }
+
+    #[test]
+    fn ac04_screen_reader_lock_sonify_polar_and_magnifier_docking() {
+        let mut lock = SpokenSlotLock::new();
+        lock.set_screen_reader_mode(true);
+        lock.push_spoken("2번 결제 진행");
+        lock.end_line(1_000);
+        // Under screen reader mode, #2 stays locked at 19.9s (would have expired at 8s normally).
+        assert!(lock.is_locked(2, 1_000 + SPOKEN_LOCK_HOLD_SR_MS - 1));
+        assert!(!lock.is_locked(2, 1_000 + SPOKEN_LOCK_HOLD_SR_MS));
+
+        let right_up = Polar { r: 0.8, theta_deg: 45.0 };
+        let beacon = sonify_polar(&right_up);
+        assert!(beacon.pan > 0.4, "right-side target pans right: {}", beacon.pan);
+        assert!(beacon.pitch_hz > 550.0, "upper target raises pitch: {}", beacon.pitch_hz);
+
+        let vp = MagnifierViewport {
+            rect: BBox::new(100.0, 100.0, 740.0, 460.0),
+            zoom: 3.0,
+        };
+        let target_bottom_right = BBox::new(620.0, 380.0, 710.0, 440.0);
+        let docked = dock_within_magnifier(&vp, (180.0, 160.0), &target_bottom_right);
+        assert!(!overlay_occludes(&docked, &target_bottom_right));
+        assert!(docked.x0 >= vp.rect.x0 && docked.x1 <= vp.rect.x1);
+        assert!(docked.y0 >= vp.rect.y0 && docked.y1 <= vp.rect.y1);
+        assert_eq!((docked.x0, docked.y0), (100.0, 100.0), "docks in farthest corner from target");
     }
 }

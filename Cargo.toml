@@ -36,23 +36,23 @@ candle-nn = "0.11.0"
 # backoff), manifest (pinned-download checks). None depends on LanceDB, Tauri, tokio or a model runtime, so they link into
 # this workspace (LanceDB 0.41) as they do into premium-discount-app (0.31).
 # Pinned by revision; to build against a checkout next to this one, uncomment the [patch] section at the end.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-verdict = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-nav = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-schema = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-filter = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-mcp-protocol = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-mcp = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-sensor = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910", default-features = false }
-premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
+premium-discount-identity = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-verdict = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-nav = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-schema = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-filter = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-mcp-protocol = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-mcp = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-sds = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-manifest = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-sensor = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-nlp = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c", default-features = false }
+premium-discount-nms = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
 # Window math is used without its Win32 lookup (feature `win32`); turn it on where an app needs it
-premium-discount-window = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910", default-features = false }
-premium-discount-relay = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
-premium-discount-vision = { git = "https://github.com/Qntology/premium-discount", rev = "d68508da8271c3387d7e8665b96a2c0c33426910" }
+premium-discount-window = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c", default-features = false }
+premium-discount-relay = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-quant = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
+premium-discount-vision = { git = "https://github.com/sungu-che/premium-discount", rev = "f8c68f88bce1ff240bff2c1b791b441c940edc6c" }
 
 [profile.release]
 opt-level = 3

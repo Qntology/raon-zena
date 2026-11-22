@@ -29,6 +29,9 @@ use premium_discount_identity::{hash_id, is_bip39_word, is_valid_phrase};
 use premium_discount_mcp::client::{
     try_lock_for, PdSyncClient, RejectionNotice, SyncLoop, SyncSnapshot, SYNC_INTERVAL,
 };
+use premium_discount_nav::{
+    Collection as NavCollection, Role as NavRole, Run as NavRun, UniversalChoiceBook,
+};
 use premium_discount_relay::{
     curate_cross_scope, supersede_sync, Entry as RelayEntry, QuarantineEntry, QuarantineLedger,
     QuarantineSyncState, Record as RelayRecord, RelayConfig, Sentence as RelaySentence, Standing,
@@ -50,11 +53,12 @@ use zena_sds::ScopeStat;
 use zena_verdict::feedback::RETRACT_WINDOW_MS;
 use zena_verdict::{
     apply_feedback_to_ledger, attribute_and_update_duels, duel_for_item, extract_pragmatic_feedback,
-    local_params, record_demotion, toggle_pin, AttributionCandidate, Baselines, Case,
+    local_params, outperforms, record_demotion, toggle_pin, AttributionCandidate, Baselines, Case,
     CreditTargetKind, CrossTrialMemory, ExtractedFeedback, FeedbackContext, FeedbackToken,
     GlobalVerdict, LocalVerdictEntry, Obs, Tier, UserPin, VerdictPairView,
 };
 
+use crate::browser_uia::{build_live_web_rows, WebAnalyticTierRow};
 use crate::pipeline::AvatarCmd;
 
 /// Soft latency budget for interactive RAG before answering from `LocalMirrorIndex` (CR-05).
@@ -287,6 +291,8 @@ pub struct MirroredLocalNote {
     pub state: String,
     pub created_at_ms: i64,
     pub embedding: Vec<f32>,
+    /// Phase 6 Part 1 (`CN2-71`): 크로스-앱 릴레이 연합으로 선택적 브리지된 대상 `cc` 목록.
+    pub bridged_targets: Vec<String>,
 }
 
 /// In-memory mirror of my own outbox rows, kept in sync with `SyncSnapshot` for 0–600 ms fast RAG.
@@ -316,6 +322,29 @@ impl LocalMirrorIndex {
 
     pub fn embed(&self, text: &str) -> Vec<f32> {
         self.embedder.embed(text)
+    }
+
+    pub fn shared_embedder(&self) -> SharedEmbedder {
+        self.embedder.clone()
+    }
+
+    /// Phase 6 Part 1 (`CN2-71`): 공통 캐노니컬 RelayKey 가 검증된 경우에만 외부 `cc` 노트를 `target_cc` 검색에 브리지한다.
+    pub fn bridge_note_to_cc(&mut self, request_id: &str, target_cc: &str) -> bool {
+        let dst = normalize_cc(target_cc);
+        if dst.is_empty() {
+            return false;
+        }
+        for notes in self.by_cc.values_mut() {
+            if let Some(n) = notes.iter_mut().find(|n| {
+                n.request_id == request_id || n.server_id.as_deref() == Some(request_id)
+            }) {
+                if n.cc != dst && !n.bridged_targets.contains(&dst) {
+                    n.bridged_targets.push(dst);
+                }
+                return true;
+            }
+        }
+        false
     }
 
     pub fn similarity(&self, a: &str, b: &str) -> f32 {
@@ -449,6 +478,7 @@ impl LocalMirrorIndex {
                 state: state.to_string(),
                 created_at_ms,
                 embedding,
+                bridged_targets: Vec::new(),
             });
             while list.len() > self.cap_per_cc {
                 if let Some((idx, _)) = list.iter().enumerate().min_by_key(|(_, n)| n.created_at_ms) {
@@ -469,18 +499,22 @@ impl LocalMirrorIndex {
     }
 
     /// Fast in-memory search (Track Fast): applies scope boost (+0.12 L1, +0.06 L2) and cosine floor,
-    /// guarantees 0 `rejected` / `failed` notes, and marks `missing` as local-only.
+    /// guarantees 0 `rejected` / `failed` notes, marks `missing` as local-only, and surfaces notes
+    /// explicitly bridged into `plan.scopes.cc` via cross-app RelayKey federation (`CN2-71`).
     pub fn search_fast(
         &self,
         plan: &ContextualQueryPlan,
         query_vec: &[f32],
         local_grade: &dyn Fn(&str) -> Grade,
     ) -> Vec<VerdictCandidate> {
-        let Some(notes) = self.by_cc.get(&plan.scopes.cc) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        for note in notes {
+        let target_cc = &plan.scopes.cc;
+        let matching_notes = self
+            .by_cc
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|n| &n.cc == target_cc || n.bridged_targets.iter().any(|b| b == target_cc));
+        for note in matching_notes {
             if matches!(note.state.as_str(), "rejected" | "failed") {
                 continue;
             }
@@ -488,7 +522,12 @@ impl LocalMirrorIndex {
             if cos < COSINE_FLOOR {
                 continue;
             }
-            let Some((_, boosted)) = plan.scopes.boosted(&note.cc, note.to.as_deref(), cos) else {
+            let effective_cc = if &note.cc == target_cc {
+                note.cc.as_str()
+            } else {
+                target_cc.as_str()
+            };
+            let Some((_, boosted)) = plan.scopes.boosted(effective_cc, note.to.as_deref(), cos) else {
                 continue;
             };
             let id = note
@@ -533,10 +572,10 @@ struct CachedRagEntry {
     slots: Vec<PackedVerdictSlot>,
 }
 
-/// 120 s scene-level RAG cache, strictly isolated by `privacy_epoch` (CR-05 / CR-06).
+/// Phase 6 Part 3: 정밀 키 `(cc, screen_key, checkpoint_to, prereq_digest, rewritten_query)` 기반 120s RAG 캐시 + 선행 프리페치.
 #[derive(Debug, Default)]
 pub struct SceneRagCache {
-    entries: HashMap<(String, String), CachedRagEntry>,
+    entries: HashMap<(String, String, String, String, String), CachedRagEntry>,
     pub ttl_ms: u64,
 }
 
@@ -548,8 +587,20 @@ impl SceneRagCache {
         }
     }
 
-    fn key(cc: &str, rewritten_query: &str) -> (String, String) {
-        (normalize_cc(cc), rewritten_query.trim().to_lowercase())
+    fn key_scoped(
+        cc: &str,
+        screen_key: &str,
+        checkpoint_to: &str,
+        prereq_digest: &str,
+        rewritten_query: &str,
+    ) -> (String, String, String, String, String) {
+        (
+            normalize_cc(cc),
+            screen_key.trim().to_lowercase(),
+            checkpoint_to.trim().to_lowercase(),
+            prereq_digest.trim().to_lowercase(),
+            rewritten_query.trim().to_lowercase(),
+        )
     }
 
     /// Inserts slots ONLY if `captured_privacy_epoch == current_privacy_epoch`.
@@ -562,11 +613,37 @@ impl SceneRagCache {
         slots: Vec<PackedVerdictSlot>,
         now_ms: u64,
     ) -> bool {
+        self.insert_scoped(
+            cc,
+            "",
+            "",
+            "",
+            rewritten_query,
+            captured_privacy_epoch,
+            current_privacy_epoch,
+            slots,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_scoped(
+        &mut self,
+        cc: &str,
+        screen_key: &str,
+        checkpoint_to: &str,
+        prereq_digest: &str,
+        rewritten_query: &str,
+        captured_privacy_epoch: u64,
+        current_privacy_epoch: u64,
+        slots: Vec<PackedVerdictSlot>,
+        now_ms: u64,
+    ) -> bool {
         if captured_privacy_epoch != current_privacy_epoch {
             return false;
         }
         self.entries.insert(
-            Self::key(cc, rewritten_query),
+            Self::key_scoped(cc, screen_key, checkpoint_to, prereq_digest, rewritten_query),
             CachedRagEntry {
                 privacy_epoch: captured_privacy_epoch,
                 stored_at_ms: now_ms,
@@ -584,14 +661,42 @@ impl SceneRagCache {
         current_privacy_epoch: u64,
         now_ms: u64,
     ) -> Option<Vec<PackedVerdictSlot>> {
+        self.get_scoped(cc, "", "", "", rewritten_query, current_privacy_epoch, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_scoped(
+        &mut self,
+        cc: &str,
+        screen_key: &str,
+        checkpoint_to: &str,
+        prereq_digest: &str,
+        rewritten_query: &str,
+        current_privacy_epoch: u64,
+        now_ms: u64,
+    ) -> Option<Vec<PackedVerdictSlot>> {
         let ttl = self.ttl_ms;
         self.entries.retain(|_, v| {
             v.privacy_epoch == current_privacy_epoch
                 && now_ms.saturating_sub(v.stored_at_ms) <= ttl
         });
         self.entries
-            .get(&Self::key(cc, rewritten_query))
+            .get(&Self::key_scoped(cc, screen_key, checkpoint_to, prereq_digest, rewritten_query))
             .map(|e| e.slots.clone())
+    }
+
+    /// Phase 6 Part 3: 다음 체크포인트 진입 직전 선행 프리페치 슬롯을 적재한다.
+    #[allow(dead_code)]
+    pub fn prefetch_lookahead(
+        &mut self,
+        cc: &str,
+        next_checkpoint_to: &str,
+        query: &str,
+        privacy_epoch: u64,
+        slots: Vec<PackedVerdictSlot>,
+        now_ms: u64,
+    ) -> bool {
+        self.insert_scoped(cc, "", next_checkpoint_to, "", query, privacy_epoch, privacy_epoch, slots, now_ms)
     }
 
     pub fn purge_all(&mut self) {
@@ -606,6 +711,102 @@ impl SceneRagCache {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Phase 6 Part 1 (`CN2-72`): 크로스-앱 메타 궤적 간선(예: 공략 위키 → 인게임 전환) 원장.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrajectoryEdge {
+    pub from_cc: String,
+    pub to_cc: String,
+    pub shared_relay_keys: Vec<String>,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TrajectoryLedger {
+    edges: VecDeque<TrajectoryEdge>,
+}
+
+impl TrajectoryLedger {
+    pub const WINDOW_MS: i64 = 300_000;
+
+    pub fn record_edge(&mut self, from_cc: &str, to_cc: &str, shared_relay_keys: Vec<String>, now_ms: i64) {
+        if shared_relay_keys.is_empty() {
+            return;
+        }
+        let f = normalize_cc(from_cc);
+        let t = normalize_cc(to_cc);
+        if f.is_empty() || t.is_empty() || f == t {
+            return;
+        }
+        self.edges.push_back(TrajectoryEdge {
+            from_cc: f,
+            to_cc: t,
+            shared_relay_keys,
+            observed_at_ms: now_ms,
+        });
+        while self.edges.len() > 32 {
+            self.edges.pop_front();
+        }
+    }
+
+    /// 현재 `active_cc` 와 5분 이내에 공통 RelayKey 로 연결된 모든 앱 `cc` 목록(`active_cc` 포함).
+    pub fn linked_ccs(&mut self, active_cc: &str, now_ms: i64) -> Vec<String> {
+        let cur = normalize_cc(active_cc);
+        self.edges.retain(|e| now_ms.saturating_sub(e.observed_at_ms) <= Self::WINDOW_MS);
+        let mut out = vec![cur.clone()];
+        for e in &self.edges {
+            if e.to_cc == cur && !out.contains(&e.from_cc) {
+                out.push(e.from_cc.clone());
+            } else if e.from_cc == cur && !out.contains(&e.to_cc) {
+                out.push(e.to_cc.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Phase 5 Part 2 (`CN2-64`): 온디바이스 64-슬롯 구역별 보관함(`ZoneVault`, Pinned-SLRU + `batch_id` 멱등 동기화).
+pub const ZONE_VAULT_MAX_SLOTS: usize = 64;
+
+#[derive(Debug, Default, Clone)]
+pub struct ZoneVault {
+    pub collection: NavCollection,
+    pending_batch: Option<String>,
+    batch_seq: u64,
+}
+
+impl ZoneVault {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 64-슬롯 Pinned-SLRU 상한으로 완주 기록을 보관한다.
+    pub fn record_run(&mut self, run: &NavRun) {
+        self.collection.add_with_cap(run, ZONE_VAULT_MAX_SLOTS);
+    }
+
+    /// 특정 코스를 수동 고정(또는 해제)해 슬롯 축출에서 보호한다.
+    pub fn pin_course(&mut self, app: &str, course: &str, pinned: bool) -> bool {
+        self.collection.pin_course(app, course, pinned)
+    }
+
+    /// 서버 `POST /nav/trials` 배치 재전송 시 동일한 `batch_id` 를 유지해 멱등성을 보장한다.
+    pub fn next_or_pending_batch_id(&mut self, now_ms: i64) -> String {
+        if let Some(existing) = &self.pending_batch {
+            return existing.clone();
+        }
+        self.batch_seq += 1;
+        let bid = format!("batch_{now_ms}_{:08x}", self.batch_seq);
+        self.pending_batch = Some(bid.clone());
+        bid
+    }
+
+    pub fn ack_batch(&mut self, batch_id: &str) {
+        if self.pending_batch.as_deref() == Some(batch_id) {
+            self.pending_batch = None;
+        }
     }
 }
 
@@ -1202,6 +1403,8 @@ pub struct LocalRecordState {
     pub wins: u32,
     pub losses: u32,
     pub global: Option<(Tier, Option<i32>, Option<(u32, u32)>, String)>,
+    /// Phase 4 Part 2 & Phase 5 Part 1: `"eval"` (공략 노트, 90일 반감기) 또는 `"nav"` (체크포인트·지름길, 14일 반감기).
+    pub track: String,
 }
 
 /// Local PD-Verdict (`pd-verdict/2`) store, cross-trial duels, and reversible `▲`/`▼` manual pins.
@@ -1237,7 +1440,54 @@ impl LocalVerdictStore {
                 wins: 0,
                 losses: 0,
                 global: None,
+                track: "eval".to_string(),
             })
+    }
+
+    /// Phase 4 Part 2 (`CN2-51`): 개인 지름길 승리(`ShortcutWinV2`)를 로컬 `nav` 트랙 + 대결 원장에 기록한다.
+    /// 동일 갈림길에서 3연승(`outperforms` 활성) 달성 시 즉시 로컬 추천(`Premium`)으로 승격해
+    /// Stage 2 서랍과 가역적 `[▲]/[▼]` 핀 조작에 노출한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_shortcut_win(
+        &mut self,
+        cc: &str,
+        fork_group: &str,
+        taken_cp: &str,
+        skipped_cp: &str,
+        label: &str,
+        saved_ms: u32,
+        now_ms: i64,
+        quarantine: &QuarantineLedger,
+    ) -> (bool, VerdictPairView) {
+        let params = local_params();
+        let rec = self.ensure_record(taken_cp, cc, Some(fork_group), label, "local");
+        rec.track = "nav".to_string();
+        rec.wins += 1;
+        rec.obs.push(Obs {
+            kind: "outcome".to_string(),
+            sign: 1,
+            weight: 1.0,
+            credit: 1.0,
+            at_ms: now_ms,
+        });
+        // `ScopeStat.confusion` 에 (taken_cp vs skipped_cp) 갈림길 대결 승리를 직접 누적한다.
+        let (key, taken_is_a) = if taken_cp <= skipped_cp {
+            (format!("{taken_cp}|{skipped_cp}"), true)
+        } else {
+            (format!("{skipped_cp}|{taken_cp}"), false)
+        };
+        let conf = self.scope_stat.confusion.entry(key).or_default();
+        conf.ties += 1;
+        if taken_is_a {
+            conf.a_wins += 1;
+        } else {
+            conf.b_wins += 1;
+        }
+        conf.margin.push(f64::from(saved_ms), 32);
+        self.scope_stat.updated_ms = self.scope_stat.updated_ms.max(now_ms);
+        let promoted = outperforms(&self.scope_stat, taken_cp, skipped_cp, &params);
+        let view = self.pair_view(taken_cp, now_ms, quarantine);
+        (promoted, view)
     }
 
     pub fn ingest_sync_snapshot(&mut self, snapshot: &SyncSnapshot) {
@@ -1340,7 +1590,10 @@ impl LocalVerdictStore {
         let mut outbound = Vec::new();
         let decisive = report.shares.len() == 1;
         for share in &report.shares {
-            if share.target_kind != CreditTargetKind::RagRecord {
+            if !matches!(
+                share.target_kind,
+                CreditTargetKind::RagRecord | CreditTargetKind::CourseCheckpoint
+            ) {
                 continue;
             }
             if let Some(rec) = self.records.get_mut(&share.target_id) {
@@ -1350,16 +1603,19 @@ impl LocalVerdictStore {
                 } else if sign < 0 {
                     rec.losses += 1;
                 }
-                let eff_w = share.obs.weight * share.credit;
-                if let Some(vote) = vote_gate.consider(
-                    rec.server_id.as_deref(),
-                    rec.server_id.is_some(),
-                    decisive,
-                    share.credit,
-                    eff_w,
-                    sign,
-                ) {
-                    outbound.push(vote);
+                // 서버 vote_outcome 은 원격 평가 서버 ID 가 있는 RagRecord 에만 전송(로컬 코스/체크포인트 격리)
+                if share.target_kind == CreditTargetKind::RagRecord {
+                    let eff_w = share.obs.weight * share.credit;
+                    if let Some(vote) = vote_gate.consider(
+                        rec.server_id.as_deref(),
+                        rec.server_id.is_some(),
+                        decisive,
+                        share.credit,
+                        eff_w,
+                        sign,
+                    ) {
+                        outbound.push(vote);
+                    }
                 }
             }
         }
@@ -1388,9 +1644,14 @@ impl LocalVerdictStore {
         let pin_superseded_after = rec.pin == Some(UserPin::Promoted)
             && active_sup.is_some_and(|e| e.new_at_ms > rec.pin_set_at_ms);
         let duel = duel_for_item(&self.scope_stat, record_id);
+        let track = if rec.track.is_empty() {
+            "eval".to_string()
+        } else {
+            rec.track.clone()
+        };
         let case = Case {
             now_ms,
-            track: "eval".into(),
+            track,
             prev: rec.entry.prev,
             obs: rec.obs.clone(),
             baseline: Baselines::default(),
@@ -1553,6 +1814,16 @@ pub struct PdBridge {
     pub prewarm: PrewarmGuard,
     pub vote_gate: OutcomeVoteGate,
     pub quarantine_path: PathBuf,
+    /// Phase 4 Part 3: 웹·인게임·네이티브 통합 선택지 편향 제거 장부.
+    #[allow(dead_code)]
+    pub choice_book: UniversalChoiceBook,
+    /// Phase 5 Part 2: 64-슬롯 구역별 Pinned-SLRU 로컬 코스 보관함.
+    #[allow(dead_code)]
+    pub zone_vault: ZoneVault,
+    /// Phase 6 Part 1: 크로스-앱 메타 코스 궤적 원장.
+    pub trajectory: TrajectoryLedger,
+    /// Phase 4 Part 3 & Phase 6 Part 3: 동기화된 공개 타임트라이얼 체크포인트 / 선행 승격 갈림길 행.
+    pub public_trial_rows: BTreeMap<String, Vec<WebAnalyticTierRow>>,
     last_snapshot: SyncSnapshot,
     local_seq: u64,
 }
@@ -1616,9 +1887,50 @@ impl PdBridge {
             prewarm: PrewarmGuard::default(),
             vote_gate: OutcomeVoteGate::new(consent_share_outcomes),
             quarantine_path,
+            choice_book: UniversalChoiceBook::default(),
+            zone_vault: ZoneVault::new(),
+            trajectory: TrajectoryLedger::default(),
+            public_trial_rows: BTreeMap::new(),
             last_snapshot: SyncSnapshot::default(),
             local_seq: 0,
         }
+    }
+
+    /// Phase 4 Part 3 (`CN2-55`) & Phase 6 Part 3 (`CN2-78`):
+    /// 로컬 `LocalVerdictStore` + `UniversalChoiceBook` + 동기화된 `public_trial_rows` 를 3-소스 병합해
+    /// `build_web_nav_overlay` 에 즉시 투입할 `WebAnalyticTierRow` 목록을 반환한다.
+    pub fn live_web_rows_for_cc(&mut self, cc: &str, now_ms: i64) -> Vec<WebAnalyticTierRow> {
+        let norm_cc = normalize_cc(cc);
+        let q = self.rag.quarantine.lock().unwrap().clone();
+        let rec_ids: Vec<String> = self
+            .verdicts
+            .records
+            .values()
+            .filter(|r| r.cc == norm_cc && !r.label.trim().is_empty())
+            .map(|r| r.record_id.clone())
+            .collect();
+        let mut local_rows = Vec::new();
+        for (idx, id) in rec_ids.iter().enumerate() {
+            let pair = self.verdicts.pair_view(id, now_ms, &q);
+            if pair.local_tier == Tier::Unrated {
+                continue;
+            }
+            if let Some(rec) = self.verdicts.records.get(id) {
+                local_rows.push(WebAnalyticTierRow {
+                    label: rec.label.clone(),
+                    role: NavRole::Button,
+                    ordinal_norm: (idx as f32 / rec_ids.len().max(1) as f32).clamp(0.0, 1.0),
+                    tier: pair.local_tier,
+                    is_friction_trap: pair.local_tier == Tier::Discount,
+                });
+            }
+        }
+        let pub_rows = self
+            .public_trial_rows
+            .get(&norm_cc)
+            .cloned()
+            .unwrap_or_default();
+        build_live_web_rows(&local_rows, &pub_rows, &[])
     }
 
     /// 0 ms PII + profanity filter before waking child app, optimistic mirror insert, and enqueue.
@@ -1685,9 +1997,9 @@ impl PdBridge {
     /// Runs cross-scope supersession curation across mirrored notes of `cc`, recording any
     /// supersessions into `QuarantineLedger` and reporting eligible same-scope pairs to `pd_supersede`.
     pub fn curate_cc(&mut self, cc: &str, now_ms: i64) -> usize {
-        let notes = {
+        let (notes, embedder) = {
             let m = self.rag.mirror.lock().unwrap();
-            m.notes_in_cc(cc).to_vec()
+            (m.notes_in_cc(cc).to_vec(), m.shared_embedder())
         };
         if notes.len() < 2 {
             return 0;
@@ -1709,11 +2021,7 @@ impl PdBridge {
                 record: r,
             })
             .collect();
-        let report = curate_cross_scope(
-            &entries,
-            &HashedNgramEmbedder::default(),
-            &RelayConfig::default(),
-        );
+        let report = curate_cross_scope(&entries, &embedder, &RelayConfig::default());
         let mut added = 0usize;
         if let Ok(mut q) = self.rag.quarantine.lock() {
             for s in &report.supersessions {
@@ -2293,5 +2601,152 @@ mod tests {
         let unpinned = bridge.verdicts.toggle_pin(&req_id, UserPin::Demoted, 3_000, &q).unwrap();
         assert_eq!(unpinned.local_tier, Tier::Unrated);
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn cn251_local_shortcut_3wins_promotes_in_verdict_store_and_drawer_pin_is_reversible() {
+        let mut store = LocalVerdictStore::default();
+        let q = QuarantineLedger::new();
+        let mut promoted = false;
+        let mut last_view = None;
+        for i in 0..3 {
+            let (p, v) = store.ingest_shortcut_win(
+                "eldenring.exe",
+                "fork:boss-gate",
+                "0xcp-ladder",
+                "0xcp-front-gate",
+                "우측 사다리 지름길",
+                4_000,
+                10_000 + i * 60_000,
+                &q,
+            );
+            promoted = p;
+            last_view = Some(v);
+        }
+        assert!(promoted, "3 consecutive shortcut wins activate local outperforms");
+        let view = last_view.unwrap();
+        assert_eq!(view.local_tier, Tier::Premium);
+        // Stage 2 drawer exposes the local shortcut and supports reversible ▼ demotion pin.
+        let drawer = store.drawer_items(Some("eldenring.exe"), 200_000, &q);
+        assert!(drawer.iter().any(|d| d.record_id == "0xcp-ladder"));
+        let demoted = store.toggle_pin("0xcp-ladder", UserPin::Demoted, 201_000, &q).unwrap();
+        assert_eq!(demoted.local_tier, Tier::Discount);
+        let restored = store.toggle_pin("0xcp-ladder", UserPin::Demoted, 202_000, &q).unwrap();
+        assert_eq!(restored.local_tier, Tier::Premium);
+    }
+
+    #[test]
+    fn cn264_zone_vault_64slots_pinned_slru_and_batch_id_idempotency() {
+        use premium_discount_nav::{Checkpoint, StepKind};
+        let mut vault = ZoneVault::new();
+        let app = "0x39206c971297059b89e4e6fc35844ee87feb0407";
+        let make_run = |idx: u32, day: u32| -> NavRun {
+            let s0 = format!("0x{:040x}", 1u64);
+            let s1 = format!("0x{:040x}", 100u64 + u64::from(idx));
+            let base_ms = i64::from(day) * 86_400_000;
+            NavRun::from_checkpoints(
+                app,
+                &[
+                    Checkpoint::new(base_ms, StepKind::Screen, &s0, None),
+                    Checkpoint::new(base_ms + 2_000, StepKind::Region, &s1, None),
+                ],
+                None,
+            )
+            .unwrap()
+        };
+        let pinned_run = make_run(0, 20_774);
+        vault.record_run(&pinned_run);
+        assert!(vault.pin_course(app, &pinned_run.course, true));
+        // Insert 70 distinct courses (exceeding 64-slot ZoneVault cap): pinned course survives!
+        for i in 1..=70 {
+            vault.record_run(&make_run(i, 20_774 + (i / 10)));
+        }
+        let kept = vault.collection.courses(app);
+        assert_eq!(kept.len(), ZONE_VAULT_MAX_SLOTS);
+        assert!(kept.iter().any(|c| c.course == pinned_run.course), "pinned course protected");
+
+        // batch_id remains identical across retries until acknowledged.
+        let b1 = vault.next_or_pending_batch_id(1_000);
+        let b2 = vault.next_or_pending_batch_id(2_000);
+        assert_eq!(b1, b2);
+        vault.ack_batch(&b1);
+        let b3 = vault.next_or_pending_batch_id(3_000);
+        assert_ne!(b1, b3);
+    }
+
+    #[test]
+    fn cn271_cross_cc_mirror_bridge_surfaces_wiki_note_in_game_and_stays_isolated_elsewhere() {
+        let mut mirror = LocalMirrorIndex::hashed();
+        mirror.enqueue_optimistic(
+            "wiki-note-1",
+            "fextralife.com",
+            None,
+            "말레니아 2페이즈 물새난격 빙결 항아리 캔슬",
+            1_000,
+        );
+        // Bridge wiki note into eldenring.exe only (verified via shared RelayKey)
+        assert!(mirror.bridge_note_to_cc("wiki-note-1", "eldenring.exe"));
+
+        let game_plan = plan("eldenring.exe", "말레니아 물새난격 빙결 항아리", None);
+        let qv = mirror.embed(&game_plan.rewritten_query);
+        let hits_game = mirror.search_fast(&game_plan, &qv, &|_| Grade::Unrated);
+        assert!(hits_game.iter().any(|c| c.record_id == "wiki-note-1"));
+
+        // Unrelated app (notepad.exe) sees 0 leaked notes!
+        let other_plan = plan("notepad.exe", "말레니아 물새난격 빙결 항아리", None);
+        let hits_other = mirror.search_fast(&other_plan, &qv, &|_| Grade::Unrated);
+        assert!(hits_other.is_empty());
+    }
+
+    #[test]
+    fn cn272_cross_cc_meta_trajectory_attributes_victory_credit_to_bridged_wiki_note() {
+        let mut traj = TrajectoryLedger::default();
+        traj.record_edge(
+            "fextralife.com",
+            "eldenring.exe",
+            vec!["0xrelay-malenia-0001".to_string()],
+            10_000,
+        );
+        let linked = traj.linked_ccs("eldenring.exe", 60_000);
+        assert!(linked.contains(&"eldenring.exe".to_string()));
+        assert!(linked.contains(&"fextralife.com".to_string()));
+
+        // Exposure ledger returns wiki note when querying active_in_meta_trajectory in-game,
+        // and LocalVerdictStore credits the wiki note on in-game victory!
+        let mut ledger = zena_core::exposure::ExposureLedger::new();
+        ledger.insert(zena_core::exposure::ExposedRecord {
+            record_id: "wiki-note-1".into(),
+            cc: "fextralife.com".into(),
+            to: None,
+            canonical_topic: "빙결 항아리".into(),
+            role: zena_core::exposure::ExposureRole::RecommendedSolution,
+            w_spoken: 1.0,
+            exposed_at_ms: 20_000,
+            target_kind: zena_core::exposure::ExposureTargetKind::RagRecord,
+            exclusive_slot_group: Some("tactics".into()),
+        });
+        let cc_refs: Vec<&str> = linked.iter().map(String::as_str).collect();
+        let active = ledger.active_in_meta_trajectory(&cc_refs, 60_000);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].record_id, "wiki-note-1");
+
+        let mut verdicts = LocalVerdictStore::default();
+        verdicts.ensure_record("wiki-note-1", "fextralife.com", None, "빙결 항아리", "stored");
+        let mut gate = OutcomeVoteGate::new(false);
+        let cands = vec![AttributionCandidate {
+            id: "wiki-note-1".into(),
+            kind: CreditTargetKind::RagRecord,
+            exclusive_slot_group: Some("tactics".into()),
+            is_warned_trap: false,
+            exposure_weight: 1.0,
+            age_ms: 40_000,
+            semantic_sim: 0.9,
+            matches_explicit_mention: false,
+            friction_z: None,
+            ambient_prior: 0.20,
+            prior_same_sign_outcomes: 0,
+        }];
+        verdicts.apply_outcome_credit(&cands, 1, 60_000, false, &mut gate);
+        assert_eq!(verdicts.records["wiki-note-1"].wins, 1);
     }
 }

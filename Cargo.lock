@@ -5592,7 +5592,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "lazy_static",
  "ndarray 0.15.6",
@@ -5604,7 +5604,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime-sys"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "flate2",
  "libloading 0.8.9",
@@ -5919,14 +5919,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-cpu-kernels"
+version = "0.1.0"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "premium-discount-filter"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 
 [[package]]
 name = "premium-discount-identity"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -5940,7 +5948,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-manifest"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -5948,7 +5956,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-mcp"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "premium-discount-filter",
@@ -5964,7 +5972,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-mcp-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -5973,7 +5981,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nav"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "premium-discount-identity",
  "premium-discount-sds",
@@ -5984,7 +5992,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nlp"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6003,10 +6011,11 @@ dependencies = [
 [[package]]
 name = "premium-discount-nms"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "candle-core",
+ "premium-discount-cpu-kernels",
  "premium-discount-nlp",
  "premium-discount-sds",
  "premium-discount-sensor",
@@ -6016,11 +6025,12 @@ dependencies = [
 [[package]]
 name = "premium-discount-quant"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "half",
  "memmap2",
+ "premium-discount-cpu-kernels",
  "rayon",
  "serde",
  "serde_json",
@@ -6029,7 +6039,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-relay"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "premium-discount-nms",
  "premium-discount-sds",
@@ -6038,7 +6048,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-schema"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "premium-discount-identity",
@@ -6050,7 +6060,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "serde",
@@ -6060,7 +6070,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-sensor"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "serde",
  "zeroize",
@@ -6069,7 +6079,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-verdict"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "serde",
 ]
@@ -6077,11 +6087,12 @@ dependencies = [
 [[package]]
 name = "premium-discount-vision"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "premium-discount-cpu-kernels",
  "premium-discount-quant",
  "premium-discount-sensor",
  "serde",
@@ -6092,7 +6103,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-window"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=d68508da8271c3387d7e8665b96a2c0c33426910#d68508da8271c3387d7e8665b96a2c0c33426910"
+source = "git+https://github.com/sungu-che/premium-discount?rev=f8c68f88bce1ff240bff2c1b791b441c940edc6c#f8c68f88bce1ff240bff2c1b791b441c940edc6c"
 dependencies = [
  "windows-sys 0.61.2",
 ]

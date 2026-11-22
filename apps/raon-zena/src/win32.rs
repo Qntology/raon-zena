@@ -100,6 +100,47 @@ pub fn cursor_over(hwnd: HWND) -> bool {
     }
 }
 
+/// Phase 7 Part 2 (`AC-04`): OS 스크린리더(NVDA / JAWS / Narrator) 활성 여부 감지 (`SPI_GETSCREENREADER`).
+/// 순수 로컬 상태 조회이며 서버로 절대 전송되지 않는다(Zero-Health-Telemetry).
+#[allow(dead_code)]
+pub fn is_screen_reader_active() -> bool {
+    unsafe {
+        let mut active: i32 = 0;
+        SystemParametersInfoW(
+            SPI_GETSCREENREADER,
+            0,
+            Some(&mut active as *mut i32 as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && active != 0
+    }
+}
+
+/// Phase 7 Part 2 (`AC-04`): Windows 돋보기(Magnifier) 창 활성 여부 감지.
+#[allow(dead_code)]
+pub fn is_magnifier_active() -> bool {
+    unsafe {
+        let cls: Vec<u16> = "MagUIClass\0".encode_utf16().collect();
+        FindWindowW(windows::core::PCWSTR(cls.as_ptr()), windows::core::PCWSTR::null())
+            .map(|h| !h.0.is_null())
+            .unwrap_or(false)
+    }
+}
+
+/// Phase 7 Part 2 (`AC-04`): 스크린리더가 비파괴적으로 읽을 수 있도록 오버레이 창의 접근성 텍스트를 갱신한다.
+#[allow(dead_code)]
+pub fn announce_live_region(hwnd: HWND, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let wide: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide.as_ptr()));
+    }
+}
+
 /// Register `Ctrl+Shift+{Q,H,L,T}` plus `Ctrl+Shift+D` (Stage 2 drawer) on a dedicated thread.
 pub fn spawn_hotkeys(send: impl Fn(HotkeyEvent) + Send + 'static) {
     std::thread::spawn(move || unsafe {

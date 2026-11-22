@@ -653,6 +653,38 @@ impl VerdictPairView {
     }
 }
 
+/// Phase 5 Part 1: 신규 지름길이 패치 등으로 망가져 `Discount (grade <= -1)` 에 도달하고
+/// 충분한 증거(`REINSTATE_MIN_EVIDENCE = 3.0`)가 쌓이면 과거 `superseded` 표준 코스를 자가 복권한다.
+pub const REINSTATE_MIN_EVIDENCE: f64 = 3.0;
+
+pub fn should_reinstate_standard_course(current_verdict: &Verdict) -> bool {
+    current_verdict.tier == Tier::Discount
+        && current_verdict.grade.is_some_and(|g| g <= -1)
+        && current_verdict.evidence >= REINSTATE_MIN_EVIDENCE
+}
+
+/// Phase 4 Part 2 & Phase 5 Part 1: 코스·지름길 전용 로컬/글로벌 병렬 스탠스 브리핑 라인.
+/// 원본 해시·레시피 혼합 없이 `LocalOnly` · `WorksForMeOnly` · `FadedRecall` · `PinnedByUser` 를 발화 지침으로 변환한다.
+pub fn course_stance_brief_line(
+    view: &VerdictPairView,
+    label: &str,
+    saved_ms: Option<u32>,
+    locale: VerdictLocale,
+) -> String {
+    let base = view.prompt_line(label, locale);
+    match saved_ms.filter(|&ms| ms >= 1_000) {
+        Some(ms) => {
+            let secs = f64::from(ms) / 1000.0;
+            match locale {
+                VerdictLocale::Ko => format!("{base} (평균 {secs:.1}초 단축)"),
+                VerdictLocale::En => format!("{base} (saves {secs:.1}s on average)"),
+                VerdictLocale::Ja => format!("{base}（平均{secs:.1}秒短縮）"),
+            }
+        }
+        None => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1008,84 @@ mod tests {
             agree.prompt_line("ice", VerdictLocale::En),
             "ice: my record and the server both say recommended"
         );
+    }
+
+    #[test]
+    fn cn252_local_shortcut_stance_separates_works_for_me_only_and_reversible_pin() {
+        let p = Params::v2();
+        let local_prem = judged_as(Tier::Premium, Some(2));
+        // Local Premium vs Global Discount => WorksForMeOnly (no blend, leads with personal shortcut)
+        let wfm = VerdictPairView::resolve(
+            Some(&local_prem),
+            None,
+            None,
+            Some((3, 0)),
+            Some((Tier::Discount, Some(-1), Some((1, 4)), RECIPE_V2)),
+        );
+        assert_eq!(wfm.differ_kind, Some(DifferKind::WorksForMeOnly));
+        let line = course_stance_brief_line(&wfm, "우측 사다리 지름길", Some(4_200), VerdictLocale::Ko);
+        assert!(line.contains("나만의 비기") && line.contains("4.2초 단축"), "{line}");
+
+        // Reversible ▼ demotion pin withdraws cleanly on second click and stays local-only
+        let mut hist = Vec::new();
+        let pin1 = toggle_pin(&mut hist, None, UserPin::Demoted, 100, &p);
+        assert_eq!(pin1.pin, Some(UserPin::Demoted));
+        assert!(outbound_votes(&hist).is_empty(), "manual pin must never go to server");
+        let pin2 = toggle_pin(&mut hist, pin1.pin, UserPin::Demoted, 200, &p);
+        assert_eq!(pin2.pin, None);
+        assert_eq!(pin2.withdrawn, 1);
+    }
+
+    #[test]
+    fn cn260_faded_recall_recalls_past_route_and_superseded_reinstates_when_new_route_fails() {
+        let p = Params::v2();
+        let day_ms = 86_400_000i64;
+        let obs = vec![
+            Obs { kind: "outcome".into(), sign: 1, weight: 1.0, credit: 1.0, at_ms: 0 },
+            Obs { kind: "outcome".into(), sign: 1, weight: 1.0, credit: 1.0, at_ms: 1_000 },
+            Obs { kind: "outcome".into(), sign: 1, weight: 1.0, credit: 1.0, at_ms: 2_000 },
+        ];
+        let mut entry = LocalVerdictEntry::default();
+        // Day 0: nav track confirms Premium (E=3.0 >= 2.0)
+        let c0 = Case {
+            now_ms: 3_000,
+            track: "nav".into(),
+            prev: Prev { tier: Tier::Unrated, since_ms: 0 },
+            obs: obs.clone(),
+            baseline: Baselines {
+                primary: Some(crate::baseline_of(&[-0.4, -0.1, 0.0, 0.2, 0.3])),
+                ..Default::default()
+            },
+            duel: None,
+            superseded: false,
+        };
+        let (v0, f0) = entry.judge(&c0, &p).unwrap();
+        assert_eq!(v0.tier, Tier::Premium);
+        assert_eq!(f0, MemoryFreshness::Active);
+
+        // Day 18 (~1.3 half-lives on 14d nav track): E ~ 1.23 in [1.0, 2.0) -> Unrated + FadedRecall!
+        let c18 = Case {
+            now_ms: 18 * day_ms,
+            ..c0
+        };
+        let (v18, f18) = entry.judge(&c18, &p).unwrap();
+        assert_eq!(v18.tier, Tier::Unrated);
+        assert!(matches!(f18, MemoryFreshness::FadedRecall { past_tier: Tier::Premium, .. }));
+        let view = VerdictPairView::resolve(Some(&v18), entry.recall_input(&obs), None, Some((3, 0)), None);
+        let line = course_stance_brief_line(&view, "지하 통로", None, VerdictLocale::Ko);
+        assert!(line.contains("예전 내 기록으로는 추천"), "{line}");
+
+        // Self-reinstatement when newer shortcut breaks to Discount (grade <= -1, evidence >= 3.0)
+        let broken_new = Verdict {
+            evidence: 3.5,
+            value: -0.8,
+            level: None,
+            rank: None,
+            tier: Tier::Discount,
+            grade: Some(-2),
+            since_ms: 0,
+            reasons: vec!["value_low".into()],
+        };
+        assert!(should_reinstate_standard_course(&broken_new));
     }
 }

@@ -223,6 +223,29 @@
     }
   },
 
+  "nav": {
+    "shortcut_prompt": {
+      "semantic": "Archetype expression for suggesting a verified faster navigation shortcut (no text trigger phrases).",
+      "express": { "emotion": "JOY", "motion": "LEAN_FORWARD_POINT", "emote": "SPARKLE_IDEA", "lines": ["여기 더 빠른 검증 지름길이 있어!", "이쪽 번호로 가면 훨씬 빨라!"] }
+    },
+    "trap_warn": {
+      "semantic": "Archetype expression for warning against a confirmed friction or defeat trap.",
+      "express": { "emotion": "WORRIED", "motion": "FLINCH", "emote": "SWEAT_PANIC", "lines": ["잠깐! 여기는 다들 막히는 함정 구간이야.", "이쪽은 조심하고 우회로부터 확인하자!"] }
+    },
+    "milestone_cheer": {
+      "semantic": "Archetype expression for cheering checkpoint passage.",
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "emote": "CHIBI_CHEER", "lines": ["좋아, 구간 통과!", "아주 매끄럽게 넘겼어!"] }
+    },
+    "rejoin_relief": {
+      "semantic": "Archetype expression when rejoining the verified ghost route after a detour.",
+      "express": { "emotion": "JOY", "motion": "NOD", "emote": "SPARKLE_IDEA", "lines": ["본선 경로로 다시 잘 합류했어!", "좋아, 여기서부터 다시 이어가자."] }
+    },
+    "pace_record": {
+      "semantic": "Archetype expression when beating personal best or public pace record.",
+      "express": { "emotion": "EXCITED", "motion": "CHEER", "emote": "STAR_EYES", "lines": ["우와, 최고 기록 단축이야!", "엄청 빠른 페이스야, 대단해!"] }
+    }
+  },
+
   "feedback": {
     "recommend": {
       "semantic": "The user explicitly recommends a strategy, route or tip that Zena suggested.",

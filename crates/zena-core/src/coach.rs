@@ -18,11 +18,12 @@
 //!   takes the channel.
 
 use crate::brief::FrictionBrief;
-use crate::exposure::{ExposedRecord, ExposureRole};
+use crate::exposure::{ExposedRecord, ExposureRole, ExposureTargetKind};
 use crate::prompt::DialogueTurn;
 use crate::reaction::ReactionLevel;
 use crate::text::clip_chars;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Session tension from which the combat gate holds proactive coaching (`SessionTracker`, half-life 20 s).
 pub const COMBAT_TENSION: f32 = 0.65;
@@ -39,6 +40,10 @@ pub const INPUT_CANCEL_DELAY_MS: u64 = 800;
 pub const OFFER_TTL_MS: u64 = 45_000;
 /// Picking the offered number within this window counts as accepting the offer.
 pub const ACCEPT_WINDOW_MS: u64 = 15_000;
+/// Phase 7 Part 2 (`κ_sr = 2.5`): 스크린리더 활성 시 코칭 수락 창을 35초로 확장한다.
+pub const SCREEN_READER_ACCEPT_WINDOW_MS: u64 = 35_000;
+/// Phase 6 Part 2: Lv3 코칭을 0ms Lv2 반사 템플릿으로 증류하기 위한 연속 검증 수락 횟수.
+pub const REFLEX_DISTILL_MIN_ACCEPTS: u32 = 2;
 /// Coach-track observation weight of an accepted offer (`Obs { kind: "engage", sign: 1, weight: 0.2 }`).
 pub const COACH_ENGAGE_WEIGHT: f32 = 0.2;
 
@@ -472,6 +477,8 @@ impl AcceptedOffer {
             role: ExposureRole::RecommendedSolution,
             w_spoken: 1.0,
             exposed_at_ms: self.offer.offered_at_ms,
+            target_kind: ExposureTargetKind::RagRecord,
+            exclusive_slot_group: Some("tactics".to_string()),
         })
     }
 }
@@ -501,6 +508,15 @@ impl Default for CoachingFatigueController {
 impl CoachingFatigueController {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Phase 7 Part 2 (`AC-04`): 스크린리더 활성 시 수락 창(15s → 35s)을 동적으로 조정한다.
+    pub fn set_screen_reader_mode(&mut self, active: bool) {
+        self.accept_window_ms = if active {
+            SCREEN_READER_ACCEPT_WINDOW_MS
+        } else {
+            ACCEPT_WINDOW_MS
+        };
     }
 
     pub fn state(&self) -> FatigueState {
@@ -673,6 +689,105 @@ pub fn route_proactive(
         line,
         point_at: evidence.point_at,
     })
+}
+
+/// Phase 6 Part 2: 반복 검증된 Lv3 코칭을 0ms LLM-Free Lv2 반사 신경으로 증류한 템플릿.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReflexTemplate {
+    pub cc: String,
+    pub screen_key: String,
+    pub anchor: Option<String>,
+    pub line: String,
+    pub point_at: Option<u8>,
+    pub verified_accepts: u32,
+    pub distilled: bool,
+}
+
+/// Phase 6 Part 2: Lv3 → Lv2 반사 신경 증류 컴파일러.
+/// 동일 `(cc, screen_key, anchor)` 에서 Lv3 코칭이 `min_accepts`(기본 2회) 연속 검증 수락되면
+/// 이후 같은 병목 발생 시 LLM 을 깨우지 않고 0ms Lv2 즉시 응답으로 전환한다.
+#[derive(Debug, Clone)]
+pub struct ReflexCompiler {
+    templates: BTreeMap<(String, String, Option<String>), ReflexTemplate>,
+    pub min_accepts: u32,
+}
+
+impl Default for ReflexCompiler {
+    fn default() -> Self {
+        Self {
+            templates: BTreeMap::new(),
+            min_accepts: REFLEX_DISTILL_MIN_ACCEPTS,
+        }
+    }
+}
+
+impl ReflexCompiler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_lv3_success(
+        &mut self,
+        cc: &str,
+        screen_key: &str,
+        anchor: Option<&str>,
+        line: &str,
+        point_at: Option<u8>,
+    ) -> bool {
+        let key = (cc.to_string(), screen_key.to_string(), anchor.map(str::to_string));
+        let entry = self.templates.entry(key).or_insert_with(|| ReflexTemplate {
+            cc: cc.to_string(),
+            screen_key: screen_key.to_string(),
+            anchor: anchor.map(str::to_string),
+            line: clip_chars(line, 60),
+            point_at,
+            verified_accepts: 0,
+            distilled: false,
+        });
+        entry.line = clip_chars(line, 60);
+        entry.point_at = point_at;
+        entry.verified_accepts = entry.verified_accepts.saturating_add(1);
+        if entry.verified_accepts >= self.min_accepts {
+            entry.distilled = true;
+        }
+        entry.distilled
+    }
+
+    pub fn revoke(&mut self, cc: &str, screen_key: &str, anchor: Option<&str>) {
+        self.templates
+            .remove(&(cc.to_string(), screen_key.to_string(), anchor.map(str::to_string)));
+    }
+
+    pub fn lookup(&self, cc: &str, screen_key: &str, anchor: Option<&str>) -> Option<&ReflexTemplate> {
+        self.templates
+            .get(&(cc.to_string(), screen_key.to_string(), anchor.map(str::to_string)))
+            .filter(|t| t.distilled)
+    }
+}
+
+/// 증류된 0ms Lv2 반사 템플릿을 우선 확인한 뒤 없을 때만 기존 `route_proactive` 로 라우팅한다.
+pub fn route_proactive_with_reflex(
+    coach: &PendingCoach,
+    mode: CoachDeliveryMode,
+    evidence: &CoachEvidence,
+    lv3_available: bool,
+    current_ask_epoch: u64,
+    fatigue: &CoachingFatigueController,
+    compiler: &ReflexCompiler,
+) -> ProactiveRoute {
+    if coach.superseded_by_question(current_ask_epoch) {
+        return ProactiveRoute::Cancel(RouteCancel::UserQuestion);
+    }
+    if !fatigue.allows_proactive() {
+        return ProactiveRoute::Cancel(RouteCancel::Muted);
+    }
+    if let Some(tpl) = compiler.lookup(&coach.cc, &coach.screen_key, coach.bottleneck_anchor.as_deref()) {
+        return ProactiveRoute::Lv2(CachedCoachLine {
+            line: tpl.line.clone(),
+            point_at: tpl.point_at.or(evidence.point_at),
+        });
+    }
+    route_proactive(coach, mode, evidence, lv3_available, current_ask_epoch, fatigue)
 }
 
 #[cfg(test)]
@@ -1134,5 +1249,78 @@ mod tests {
         f.on_ignored_or_dismissed(true);
         assert_eq!(f.state(), FatigueState::MutedUntilAsk);
         assert!(!f.allows_proactive());
+    }
+
+    #[test]
+    fn cn256_ingame_defeat_trap_routes_to_post_defeat_comfort_without_combat_interruption() {
+        let mut hook = PendingCoachHook::new();
+        let fatigue = CoachingFatigueController::new();
+        let combat = InterruptSignals {
+            high_tension_combat: true,
+            ..sig(10_000)
+        };
+        let trap_coach = PendingCoach::new("eldenring.exe", "boss-gate", Some("trap-door"), "defeat_trap", 10_000, 1);
+        assert_eq!(hook.submit(trap_coach, &combat), None, "silent during combat");
+        // Defeat triggers 1.5s delay then releases PostDefeatComfort with confirmed_trap evidence -> Lv3 comfort + warning.
+        assert_eq!(
+            hook.poll(
+                "eldenring.exe",
+                "boss-gate",
+                false,
+                1,
+                &InterruptSignals { just_defeated: true, ..sig(15_000) }
+            ),
+            None
+        );
+        let (released, mode) = hook
+            .poll("eldenring.exe", "boss-gate", false, 1, &sig(16_500))
+            .expect("released after 1500ms");
+        assert_eq!(mode, CoachDeliveryMode::PostDefeatComfort);
+        let ev = CoachEvidence {
+            bottleneck_label: Some("중앙 정문".into()),
+            confirmed_trap: Some("정면 돌입 함정".into()),
+            verified_alternative: Some("#1 '우측 사다리'".into()),
+            point_at: Some(1),
+        };
+        match route_proactive(&released, mode, &ev, true, 1, &fatigue) {
+            ProactiveRoute::Lv3(brief) => {
+                let text = brief.to_prompt_lines().join("\n");
+                assert!(text.contains("정면 돌입 함정") && text.contains("먼저 위로"), "{text}");
+            }
+            other => panic!("expected Lv3 PostDefeatComfort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cn274_reflex_compiler_distills_lv3_coaching_to_zero_ms_lv2_after_two_accepts() {
+        let mut compiler = ReflexCompiler::new();
+        let fatigue = CoachingFatigueController::new();
+        let c = coach(1_000, 0);
+        let ev = CoachEvidence {
+            verified_alternative: Some("#1 '간편결제'".into()),
+            point_at: Some(1),
+            ..Default::default()
+        };
+        // Before 2 verified accepts -> still routes to Lv3.
+        assert!(!compiler.record_lv3_success("eldenring.exe", "screen-a", Some("#2"), "1번 우측 사다리 써보자!", Some(1)));
+        assert!(matches!(
+            route_proactive_with_reflex(&c, CoachDeliveryMode::Immediate, &ev, true, 0, &fatigue, &compiler),
+            ProactiveRoute::Lv3(_)
+        ));
+        // Second verified accept -> distills into 0ms Lv2 reflex (LLM never wakes even when lv3_available == true)!
+        assert!(compiler.record_lv3_success("eldenring.exe", "screen-a", Some("#2"), "1번 우측 사다리 써보자!", Some(1)));
+        match route_proactive_with_reflex(&c, CoachDeliveryMode::Immediate, &ev, true, 0, &fatigue, &compiler) {
+            ProactiveRoute::Lv2(cached) => {
+                assert_eq!(cached.line, "1번 우측 사다리 써보자!");
+                assert_eq!(cached.point_at, Some(1));
+            }
+            other => panic!("expected 0ms Lv2 distilled reflex, got {other:?}"),
+        }
+        // Revocation restores Lv3 path.
+        compiler.revoke("eldenring.exe", "screen-a", Some("#2"));
+        assert!(matches!(
+            route_proactive_with_reflex(&c, CoachDeliveryMode::Immediate, &ev, true, 0, &fatigue, &compiler),
+            ProactiveRoute::Lv3(_)
+        ));
     }
 }

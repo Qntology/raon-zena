@@ -15,6 +15,10 @@ pub mod phrase;
 #[cfg(feature = "lancedb")]
 pub mod store;
 
-pub use model::{Action, Express, ExpressLevel, Lexicon, Node, VisionKind, VisionNode, VisionPrompting};
+pub use model::{
+    check_safe_learn_gates, Action, Express, ExpressLevel, Lexicon, Node, SafeLearnOutcome, SafeLearnReject,
+    ScopedBinding, VisionKind, VisionNode, VisionPrompting, NAV_GROUP, SAFE_LEARN_PROMOTE_SESSIONS,
+    SAFE_LEARN_REVOKE_REJECTS,
+};
 #[cfg(feature = "lancedb")]
 pub use store::{Anchors, LexiconStore, Role};
