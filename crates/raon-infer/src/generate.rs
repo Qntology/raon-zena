@@ -94,7 +94,8 @@ impl Generator {
 
     /// Greedy decode until EOS / `max_new`, streaming text deltas through `on_text`.
     pub fn generate(&self, prompt: &[u32], max_new: usize, on_text: impl FnMut(&str)) -> Result<(String, GenStats)> {
-        self.generate_from(self.model.new_state(), prompt, max_new, on_text)
+        let st = self.model.new_state_with_capacity(prompt.len() + max_new);
+        self.generate_from(st, prompt, max_new, on_text)
     }
 
     /// Like [`Self::generate`], continuing from `st` (e.g. a cloned [`Self::prefix_state`]).
@@ -128,6 +129,7 @@ impl Generator {
         if is_cancelled() {
             return Ok((String::new(), stats));
         }
+        st.plan_capacity(st.pos + prompt.len() + max_new);
         let t0 = Instant::now();
         let h = self.model.forward(prompt, &mut st)?;
         if is_cancelled() {
@@ -166,6 +168,7 @@ impl Generator {
         } else {
             0.0
         };
+        crate::device::trim_idle_gpu_pool(self.model.device());
         Ok((self.decode(&out)?, stats))
     }
 }

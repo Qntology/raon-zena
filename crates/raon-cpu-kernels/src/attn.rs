@@ -264,10 +264,98 @@ pub fn stream_attention_f32_masked(
     }
 
     let group = hq / hkv;
-    let n_panels = seq_kv.div_ceil(KP);
     let q_stride = hq * d;
     let kv_stride = hkv * d;
     let avx2 = use_avx2_fma();
+
+    // Fast path for single-query decode (seq_q == 1): direct SIMD dot + in-place strided V
+    // accumulation avoids O(seq_kv * hkv * d) K-transpose and V-repack allocations per token.
+    if seq_q == 1 {
+        let out_ptr = SendPtr(out.as_mut_ptr());
+        let max_k = if cfg.causal {
+            (cfg.past_offset + 1).min(seq_kv)
+        } else {
+            seq_kv
+        };
+        let active_panels = max_k.div_ceil(KP);
+        let run_head = |head: usize| {
+            let out_ptr = &out_ptr;
+            let kvh = head / group;
+            let q_row = &q[head * d..(head + 1) * d];
+            SCRATCH.with(|cell| {
+                let mut sc = cell.borrow_mut();
+                if sc.scores.len() < KP {
+                    sc.scores.resize(KP, 0.0);
+                }
+                if sc.weights.len() < KP {
+                    sc.weights.resize(KP, 0.0);
+                }
+                if sc.acc.len() < d {
+                    sc.acc.resize(d, 0.0);
+                }
+                let TlsScratch { scores, weights, acc } = &mut *sc;
+                acc[..d].fill(0.0);
+                let mut m_curr = f32::NEG_INFINITY;
+                let mut l_curr = 0.0f32;
+                for p in 0..active_panels {
+                    let j0 = p * KP;
+                    let valid = KP.min(max_k - j0);
+                    let mut p_max = f32::NEG_INFINITY;
+                    if let Some(mask) = key_mask {
+                        for j in 0..valid {
+                            let k_off = (j0 + j) * kv_stride + kvh * d;
+                            let s = crate::dot_f32_simd(q_row, &k[k_off..k_off + d]) * cfg.scale + mask[j0 + j];
+                            scores[j] = s;
+                            if s > p_max {
+                                p_max = s;
+                            }
+                        }
+                    } else {
+                        for j in 0..valid {
+                            let k_off = (j0 + j) * kv_stride + kvh * d;
+                            let s = crate::dot_f32_simd(q_row, &k[k_off..k_off + d]) * cfg.scale;
+                            scores[j] = s;
+                            if s > p_max {
+                                p_max = s;
+                            }
+                        }
+                    }
+                    let m_new = m_curr.max(p_max);
+                    let corr = if m_curr.is_finite() { (m_curr - m_new).exp() } else { 0.0 };
+                    let mut p_sum = 0.0f32;
+                    for j in 0..valid {
+                        let w = (scores[j] - m_new).exp();
+                        weights[j] = w;
+                        p_sum += w;
+                    }
+                    let v_p = &v[j0 * kv_stride + kvh * d..];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            accumulate_avx2(acc.as_mut_ptr(), corr, weights.as_ptr(), v_p.as_ptr(), kv_stride, valid, d);
+                        }
+                    } else {
+                        accumulate_scalar(acc, corr, weights, v_p, kv_stride, valid, d);
+                    }
+                    l_curr = l_curr * corr + p_sum;
+                    m_curr = m_new;
+                }
+                let inv_l = if l_curr > 0.0 { 1.0 / l_curr } else { 0.0 };
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add(head * d), d) };
+                for e in 0..d {
+                    dst[e] = acc[e] * inv_l;
+                }
+            });
+        };
+        if hq <= 1 || seq_kv * hq * d < 65_536 {
+            (0..hq).for_each(run_head);
+        } else {
+            (0..hq).into_par_iter().for_each(run_head);
+        }
+        return;
+    }
+
+    let n_panels = seq_kv.div_ceil(KP);
 
     // 1) Transpose K once per KV head into contiguous 64-key panels:
     //    kt_all[kvh][panel][e * KP + j] = k[(panel*KP + j) * kv_stride + kvh * d + e]
@@ -478,6 +566,71 @@ pub fn stream_attention_mla_hsd_f32(
         let q_h = &q[head * seq_q * dq..(head + 1) * seq_q * dq];
         let k_h = &k[head * seq_kv * dq..(head + 1) * seq_kv * dq];
         let v_h = &v[head * seq_kv * dv..(head + 1) * seq_kv * dv];
+
+        // Single-query MLA decode (seq_q == 1): compute q·k directly on k_h with SIMD dot,
+        // eliminating per-head `kt` allocation and full KV-cache transpose on every decode token.
+        if seq_q == 1 {
+            let max_k = if causal {
+                (past_offset + 1).min(seq_kv)
+            } else {
+                seq_kv
+            };
+            let active_panels = max_k.div_ceil(KP);
+            SCRATCH.with(|cell| {
+                let mut sc = cell.borrow_mut();
+                if sc.scores.len() < KP {
+                    sc.scores.resize(KP, 0.0);
+                }
+                if sc.weights.len() < KP {
+                    sc.weights.resize(KP, 0.0);
+                }
+                if sc.acc.len() < dv {
+                    sc.acc.resize(dv, 0.0);
+                }
+                let TlsScratch { scores, weights, acc } = &mut *sc;
+                acc[..dv].fill(0.0);
+                let mut m_curr = f32::NEG_INFINITY;
+                let mut l_curr = 0.0f32;
+                for p in 0..active_panels {
+                    let j0 = p * KP;
+                    let valid = KP.min(max_k - j0);
+                    let mut p_max = f32::NEG_INFINITY;
+                    for j in 0..valid {
+                        let k_row = &k_h[(j0 + j) * dq..(j0 + j + 1) * dq];
+                        let s = crate::dot_f32_simd(q_h, k_row) * scale;
+                        scores[j] = s;
+                        if s > p_max {
+                            p_max = s;
+                        }
+                    }
+                    let m_new = m_curr.max(p_max);
+                    let corr = if m_curr.is_finite() { (m_curr - m_new).exp() } else { 0.0 };
+                    let mut p_sum = 0.0f32;
+                    for j in 0..valid {
+                        let w = (scores[j] - m_new).exp();
+                        weights[j] = w;
+                        p_sum += w;
+                    }
+                    let v_p = &v_h[j0 * dv..];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            accumulate_avx2(acc.as_mut_ptr(), corr, weights.as_ptr(), v_p.as_ptr(), dv, valid, dv);
+                        }
+                    } else {
+                        accumulate_scalar(acc, corr, weights, v_p, dv, valid, dv);
+                    }
+                    l_curr = l_curr * corr + p_sum;
+                    m_curr = m_new;
+                }
+                let inv_l = if l_curr > 0.0 { 1.0 / l_curr } else { 0.0 };
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add(head * dv), dv) };
+                for e in 0..dv {
+                    dst[e] = acc[e] * inv_l;
+                }
+            });
+            return;
+        }
 
         // Pack this head's K into 64-key panels `[n_panels, dq, KP]`.
         let mut kt = vec![0.0f32; n_panels * dq * KP];
@@ -774,5 +927,67 @@ mod tests {
         }
         let max_err = out.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(max_err < 1e-5, "MLA dq=192 dv=128 max_err {max_err}");
+    }
+
+    #[test]
+    fn single_query_decode_mla_and_gqa_zero_transpose_match_reference() {
+        // 1) MLA single-token decode (seq_q = 1, 32 heads, dq = 192, dv = 128, seq_kv = 135)
+        let (heads, seq_kv, dq, dv, past) = (8usize, 135usize, 192usize, 128usize, 134usize);
+        let scale = 1.0 / (dq as f32).sqrt();
+        let q = det(heads * dq, 51);
+        let k = det(heads * seq_kv * dq, 52);
+        let v = det(heads * seq_kv * dv, 53);
+        let mut out = vec![0.0f32; heads * dv];
+        reset_attn_scalar_tail_hits();
+        stream_attention_mla_hsd_f32(&q, &k, &v, heads, 1, seq_kv, dq, dv, scale, true, past, &mut out);
+        assert_eq!(attn_scalar_tail_hits(), 0, "seq_q=1 MLA dv=128 must not hit scalar tail");
+        let mut want = vec![0.0f32; heads * dv];
+        for h in 0..heads {
+            let mut scores = vec![0.0f64; seq_kv];
+            let mut mx = f64::NEG_INFINITY;
+            for ki in 0..seq_kv {
+                let mut dot = 0.0f64;
+                for e in 0..dq {
+                    dot += (q[h * dq + e] as f64) * (k[(h * seq_kv + ki) * dq + e] as f64);
+                }
+                let s = dot * scale as f64;
+                scores[ki] = s;
+                mx = mx.max(s);
+            }
+            let mut denom = 0.0f64;
+            for s in &mut scores {
+                *s = (*s - mx).exp();
+                denom += *s;
+            }
+            for e in 0..dv {
+                let mut acc = 0.0f64;
+                for ki in 0..seq_kv {
+                    acc += scores[ki] * (v[(h * seq_kv + ki) * dv + e] as f64);
+                }
+                want[h * dv + e] = (acc / denom) as f32;
+            }
+        }
+        let max_err = out.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "seq_q=1 MLA max_err {max_err}");
+
+        // 2) Standard GQA single-token decode (seq_q = 1, Hq = 8, Hkv = 2, head_dim = 72)
+        let cfg = CpuStreamAttnCfg {
+            num_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 72,
+            scale: 1.0 / (72.0f32).sqrt(),
+            causal: true,
+            past_offset: 100,
+        };
+        let q2 = det(8 * 72, 61);
+        let k2 = det(101 * 2 * 72, 62);
+        let v2 = det(101 * 2 * 72, 63);
+        let mut out2 = vec![0.0f32; 8 * 72];
+        reset_attn_scalar_tail_hits();
+        stream_attention_f32(&q2, &k2, &v2, 1, 101, &cfg, &mut out2);
+        assert_eq!(attn_scalar_tail_hits(), 0, "seq_q=1 GQA d=72 must not hit scalar tail");
+        let want2 = reference_attn(&q2, &k2, &v2, 1, 101, &cfg, None);
+        let err2 = out2.iter().zip(&want2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err2 < 1e-5, "seq_q=1 GQA max_err {err2}");
     }
 }
