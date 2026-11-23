@@ -10,6 +10,18 @@ DEST=${1:-models}
 PARTS=${PARTS:-8}
 HF=https://huggingface.co
 
+file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
+sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c -
+  else
+    shasum -a 256 -c -
+  fi
+}
+
 small() { # repo file...
   local repo=$1; shift
   for f in "$@"; do
@@ -20,16 +32,16 @@ small() { # repo file...
 
 big() { # repo file
   local repo=$1 f=$2 out="$DEST/$1/$2"
-  local size; size=$(curl -fsSI "$HF/$repo/resolve/main/$f" | tr -d '\r' | awk 'tolower($1)=="x-linked-size:"{print $2}')
+  local size; size=$(curl -fsSI "$HF/$repo/resolve/main/$f" | tr -d '\r' | awk 'tolower($1)=="x-linked-size:"{print $2; exit}')
   [ -n "$size" ] || { echo "cannot size $repo/$f" >&2; return 1; }
-  if [ -f "$out" ] && [ "$(stat -c %s "$out")" -eq "$size" ]; then echo "have $repo/$f"; return 0; fi
+  if [ -f "$out" ] && [ "$(file_size "$out")" -eq "$size" ]; then echo "have $repo/$f"; return 0; fi
   mkdir -p "$(dirname "$out")"; rm -f "$out"
   local chunk=$(( (size + PARTS - 1) / PARTS )) pids=()
   for i in $(seq 0 $((PARTS - 1))); do
     local s=$((i * chunk)) e=$(((i + 1) * chunk - 1)); [ $e -ge $((size - 1)) ] && e=$((size - 1)); [ $s -gt $e ] && continue
     ( part="$out.part$i"; want=$((e - s + 1))
       for t in 1 2 3 4 5 6; do
-        got=0; [ -f "$part" ] && got=$(stat -c %s "$part")
+        got=0; [ -f "$part" ] && got=$(file_size "$part")
         [ "$got" -ge "$want" ] && exit 0
         curl -fsSL --retry 3 -r $((s + got))-$e "$HF/$repo/resolve/main/$f" >> "$part" || sleep $((t * 3))
       done; exit 1 ) & pids+=($!)
@@ -44,7 +56,7 @@ verify() { # repo
 import json, sys
 for e in json.load(sys.stdin):
     if e.get("lfs") and e["path"].endswith(".safetensors"):
-        print(e["lfs"]["oid"] + "  " + sys.argv[1] + "/" + e["path"])' "$DEST/$1" | sha256sum -c -
+        print(e["lfs"]["oid"] + "  " + sys.argv[1] + "/" + e["path"])' "$DEST/$1" | sha256_check
 }
 
 NANO=KRAFTON/Raon-1-nano

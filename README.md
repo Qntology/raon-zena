@@ -81,13 +81,15 @@ Windows 클라이언트는 아래 명령으로 실행합니다. `--features`로 
 LanceDB 사전 저장소를 빌드하려면 `protoc`가 필요합니다(Ubuntu `apt install protobuf-compiler libprotobuf-dev`, Windows `winget install protobuf`).
 `--no-default-features`로 빌드하면 DB 없이 JSON 사전만 씁니다.
 
-Windows에서 CUDA 13.x로 `--features cuda`를 빌드하려면 VS 개발자 셸(`vcvars64.bat`, nvcc가 `cl.exe`를 찾도록)에서 다음 환경 변수를 먼저 설정해야 합니다. CUDA 13의 CCCL 헤더가 MSVC의 전통 전처리기를 거부하기 때문입니다. RTX 3050 Laptop + CUDA 13.3 + MSVC 14.51에서 이 설정으로 `raon-chat`이 빌드되는 것을 확인했습니다.
+Windows에서 CUDA 13.x로 `--features cuda`를 빌드하려면 `scripts\dev_cargo.bat` · `scripts\build_cargo.bat` · `scripts\check_cargo.bat` · `scripts\test_cargo.bat` (ROCm/Vulkan은 `*_rocm.bat` · `*_vulkan.bat`)를 쓰면 VS 개발자 셸(`vcvars64.bat`)과 `NVCC_CCBIN` · `NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor`가 자동으로 설정됩니다. 직접 실행할 때는 VS 개발자 셸에서 아래 환경 변수를 먼저 설정하세요.
 
 ```bash
-set NVCC_APPEND_FLAGS=-Xcompiler=/Zc:preprocessor
+set NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor
 ```
 
 ```bash
+.\scripts\dev_cargo.bat --model models/KRAFTON/Raon-1-nano --quant-preset zena --llm-device auto --llm-idle 120 --screen models/KRAFTON/Raon-VisionEncoder --learn
+# 또는 릴리스 실행:
 cargo run --release -p raon-zena --features cuda,flash-attn -- --model models/KRAFTON/Raon-1-nano --quant-preset zena --llm-device auto --llm-idle 120 --screen models/KRAFTON/Raon-VisionEncoder --learn
 ```
 
