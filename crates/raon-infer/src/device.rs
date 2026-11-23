@@ -231,7 +231,10 @@ pub fn device_ordinal(d: &Device) -> usize {
 pub fn describe(d: &Device) -> String {
     match d.location() {
         DeviceLocation::Cpu => format!("cpu ({} threads)", rayon::current_num_threads()),
-        DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
+        DeviceLocation::Cuda { gpu_id } => match d.cuda_compute_capability() {
+            Some((major, minor)) => format!("cuda:{gpu_id} (sm_{major}{minor})"),
+            None => format!("cuda:{gpu_id}"),
+        },
         DeviceLocation::Rocm { gpu_id } => {
             #[cfg(feature = "rocm")]
             {
@@ -592,7 +595,13 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
                     qd.forward(&a_dev)?
                 };
                 let err = rel_err_f32(&got, &want)?;
-                let tol = if exact_matmul_native(device) || device.is_vulkan() { 1e-2 } else { 5e-2 };
+                let tol = if exact_matmul_native(device) {
+                    1e-3
+                } else if device.is_vulkan() {
+                    1e-2
+                } else {
+                    5e-2
+                };
                 worst = worst.max(if err <= tol { err * 0.1 } else { err });
             }
             Ok(worst)
@@ -634,18 +643,29 @@ mod tests {
         let gpu = candle_nn::ops::softmax_last_dim(&a.to_device(&dev)?.matmul(&w.to_device(&dev)?.t()?)?)?;
         let d = max_abs_diff(&cpu, &gpu.to_device(&Device::Cpu)?)?;
         assert!(d < 1e-4, "dense matmul + softmax differ by {d}");
-        // Q8_0 and K-quant weights (Q4_0 / Q4K / Q5K / Q6K) through QMatMul — verifies both
-        // ROCm w8a16 and Vulkan GpuQuant shaders across all pyramid tiers.
+        // Q8_0 and K-quant weights (Q4_0 / Q4K / Q5K / Q6K) through QMatMul — verifies exact
+        // W8A16 on CUDA/ROCm/Metal (~1e-7) and native GpuQuant shaders on Vulkan.
         let a_dev = a.to_device(&dev)?;
         let w_dev = w.to_device(&dev)?;
+        let exact = exact_matmul_native(&dev);
+        let q_tol = if exact { 1e-4 } else { 0.05 };
         for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
-            let q_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?;
+            let qt_cpu = QTensor::quantize(&w, dt)?;
+            let y_cpu = if exact {
+                a.matmul(&qt_cpu.dequantize(&Device::Cpu)?.t()?)?
+            } else {
+                QMatMul::from_qtensor(qt_cpu)?.forward(&a)?
+            };
             let q_gpu = QMatMul::from_qtensor(QTensor::quantize(&w_dev, dt)?)?;
-            let y_cpu = q_cpu.forward(&a)?;
-            let y_gpu = q_gpu.forward(&a_dev)?.to_device(&Device::Cpu)?;
+            let y_gpu = if exact {
+                q_gpu.forward_exact(&a_dev)?
+            } else {
+                q_gpu.forward(&a_dev)?
+            }
+            .to_device(&Device::Cpu)?;
             let scale = y_cpu.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             let d = max_abs_diff(&y_cpu, &y_gpu)?;
-            assert!(d <= 0.05 * scale.max(1e-3), "{dt:?} matmul differs by {d} (scale {scale})");
+            assert!(d <= q_tol * scale.max(1e-3), "{dt:?} matmul differs by {d} (scale {scale}, tol {q_tol})");
         }
         #[cfg(feature = "vulkan")]
         if let Some(before) = vk_native_before {

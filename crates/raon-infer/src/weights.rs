@@ -131,6 +131,8 @@ pub struct Linear {
     inner: QMatMul,
     exact: bool,
     pub name: String,
+    /// When fused via [`Linear::cat_rows`], preserves constituent names for `imatrix::record`.
+    orig_names: Vec<String>,
     pub out_features: usize,
     pub in_features: usize,
 }
@@ -152,14 +154,80 @@ impl Linear {
             inner,
             exact,
             name: name.to_string(),
+            orig_names: Vec::new(),
             out_features,
             in_features,
         }
     }
 
+    /// Horizontally fuses multiple [`Linear`] projections that share the same input width, `exact`
+    /// flag, and storage dtype/qtype into a single row-concatenated matrix (zero-reencode via
+    /// `QTensor::cat_rows` for quantized weights). Returns `None` if formats differ.
+    pub fn cat_rows(layers: &[&Linear]) -> Option<Self> {
+        let first = *layers.first()?;
+        let in_features = first.in_features;
+        let exact = first.exact;
+        if layers.iter().any(|l| l.in_features != in_features || l.exact != exact) {
+            return None;
+        }
+        let out_features: usize = layers.iter().map(|l| l.out_features).sum();
+        let inner = match &first.inner {
+            QMatMul::Tensor(t0) => {
+                let dt = t0.dtype();
+                let mut ts = Vec::with_capacity(layers.len());
+                for l in layers {
+                    let QMatMul::Tensor(t) = &l.inner else { return None };
+                    if t.dtype() != dt {
+                        return None;
+                    }
+                    ts.push(t);
+                }
+                QMatMul::Tensor(Tensor::cat(&ts, 0).ok()?)
+            }
+            QMatMul::QTensor(q0) => {
+                let dt = q0.dtype();
+                let mut qs = Vec::with_capacity(layers.len());
+                for l in layers {
+                    let QMatMul::QTensor(q) = &l.inner else { return None };
+                    if q.dtype() != dt {
+                        return None;
+                    }
+                    qs.push(q.as_ref());
+                }
+                let cat = candle_core::quantized::QTensor::cat_rows(&qs).ok()?;
+                QMatMul::from_qtensor(cat).ok()?
+            }
+            _ => return None,
+        };
+        let mut orig_names = Vec::with_capacity(layers.len());
+        for l in layers {
+            if l.orig_names.is_empty() {
+                orig_names.push(l.name.clone());
+            } else {
+                orig_names.extend(l.orig_names.iter().cloned());
+            }
+        }
+        Some(Self {
+            inner,
+            exact,
+            name: orig_names.join("+"),
+            orig_names,
+            out_features,
+            in_features,
+        })
+    }
+
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = x.contiguous()?;
-        imatrix::record(&self.name, &x)?;
+        if imatrix::ON.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.orig_names.is_empty() {
+                imatrix::record(&self.name, &x)?;
+            } else {
+                for n in &self.orig_names {
+                    imatrix::record(n, &x)?;
+                }
+            }
+        }
         if self.exact {
             self.inner.forward_exact(&x)
         } else {
@@ -464,6 +532,7 @@ impl Weights {
             inner,
             exact: self.exact,
             name: name.to_string(),
+            orig_names: Vec::new(),
             out_features,
             in_features,
         })
