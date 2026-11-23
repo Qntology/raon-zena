@@ -139,10 +139,11 @@ fn helmert(n: usize) -> Vec<f32> {
 }
 
 struct MhcConsts {
-    q: Tensor,   // [n, n-1]
-    q_t: Tensor, // [n-1, n] precomputed transpose
-    b: Tensor,   // [n, n]  (I + 11ᵀ/n)/2
-    eye: Tensor, // [n, n]
+    q: Tensor,        // [n, n-1]
+    q_t: Tensor,      // [n-1, n] precomputed transpose
+    b: Tensor,        // [n, n]  (I + 11ᵀ/n)/2
+    eye: Tensor,      // [n, n]
+    sel_ones: Tensor, // [n·C] ones for fused RMSNorm in Mhc::route
 }
 
 struct Mhc {
@@ -188,8 +189,26 @@ impl Mhc {
     fn route(&self, stream: &Tensor, k: &MhcConsts, cfg: &Config) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let (t, n, c) = stream.dims3()?;
         let flat = stream.reshape((t, n * c))?;
-        let inv = flat.sqr()?.mean_keepdim(1)?.affine(1.0, cfg.sel_eps)?.sqrt()?.recip()?;
-        let z = flat.matmul(&self.sel)?.broadcast_mul(&inv)?;
+        let z = if !flat.device().is_cpu()
+            && k.sel_ones.dim(0)? == n * c
+            && crate::device::accel_op_ok(flat.device(), crate::device::AccelOp::RmsNorm)
+        {
+            match candle_core::decoder_ops::rmsnorm_fused(
+                &flat.contiguous()?,
+                &k.sel_ones,
+                cfg.sel_eps as f32,
+                false,
+            ) {
+                Ok(normed) => normed.matmul(&self.sel)?,
+                Err(_) => {
+                    let inv = flat.sqr()?.mean_keepdim(1)?.affine(1.0, cfg.sel_eps)?.sqrt()?.recip()?;
+                    flat.matmul(&self.sel)?.broadcast_mul(&inv)?
+                }
+            }
+        } else {
+            let inv = flat.sqr()?.mean_keepdim(1)?.affine(1.0, cfg.sel_eps)?.sqrt()?.recip()?;
+            flat.matmul(&self.sel)?.broadcast_mul(&inv)?
+        };
         let h_pre = sigmoid(&z.narrow(1, 0, n)?.affine(self.alpha_pre, 0.0)?.broadcast_add(&self.b_pre)?)?;
         let h_post = (sigmoid(&z.narrow(1, n, n)?.affine(self.alpha_post, 0.0)?.broadcast_add(&self.b_post)?)? * cfg.post_factor)?;
         let m = n - 1;
@@ -214,13 +233,24 @@ impl Mhc {
 }
 
 fn aggregate(stream: &Tensor, h_pre: &Tensor) -> candle_core::Result<Tensor> {
+    if stream.dim(0)? == 1 {
+        // Single-token decode: [1, n] @ [n, C] -> [1, C] with zero [1, n, C] intermediate allocation.
+        return h_pre.contiguous()?.matmul(&stream.squeeze(0)?.contiguous()?);
+    }
     stream.broadcast_mul(&h_pre.unsqueeze(2)?)?.sum(1)
 }
 
 fn mix(stream: &Tensor, branch: &Tensor, h_post: &Tensor, h_res: &Tensor) -> candle_core::Result<Tensor> {
-    h_res
-        .matmul(&stream.contiguous()?)?
-        .broadcast_add(&h_post.unsqueeze(2)?.broadcast_mul(&branch.unsqueeze(1)?)?)
+    let mixed = if stream.dim(0)? == 1 {
+        h_res
+            .squeeze(0)?
+            .contiguous()?
+            .matmul(&stream.squeeze(0)?.contiguous()?)?
+            .unsqueeze(0)?
+    } else {
+        h_res.matmul(&stream.contiguous()?)?
+    };
+    mixed.broadcast_add(&h_post.unsqueeze(2)?.broadcast_mul(&branch.unsqueeze(1)?)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -242,18 +272,33 @@ pub struct RdaState {
     pub rec: RecState,
 }
 
+enum RdaQkvg {
+    Fused(Linear),
+    Separate {
+        q: Linear,
+        k: Linear,
+        v: Linear,
+        g: Linear,
+    },
+}
+
+enum RdaBw {
+    Fused(Linear),
+    Separate {
+        b: Linear,
+        w: Linear,
+    },
+}
+
 struct Rda {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    g: Linear,
-    b: Linear,
-    w: Linear,
+    qkvg: RdaQkvg,
+    bw: RdaBw,
     fa: Linear,
     fb: Linear,
-    conv: [Tensor; 3], // [C, K]
-    a_exp: Tensor,     // [1, H, 1]
-    dt_bias: Tensor,   // [H, D]
+    /// Fused `[3·proj, K]` depthwise causal conv weights `[q_conv; k_conv; v_conv]`.
+    conv_w: Tensor,
+    a_exp: Tensor,   // [1, H, 1]
+    dt_bias: Tensor, // [H, D]
     o_norm: Tensor,
     o: Linear,
 }
@@ -274,11 +319,19 @@ fn l2norm(x: &Tensor) -> candle_core::Result<Tensor> {
 
 fn short_conv(x: &Tensor, w: &Tensor, hist: Option<Tensor>, k: usize) -> candle_core::Result<(Tensor, Tensor)> {
     let (t, c) = x.dims2()?;
-    let sig = x.t()?.contiguous()?; // [C, T]
     let hist = match hist {
         Some(h) => h,
         None => Tensor::zeros((c, k - 1), DType::F32, x.device())?,
     };
+    if t == 1 {
+        // Single-token decode fast path: zero-copy reshape [1, C] -> [C, 1], single mul + sum + silu.
+        let sig = x.contiguous()?.reshape((c, 1))?;
+        let padded = Tensor::cat(&[&hist, &sig], 1)?; // [C, K]
+        let out = padded.mul(w)?.sum(1)?.silu()?.reshape((1, c))?;
+        let new_hist = padded.narrow(1, 1, k - 1)?.contiguous()?;
+        return Ok((out, new_hist));
+    }
+    let sig = x.t()?.contiguous()?; // [C, T]
     let padded = Tensor::cat(&[&hist, &sig], 1)?; // [C, T+K-1]
     let mut out = padded.narrow(1, 0, t)?.broadcast_mul(&w.narrow(1, 0, 1)?)?;
     for j in 1..k {
@@ -292,20 +345,40 @@ impl Rda {
     fn load(w: &Weights, p: &str, cfg: &Config) -> Result<Self> {
         let h = cfg.rda_heads;
         let a: Vec<f32> = w.host_f32(&format!("{p}.A_log"))?.iter().map(|x| x.exp()).collect();
-        Ok(Self {
-            q: w.linear(&format!("{p}.q_proj.weight"))?,
-            k: w.linear(&format!("{p}.k_proj.weight"))?,
-            v: w.linear(&format!("{p}.v_proj.weight"))?,
-            g: w.linear(&format!("{p}.g_proj.weight"))?,
-            b: w.linear(&format!("{p}.b_proj.weight"))?,
-            w: w.linear(&format!("{p}.rda_w_proj.weight"))?,
-            fa: w.linear(&format!("{p}.f_a_proj.weight"))?,
-            fb: w.linear(&format!("{p}.f_b_proj.weight"))?,
-            conv: [
+        let q_lin = w.linear(&format!("{p}.q_proj.weight"))?;
+        let k_lin = w.linear(&format!("{p}.k_proj.weight"))?;
+        let v_lin = w.linear(&format!("{p}.v_proj.weight"))?;
+        let g_lin = w.linear(&format!("{p}.g_proj.weight"))?;
+        let qkvg = match Linear::cat_rows(&[&q_lin, &k_lin, &v_lin, &g_lin]) {
+            Some(fused) => RdaQkvg::Fused(fused),
+            None => RdaQkvg::Separate {
+                q: q_lin,
+                k: k_lin,
+                v: v_lin,
+                g: g_lin,
+            },
+        };
+        let b_lin = w.linear(&format!("{p}.b_proj.weight"))?;
+        let w_lin = w.linear(&format!("{p}.rda_w_proj.weight"))?;
+        let bw = match Linear::cat_rows(&[&b_lin, &w_lin]) {
+            Some(fused) => RdaBw::Fused(fused),
+            None => RdaBw::Separate { b: b_lin, w: w_lin },
+        };
+        let conv_w = Tensor::cat(
+            &[
                 w.tensor(&format!("{p}.q_conv1d.weight"), None)?,
                 w.tensor(&format!("{p}.k_conv1d.weight"), None)?,
                 w.tensor(&format!("{p}.v_conv1d.weight"), None)?,
             ],
+            0,
+        )?
+        .contiguous()?;
+        Ok(Self {
+            qkvg,
+            bw,
+            fa: w.linear(&format!("{p}.f_a_proj.weight"))?,
+            fb: w.linear(&format!("{p}.f_b_proj.weight"))?,
+            conv_w,
             a_exp: Tensor::from_vec(a, (1, h, 1), &w.device)?,
             dt_bias: w.tensor(&format!("{p}.dt_bias"), Some(&[h, cfg.rda_head_dim]))?,
             o_norm: w.tensor(&format!("{p}.o_norm.weight"), None)?,
@@ -317,17 +390,33 @@ impl Rda {
         let (t, _) = x.dims2()?;
         let (h, d) = (cfg.rda_heads, cfg.rda_head_dim);
         let proj = h * d;
-        let (q, k, v) = (self.q.forward(x)?, self.k.forward(x)?, self.v.forward(x)?);
-        let gate = self.g.forward(x)?;
-        let beta_raw = self.b.forward(x)?;
-        let delta = self.w.forward(x)?;
+        let (qkv, gate) = match &self.qkvg {
+            RdaQkvg::Fused(lin) => {
+                let all = lin.forward(x)?;
+                (
+                    all.narrow(1, 0, 3 * proj)?.contiguous()?,
+                    all.narrow(1, 3 * proj, proj)?.contiguous()?,
+                )
+            }
+            RdaQkvg::Separate { q, k, v, g } => (
+                Tensor::cat(&[q.forward(x)?, k.forward(x)?, v.forward(x)?], 1)?,
+                g.forward(x)?,
+            ),
+        };
+        let (beta_raw, delta) = match &self.bw {
+            RdaBw::Fused(lin) => {
+                let both = lin.forward(x)?;
+                (both.narrow(1, 0, h)?.contiguous()?, both.narrow(1, h, h)?.contiguous()?)
+            }
+            RdaBw::Separate { b, w } => (b.forward(x)?, w.forward(x)?),
+        };
         let decay_raw = self.fb.forward(&self.fa.forward(x)?)?;
 
-        let hist = |i: usize| st.conv.as_ref().map(|c| c.narrow(0, i * proj, proj)).transpose();
-        let (q, qh) = short_conv(&q, &self.conv[0], hist(0)?, cfg.conv_k)?;
-        let (k, kh) = short_conv(&k, &self.conv[1], hist(1)?, cfg.conv_k)?;
-        let (v, vh) = short_conv(&v, &self.conv[2], hist(2)?, cfg.conv_k)?;
-        st.conv = Some(Tensor::cat(&[qh, kh, vh], 0)?);
+        let (qkv_c, new_hist) = short_conv(&qkv, &self.conv_w, st.conv.take(), cfg.conv_k)?;
+        st.conv = Some(new_hist);
+        let q = qkv_c.narrow(1, 0, proj)?.contiguous()?;
+        let k = qkv_c.narrow(1, proj, proj)?.contiguous()?;
+        let v = qkv_c.narrow(1, 2 * proj, proj)?.contiguous()?;
 
         let q = (l2norm(&q.reshape((t, h, d))?)? * (d as f64).powf(-0.5))?;
         let k = l2norm(&k.reshape((t, h, d))?)?;
@@ -386,16 +475,18 @@ impl Rda {
             RecState::Host(s) => Tensor::from_vec(s, (h, d, d), dev)?,
             RecState::Dev(t) => t,
         };
-        let (q, k, v, la) = (
+        let (q, k_col, k_row, v, la) = (
             q.reshape((h, d, 1))?,
             k.reshape((h, d, 1))?,
+            k.reshape((h, 1, d))?,
             v.reshape((h, d, 1))?,
             la.reshape((h, 1, d))?,
         );
         let s = s.broadcast_mul(&la.exp()?)?; // decay along K
-        let pred = s.matmul(&k)?; // [H, V, 1]
+        let pred = s.matmul(&k_col)?; // [H, V, 1]
         let err = (v - pred)?.broadcast_mul(&beta.reshape((h, 1, 1))?)?;
-        let s = (s + err.matmul(&k.transpose(1, 2)?)?)?;
+        // Rank-1 outer product [H, V, 1] * [H, 1, K] via broadcast_mul (avoids cuBLAS GEMM launch).
+        let s = (s + err.broadcast_mul(&k_row)?)?;
         let out = s.matmul(&q)?.reshape((1, h, d))?;
         st.rec = RecState::Dev(s);
         Ok(out)
@@ -632,23 +723,41 @@ pub enum LayerState {
     Mla(KvState),
 }
 
+enum MlpIn {
+    Fused { gate_up: Linear, inter: usize },
+    Separate { gate: Linear, up: Linear },
+}
+
 struct Mlp {
-    gate: Linear,
-    up: Linear,
+    inp: MlpIn,
     down: Linear,
 }
 
 impl Mlp {
     fn load(w: &Weights, p: &str) -> Result<Self> {
+        let gate = w.linear(&format!("{p}.gate_proj.weight"))?;
+        let up = w.linear(&format!("{p}.up_proj.weight"))?;
+        let inter = gate.out_features;
+        let inp = match Linear::cat_rows(&[&gate, &up]) {
+            Some(gate_up) => MlpIn::Fused { gate_up, inter },
+            None => MlpIn::Separate { gate, up },
+        };
         Ok(Self {
-            gate: w.linear(&format!("{p}.gate_proj.weight"))?,
-            up: w.linear(&format!("{p}.up_proj.weight"))?,
+            inp,
             down: w.linear(&format!("{p}.down_proj.weight"))?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate.forward(x)?;
-        let u = self.up.forward(x)?;
+        let (g, u) = match &self.inp {
+            MlpIn::Fused { gate_up, inter } => {
+                let gu = gate_up.forward(x)?;
+                (
+                    gu.narrow(1, 0, *inter)?.contiguous()?,
+                    gu.narrow(1, *inter, *inter)?.contiguous()?,
+                )
+            }
+            MlpIn::Separate { gate, up } => (gate.forward(x)?, up.forward(x)?),
+        };
         let a = if !x.device().is_cpu()
             && crate::device::accel_op_ok(x.device(), crate::device::AccelOp::DecoderOps)
         {
@@ -796,6 +905,7 @@ impl Model {
             q_t,
             b: Tensor::from_vec(b, (n, n), &dev)?,
             eye: Tensor::from_vec(eye, (n, n), &dev)?,
+            sel_ones: Tensor::ones(n * cfg.hidden, DType::F32, &dev)?,
         };
         let layers = (0..cfg.layers)
             .map(|i| Layer::load(&w, i, &cfg, cfg.rda_layer[i], &consts).with_context(|| format!("layer {i}")))
@@ -1007,6 +1117,94 @@ mod tests {
         kv.append(&k0, &v0, false)?;
         assert_eq!(kv.cap, 512, "planned_cap=300 should pre-allocate next_power_of_two(300)=512");
         assert_eq!(kv.len, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn fused_linears_short_conv_and_mhc_match_unfused_on_active_device() -> Result<()> {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        let dev = crate::device::select_device(crate::device::Backend::Auto, 0)?;
+        let exact = crate::device::exact_matmul_native(&dev);
+        let mk = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 40) as f32 / (1u32 << 24) as f32) * 0.5 - 0.25
+                })
+                .collect()
+        };
+
+        // 1) Linear::cat_rows across dense F32 and Q8_0 / Q4_0 / Q4K / Q5K / Q6K
+        let (rows, cols) = (64usize, 256usize);
+        let x = Tensor::from_vec(mk(3 * cols, 11), (3, cols), &dev)?;
+        let wa = Tensor::from_vec(mk(rows * cols, 12), (rows, cols), &dev)?;
+        let wb = Tensor::from_vec(mk(rows * cols, 13), (rows, cols), &dev)?;
+        let la_dense = Linear::from_qmatmul(QMatMul::Tensor(wa.clone()), exact, "a", rows, cols);
+        let lb_dense = Linear::from_qmatmul(QMatMul::Tensor(wb.clone()), exact, "b", rows, cols);
+        let fused_dense = Linear::cat_rows(&[&la_dense, &lb_dense]).expect("dense cat_rows");
+        let want_d = Tensor::cat(&[la_dense.forward(&x)?, lb_dense.forward(&x)?], 1)?;
+        let got_d = fused_dense.forward(&x)?;
+        let diff_d = (&want_d - &got_d)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(diff_d < 1e-4, "dense Linear::cat_rows diff {diff_d}");
+
+        for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+            let qa = QTensor::quantize(&wa, dt)?;
+            let qb = QTensor::quantize(&wb, dt)?;
+            let la = Linear::from_qmatmul(QMatMul::from_qtensor(qa)?, exact, "qa", rows, cols);
+            let lb = Linear::from_qmatmul(QMatMul::from_qtensor(qb)?, exact, "qb", rows, cols);
+            let fused = Linear::cat_rows(&[&la, &lb]).expect("quant cat_rows");
+            let want = Tensor::cat(&[la.forward(&x)?, lb.forward(&x)?], 1)?;
+            let got = fused.forward(&x)?;
+            let diff = (&want - &got)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            assert!(diff < 1e-4, "{dt:?} Linear::cat_rows diff {diff}");
+        }
+
+        // 2) Fused 3*proj short_conv (prefill t=6 + single-token decode t=1 fast path)
+        let (proj, k_sz) = (32usize, 4usize);
+        let cw0 = Tensor::from_vec(mk(proj * k_sz, 21), (proj, k_sz), &dev)?;
+        let cw1 = Tensor::from_vec(mk(proj * k_sz, 22), (proj, k_sz), &dev)?;
+        let cw2 = Tensor::from_vec(mk(proj * k_sz, 23), (proj, k_sz), &dev)?;
+        let cw_all = Tensor::cat(&[&cw0, &cw1, &cw2], 0)?.contiguous()?;
+        let mut h_fused: Option<Tensor> = None;
+        let mut h_sep: [Option<Tensor>; 3] = [None, None, None];
+        for (step, t) in [6usize, 1, 1].iter().enumerate() {
+            let x0 = Tensor::from_vec(mk(t * proj, 30 + step as u64 * 3), (*t, proj), &dev)?;
+            let x1 = Tensor::from_vec(mk(t * proj, 31 + step as u64 * 3), (*t, proj), &dev)?;
+            let x2 = Tensor::from_vec(mk(t * proj, 32 + step as u64 * 3), (*t, proj), &dev)?;
+            let x_all = Tensor::cat(&[&x0, &x1, &x2], 1)?;
+            let (out_f, nh_f) = short_conv(&x_all, &cw_all, h_fused.take(), k_sz)?;
+            h_fused = Some(nh_f);
+            let (o0, nh0) = short_conv(&x0, &cw0, h_sep[0].take(), k_sz)?;
+            let (o1, nh1) = short_conv(&x1, &cw1, h_sep[1].take(), k_sz)?;
+            let (o2, nh2) = short_conv(&x2, &cw2, h_sep[2].take(), k_sz)?;
+            h_sep = [Some(nh0), Some(nh1), Some(nh2)];
+            let out_s = Tensor::cat(&[&o0, &o1, &o2], 1)?;
+            let diff = (&out_f - &out_s)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            assert!(diff < 1e-5, "short_conv step {step} (t={t}) diff {diff}");
+        }
+
+        // 3) Mhc aggregate + mix t==1 fast path vs general path
+        let (n, c) = (4usize, 64usize);
+        let stream = Tensor::from_vec(mk(n * c, 41), (1, n, c), &dev)?;
+        let h_pre = Tensor::from_vec(mk(n, 42), (1, n), &dev)?;
+        let h_post = Tensor::from_vec(mk(n, 43), (1, n), &dev)?;
+        let h_res = Tensor::from_vec(mk(n * n, 44), (1, n, n), &dev)?;
+        let branch = Tensor::from_vec(mk(c, 45), (1, c), &dev)?;
+        let agg_got = aggregate(&stream, &h_pre)?;
+        let agg_ref = stream.broadcast_mul(&h_pre.unsqueeze(2)?)?.sum(1)?;
+        let agg_diff = (&agg_got - &agg_ref)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(agg_diff < 1e-5, "aggregate t=1 diff {agg_diff}");
+        let mix_got = mix(&stream, &branch, &h_post, &h_res)?;
+        let mix_ref = h_res
+            .matmul(&stream.contiguous()?)?
+            .broadcast_add(&h_post.unsqueeze(2)?.broadcast_mul(&branch.unsqueeze(1)?)?)?;
+        let mix_diff = (&mix_got - &mix_ref)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(mix_diff < 1e-5, "mix t=1 diff {mix_diff}");
+
+        if !dev.is_cpu() {
+            crate::device::trim_idle_gpu_pool(&dev);
+        }
         Ok(())
     }
 }
